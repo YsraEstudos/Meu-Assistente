@@ -114,10 +114,24 @@ AZURE_SPEECH_KEY=your_azure_speech_key
 AZURE_SPEECH_REGION=your_region
 
 # Local Whisper option
-WHISPER_COMMAND=whisper
-WHISPER_MODEL_DIR=.whisper-models
 WHISPER_MODEL=turbo
 WHISPER_LANGUAGE=en
+WHISPER_PERIODIC_FLUSH_MS=5000  # partial transcript interval for long speech
+
+# Whisper engine: whisper-cpp (Vulkan), faster (fallback), or openai (legacy)
+WHISPER_ENGINE=whisper-cpp
+WHISPER_CPP_BACKEND=vulkan
+WHISPER_CPP_THREADS=4
+WHISPER_CPP_BLAS=auto
+
+# Faster Whisper settings (only used when WHISPER_ENGINE=faster)
+WHISPER_FASTER_DEVICE=cpu       # auto-detect GPU: cpu, cuda
+WHISPER_FASTER_COMPUTE_TYPE=int8 # precision: int8, float16
+
+# Batch settings (only used when WHISPER_ENGINE=faster)
+WHISPER_BATCH_SIZE=4
+WHISPER_BATCH_TIMEOUT_MS=2000
+WHISPER_MAX_CONCURRENT=4
 ```
 
 Speech is optional. If no provider is configured, the microphone button hides itself across the app.
@@ -126,8 +140,13 @@ Speech is optional. If no provider is configured, the microphone button hides it
 
 You can use local Whisper for offline transcription or Azure Speech for a cloud option.
 
-For local Whisper, `./setup.sh` handles the full setup. It creates `.venv-whisper`, installs `openai-whisper`, points `.env` at the virtual environment, creates `.whisper-models`, and runs a quick speech test. You only need Python 3.10 or newer and ffmpeg on your system. Install those with `./setup.sh --install-system-deps`, or add `ffmpeg` and `sox` yourself.
+For local Whisper, setup.sh detects Vulkan and builds whisper.cpp v1.9.1 when the required Windows tools are available. The microchip button in the initial bar shows the detected GPU, selected backend, model status, and the result of a real runtime probe.
 
+Faster Whisper is the safe fallback. It uses CUDA when supported by NVIDIA and CPU INT8 otherwise.
+
+whisper.cpp + Vulkan is the recommended path for an AMD Radeon RX 6600 on Windows. It runs whisper-cli separately and checks its runtime logs to confirm GPU use.
+
+If Vulkan, the binary, or the model is unavailable, the app falls back to Faster Whisper CPU INT8 and then the legacy OpenAI Whisper CLI.
 For Azure Speech, create a Speech resource in the [Azure Portal](https://portal.azure.com/), then add the key and region to `.env` with `SPEECH_PROVIDER=azure`.
 
 ## How it works
@@ -165,6 +184,10 @@ OpenCluely is under active development. The core is stable and improvements ship
 - Session memory and a full chat UI
 - Language picker and a DSA skill prompt
 - Optional Azure Speech and local Whisper, with an auto hiding mic button
+- Faster Whisper CPU INT8 fallback with NVIDIA CUDA support where available
+- whisper.cpp Vulkan backend for AMD GPUs with CPU/OpenBLAS fallback
+- Batch transcription for higher throughput
+- Three-engine fallback chain: whisper.cpp Vulkan → faster-whisper CPU INT8 → openai-whisper
 - Multi-monitor and area capture support
 - Window binding and positioning
 - Settings management with disguise and stealth modes
@@ -220,7 +243,8 @@ Released under the MIT License. See [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 - Google Gemini for the AI reasoning
-- Azure Speech and OpenAI Whisper for optional voice input
+- Azure Speech, OpenAI Whisper, Faster Whisper, and whisper.cpp for voice input
+- CTranslate2 for GPU-accelerated transcription
 - Electron for the cross platform desktop runtime
 - [Vysper by varun-singhh](https://github.com/varun-singhh/Vysper) for UI and structure inspiration
 

@@ -4,5 +4,10 @@ node_modules/
 .whisper-models/
 eng.traineddata
 dist/
+dist-packaged/
 .DS_Store
 *.log
+.slim/deepwork/
+__pycache__/
+*.pyc
+unicode-probe-*

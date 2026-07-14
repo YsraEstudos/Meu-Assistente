@@ -7,9 +7,15 @@
     "start": "env -u ELECTRON_RUN_AS_NODE electron .",
     "dev": "env -u ELECTRON_RUN_AS_NODE electron . --no-sandbox --disable-gpu",
     "test-speech": "node scripts/test-speech.js",
+    "test-speech-finalization": "node scripts/test-speech-finalization.js",
+    "test:gpu": "node scripts/test-gpu-regression.js",
+    "test:gpu:build": "node scripts/test-gpu-regression.js --target build",
+    "test:all": "npm run test-speech-finalization && npm run test:gpu",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",
+    "prebuild:win": "npm run test:all",
     "build:win": "electron-builder --win",
+    "postbuild:win": "npm run test:gpu:build",
     "build:linux": "electron-builder --linux",
     "build:all": "electron-builder --mac --win --linux",
     "dist": "npm run build",
@@ -58,12 +64,19 @@
       "!.git/**/*",
       "!.env*",
       "!.venv-whisper/**/*",
+      "!.venv-faster-whisper/**/*",
       "!.whisper-models/**/*",
+      "!.faster-whisper-models/**/*",
       "!eng.traineddata"
     ],
     "asarUnpack": [
       "assests/icons/**/*",
-      "prompts/**/*"
+      "prompts/**/*",
+      "scripts/detect-gpu.py",
+      "scripts/whisper-worker.py",
+      "scripts/faster-whisper-worker.py",
+      "scripts/detect-cpu.py",
+      "scripts/whisper-cpp-worker.py"
     ],
     "mac": {
       "category": "public.app-category.utilities",
@@ -97,15 +110,13 @@
         {
           "target": "nsis",
           "arch": [
-            "x64",
-            "ia32"
+            "x64"
           ]
         },
         {
           "target": "portable",
           "arch": [
-            "x64",
-            "ia32"
+            "x64"
           ]
         }
       ],

@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron')
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
 contextBridge.exposeInMainWorld('electronAPI', {
+  isDevelopment: Boolean(process.defaultApp || process.env.NODE_ENV === 'development'),
   // Screenshot and OCR
   takeScreenshot: () => ipcRenderer.invoke('take-screenshot'),
   
@@ -10,7 +11,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startSpeechRecognition: () => ipcRenderer.invoke('start-speech-recognition'),
   stopSpeechRecognition: () => ipcRenderer.invoke('stop-speech-recognition'),
   sendAudioChunk: (buffer) => ipcRenderer.send('audio-chunk', { buffer }),
+  confirmAudioCaptureStopped: () => ipcRenderer.send('speech-capture-drained'),
   getSpeechAvailability: () => ipcRenderer.invoke('get-speech-availability'),
+  getSpeechStatus: () => ipcRenderer.invoke('get-speech-status'),
+  diagnoseSpeech: (options) => ipcRenderer.invoke('diagnose-speech', options || {}),
   
   // Window management
   showAllWindows: () => ipcRenderer.invoke('show-all-windows'),
@@ -115,7 +119,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onSkillChanged: (callback) => ipcRenderer.on('skill-changed', callback),
   onInteractionModeChanged: (callback) => ipcRenderer.on('interaction-mode-changed', callback),
   onRecordingStarted: (callback) => ipcRenderer.on('recording-started', callback),
+  onRecordingCaptureStopped: (callback) => ipcRenderer.on('recording-capture-stopped', callback),
   onRecordingStopped: (callback) => ipcRenderer.on('recording-stopped', callback),
+  onTranscriptionProgress: (callback) => ipcRenderer.on('transcription-progress', callback),
   onCodingLanguageChanged: (callback) => ipcRenderer.on('coding-language-changed', callback),
   onMainWindowShown: (callback) => ipcRenderer.on('main-window-shown', callback),
   

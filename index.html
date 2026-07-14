@@ -103,6 +103,150 @@
         box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.25) inset;
       }
 
+      #whisperStatusButton {
+        width: 26px;
+        height: 26px;
+        border-radius: 9999px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+      }
+
+      #whisperStatusButton i {
+        font-size: 14px;
+        color: rgba(255, 255, 255, 0.72);
+        transition: color 0.2s ease, text-shadow 0.2s ease;
+      }
+
+      #whisperStatusButton.gpu i {
+        color: #a78bfa;
+        text-shadow: 0 0 9px rgba(167, 139, 250, 0.7);
+      }
+
+      #whisperStatusButton.cpu i {
+        color: #fbbf24;
+        text-shadow: 0 0 8px rgba(251, 191, 36, 0.45);
+      }
+
+      #whisperStatusButton.remote i {
+        color: #60a5fa;
+      }
+
+      #whisperStatusButton.error i {
+        color: #fb7185;
+      }
+
+      #whisperStatusButton:hover {
+        background: rgba(167, 139, 250, 0.16);
+        box-shadow: 0 0 0 1px rgba(167, 139, 250, 0.25) inset;
+      }
+
+      .hardware-popover {
+        position: absolute;
+        top: 36px;
+        right: 8px;
+        width: 350px;
+        max-width: calc(100vw - 16px);
+        background: linear-gradient(135deg, rgba(20, 20, 20, 0.82), rgba(10, 10, 10, 0.74));
+        backdrop-filter: blur(18px);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 10px;
+        color: rgba(255, 255, 255, 0.95);
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.38);
+        padding: 13px;
+        z-index: 1001;
+        -webkit-app-region: no-drag;
+        pointer-events: none;
+        opacity: 0;
+        visibility: hidden;
+        transition: opacity 120ms ease, visibility 120ms ease;
+      }
+
+      .hardware-popover.is-open {
+        pointer-events: auto;
+        opacity: 1;
+        visibility: visible;
+      }
+
+      .hardware-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        font-weight: 700;
+        margin-bottom: 5px;
+      }
+
+      .hardware-summary {
+        color: rgba(255, 255, 255, 0.72);
+        font-size: 11px;
+        line-height: 1.45;
+        margin-bottom: 10px;
+      }
+
+      .hardware-summary.gpu { color: #c4b5fd; }
+      .hardware-summary.cpu { color: #fde68a; }
+      .hardware-summary.error { color: #fda4af; }
+
+      .hardware-rows {
+        display: grid;
+        gap: 6px;
+        border-top: 1px solid rgba(255, 255, 255, 0.09);
+        padding-top: 9px;
+      }
+
+      .hardware-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        font-size: 11px;
+      }
+
+      .hardware-row-label {
+        color: rgba(255, 255, 255, 0.55);
+      }
+
+      .hardware-row-value {
+        color: rgba(255, 255, 255, 0.92);
+        text-align: right;
+        overflow-wrap: anywhere;
+      }
+
+      .hardware-checks {
+        margin: 10px 0 0;
+        padding: 8px 0 0 17px;
+        border-top: 1px solid rgba(255, 255, 255, 0.09);
+        color: rgba(255, 255, 255, 0.75);
+        font-size: 11px;
+        line-height: 1.5;
+      }
+
+      .hardware-checks li.ok { color: #86efac; }
+      .hardware-checks li.fail { color: #fda4af; }
+
+      .hardware-test-button {
+        width: 100%;
+        margin-top: 11px;
+        padding: 7px 10px;
+        border: 1px solid rgba(167, 139, 250, 0.38);
+        border-radius: 6px;
+        background: rgba(167, 139, 250, 0.14);
+        color: #ede9fe;
+        font-size: 11px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      .hardware-test-button:hover {
+        background: rgba(167, 139, 250, 0.24);
+      }
+
+      .hardware-test-button:disabled {
+        cursor: wait;
+        opacity: 0.65;
+      }
+
       .command-separator {
         width: 1px;
         height: 16px;
@@ -361,10 +505,13 @@
       <div class="command-item" id="micButton">
         <i class="fas fa-microphone"></i>
       </div>
+      <div class="command-item" id="whisperStatusButton" title="Status da transcrição local">
+        <i class="fas fa-microchip"></i>
+      </div>
       <div class="command-separator"></div>
       <div class="command-item" id="skillIndicator">
         <i class="fas fa-brain"></i>
-        <span>DSA</span>
+        <span>General</span>
       </div>
       <div class="command-separator"></div>
       <div class="command-item" id="languageSelector">
@@ -453,6 +600,19 @@
         <span>Tip: Alt+A also toggles interaction from anywhere.</span>
         <a href="https://techycsr.dev" target="_blank" rel="noreferrer noopener">Made by @TechyCSR</a>
       </div>
+    </div>
+
+    <div id="whisperStatusPopover" class="hardware-popover" aria-hidden="true">
+      <div class="hardware-title">
+        <i class="fas fa-microchip"></i>
+        <span>Status do Whisper</span>
+      </div>
+      <div id="whisperStatusSummary" class="hardware-summary">Verificando CPU, GPU e backend…</div>
+      <div id="whisperStatusRows" class="hardware-rows"></div>
+      <ul id="whisperStatusChecks" class="hardware-checks"></ul>
+      <button id="whisperStatusTestButton" class="hardware-test-button" type="button">
+        <i class="fas fa-vial"></i> Testar backend agora
+      </button>
     </div>
 
     <script src="./src/ui/main-window.js"></script>

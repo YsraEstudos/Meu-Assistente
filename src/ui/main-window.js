@@ -1,7 +1,12 @@
 // Simple logger for renderer process
 const logger = {
     info: (...args) => console.log('[MainWindowUI]', ...args),
-    debug: (...args) => console.log('[MainWindowUI DEBUG]', ...args),
+    debug: (...args) => {
+        if (typeof window !== 'undefined' && window.electronAPI && window.electronAPI.isDevelopment === false) {
+            return;
+        }
+        console.log('[MainWindowUI DEBUG]', ...args);
+    },
     error: (...args) => console.error('[MainWindowUI ERROR]', ...args),
     warn: (...args) => console.warn('[MainWindowUI WARN]', ...args)
 };
@@ -16,12 +21,22 @@ class MainWindowUI {
         this.micButton = null;
         this.isRecording = false;
         this.speechAvailable = false; // track availability
+        this.whisperStatus = null;
+        this._whisperStatusRequest = null;
+        this._micTogglePending = false;
+        this._isTranscribing = false;
         this._popoverHideTimeout = null;
         // Renderer-side audio capture state (used for Whisper on Windows)
         this._audioContext = null;
         this._mediaStream = null;
         this._scriptNode = null;
-        this._captureInterval = null;
+        this._captureWatchdog = null;
+        this._captureStatsTimer = null;
+        this._captureStartPromise = null;
+        this._captureRestartPromise = null;
+        this._captureGeneration = 0;
+        this._captureRestartCount = 0;
+        this._captureStats = null;
         
         // Define available skills for navigation
         this.availableSkills = [
@@ -48,6 +63,7 @@ class MainWindowUI {
             this.updateSkillIndicator();
             this.updateAllElementStates(); // Update all elements with current state
             this.resizeWindowToContent();
+            this.loadWhisperStatus(false);
             
             logger.info('Main window UI initialized', {
                 component: 'MainWindowUI',
@@ -142,6 +158,109 @@ class MainWindowUI {
         this.updateSkillIndicatorState();
         this.updateMicButtonState();
         this.updateSettingsIndicatorState();
+        this.updateWhisperStatusIndicator();
+    }
+
+    updateWhisperStatusIndicator() {
+        if (!this.whisperStatusButton) return;
+        this.whisperStatusButton.classList.remove('gpu', 'cpu', 'remote', 'error');
+        const execution = this.whisperStatus && this.whisperStatus.execution;
+        const kind = execution && execution.kind;
+        if (kind === 'gpu') this.whisperStatusButton.classList.add('gpu');
+        else if (kind === 'cpu') this.whisperStatusButton.classList.add('cpu');
+        else if (kind === 'remote') this.whisperStatusButton.classList.add('remote');
+        else if (kind === 'unavailable' || this.whisperStatus?.ok === false) this.whisperStatusButton.classList.add('error');
+        const label = execution?.label || 'Status do Whisper indisponível';
+        this.whisperStatusButton.title = label;
+    }
+
+    async loadWhisperStatus(probe = false) {
+        if (!window.electronAPI) return null;
+        const method = probe ? window.electronAPI.diagnoseSpeech : window.electronAPI.getSpeechStatus;
+        if (typeof method !== 'function') return null;
+        if (this._whisperStatusRequest && !probe) return this._whisperStatusRequest;
+
+        const request = Promise.resolve().then(() => method(probe ? { probe: true } : undefined)).then((status) => {
+            this.whisperStatus = status || null;
+            this.renderWhisperStatus(status || {});
+            this.updateWhisperStatusIndicator();
+            return status;
+        }).catch((error) => {
+            const status = {
+                ok: false,
+                error: error.message || String(error),
+                execution: { kind: 'unavailable', backend: 'none', label: 'Diagnóstico indisponível' }
+            };
+            this.whisperStatus = status;
+            this.renderWhisperStatus(status);
+            this.updateWhisperStatusIndicator();
+            return status;
+        }).finally(() => {
+            if (!probe) this._whisperStatusRequest = null;
+        });
+
+        if (!probe) this._whisperStatusRequest = request;
+        return request;
+    }
+
+    renderWhisperStatus(status = {}) {
+        if (!this.whisperStatusSummary || !this.whisperStatusRows || !this.whisperStatusChecks) return;
+        const execution = status.execution || {};
+        const kind = execution.kind || 'unavailable';
+        const fallbackText = status.fallback
+            ? ' • fallback ativo: ' + (status.effectiveEngine || 'engine alternativo')
+            : '';
+        const summary = (execution.label || 'Backend indisponível') + fallbackText;
+        this.whisperStatusSummary.textContent = summary;
+        this.whisperStatusSummary.className = 'hardware-summary ' + (kind === 'gpu' ? 'gpu' : (kind === 'cpu' ? 'cpu' : (kind === 'unavailable' ? 'error' : '')));
+
+        this.whisperStatusRows.replaceChildren();
+        const engine = status.effectiveEngine || status.configuredEngine || '—';
+        const gpu = status.gpu || {};
+        const cpu = status.cpu || {};
+        const runtimeGpu = execution.backend === 'vulkan'
+            ? (execution.gpuName || gpu.name || 'GPU Vulkan')
+            : 'Não utilizada (CPU)';
+        const model = status.engine?.model ? String(status.engine.model).split(/[\\/]/).pop() : '—';
+        const rows = [
+            ['Engine configurado', status.configuredEngine || '—'],
+            ['Engine em uso', engine],
+            ['Backend em uso', execution.backend || '—'],
+            ['GPU em uso', runtimeGpu],
+            ['GPU detectada', gpu.detected ? (gpu.name || 'GPU') : 'Não detectada'],
+            ['Vulkan', gpu.vulkan ? 'Disponível' : 'Não disponível'],
+            ['CPU', cpu.name || cpu.vendor || '—'],
+            ['Modelo', status.engine?.modelExists ? model : 'Ausente'],
+            ['Worker', status.engine?.workerReady ? 'Pronto' : 'Aguardando']
+        ];
+        rows.forEach(([label, value]) => {
+            const row = document.createElement('div');
+            row.className = 'hardware-row';
+            const labelNode = document.createElement('span');
+            labelNode.className = 'hardware-row-label';
+            labelNode.textContent = label;
+            const valueNode = document.createElement('span');
+            valueNode.className = 'hardware-row-value';
+            valueNode.textContent = value;
+            row.append(labelNode, valueNode);
+            this.whisperStatusRows.appendChild(row);
+        });
+
+        this.whisperStatusChecks.replaceChildren();
+        const checks = Array.isArray(status.checks) ? status.checks : [];
+        if (status.error) checks.push({ ok: false, label: status.error });
+        checks.forEach((check) => {
+            const item = document.createElement('li');
+            item.className = check.ok ? 'ok' : 'fail';
+            item.textContent = (check.ok ? '✓ ' : '✗ ') + (check.label || 'Verificação');
+            this.whisperStatusChecks.appendChild(item);
+        });
+        if (!checks.length) {
+            const item = document.createElement('li');
+            item.className = 'fail';
+            item.textContent = '✗ Nenhuma verificação disponível';
+            this.whisperStatusChecks.appendChild(item);
+        }
     }
 
     updateStatusDot() {
@@ -207,12 +326,13 @@ class MainWindowUI {
             }
             
             // Update button state
-            this.micButton.disabled = !this.isInteractive;
+            this.micButton.disabled = !this.isInteractive || !this.speechAvailable ||
+                this._micTogglePending || this._isTranscribing;
             
             logger.debug('Mic button state updated', {
                 component: 'MainWindowUI',
                 interactive: this.isInteractive,
-                disabled: !this.isInteractive
+                disabled: this.micButton.disabled
             });
         }
     }
@@ -253,6 +373,10 @@ class MainWindowUI {
                     // popover is positioned below the bar (top:36px), add that plus its height and a small margin
                     height = Math.max(height, Math.ceil(36 + popRect.height + 8));
                 }
+                if (this.whisperStatusPopover && this.whisperStatusPopover.classList.contains('is-open')) {
+                    const popRect = this.whisperStatusPopover.getBoundingClientRect();
+                    height = Math.max(height, Math.ceil(36 + popRect.height + 8));
+                }
                 
                 logger.debug('Resizing window to content', {
                     width,
@@ -270,8 +394,14 @@ class MainWindowUI {
         this.skillIndicator = document.getElementById('skillIndicator');
         this.settingsIndicator = document.getElementById('settingsIndicator'); // Optional
         this.micButton = document.getElementById('micButton');
-    this.infoButton = document.getElementById('infoButton');
-    this.shortcutsPopover = document.getElementById('shortcutsPopover');
+        this.whisperStatusButton = document.getElementById('whisperStatusButton');
+        this.whisperStatusPopover = document.getElementById('whisperStatusPopover');
+        this.whisperStatusSummary = document.getElementById('whisperStatusSummary');
+        this.whisperStatusRows = document.getElementById('whisperStatusRows');
+        this.whisperStatusChecks = document.getElementById('whisperStatusChecks');
+        this.whisperStatusTestButton = document.getElementById('whisperStatusTestButton');
+        this.infoButton = document.getElementById('infoButton');
+        this.shortcutsPopover = document.getElementById('shortcutsPopover');
 
         // NEW: Screenshot button is the first .command-item without id
         const commandItems = document.querySelectorAll('.command-item');
@@ -312,12 +442,23 @@ class MainWindowUI {
 
         // Add click handler for microphone
         this.micButton.addEventListener('click', async () => {
+            if (this._micTogglePending || this._isTranscribing) {
+                return;
+            }
             if (this.isInteractive && this.speechAvailable) {
+                this._micTogglePending = true;
+                this.updateMicButtonState();
                 try {
-                    if (this.isRecording) {
-                        await window.electronAPI.stopSpeechRecognition();
-                    } else {
-                        await window.electronAPI.startSpeechRecognition();
+                    const status = this.isRecording
+                        ? await window.electronAPI.stopSpeechRecognition()
+                        : await window.electronAPI.startSpeechRecognition();
+                    if (status) {
+                        this._isTranscribing = !!status.isFinalizing;
+                        if (status.isRecording && !this.isRecording) {
+                            this.handleRecordingStarted();
+                        } else if (!status.isRecording && this.isRecording) {
+                            this.handleRecordingStopped();
+                        }
                     }
                 } catch (error) {
                     logger.error('Speech recognition toggle failed', {
@@ -325,6 +466,8 @@ class MainWindowUI {
                         error: error.message
                     });
                     this.isRecording = false;
+                } finally {
+                    this._micTogglePending = false;
                     this.updateMicButtonState();
                 }
             } else if (this.isInteractive && !this.speechAvailable) {
@@ -370,6 +513,45 @@ class MainWindowUI {
                         window.electronAPI.resizeWindow(Math.ceil(rect.width), Math.ceil(rect.height));
                     }
                 }, 50);
+            });
+        }
+
+        // Whisper hardware status button / diagnostic popover
+        if (this.whisperStatusButton && this.whisperStatusPopover) {
+            this.whisperStatusButton.addEventListener('click', async (event) => {
+                if (!this.isInteractive) return;
+                event.stopPropagation();
+                const isOpen = this.whisperStatusPopover.classList.contains('is-open');
+                if (isOpen) {
+                    this.hideWhisperStatusPopover();
+                } else {
+                    this.showWhisperStatusPopover();
+                    await this.loadWhisperStatus(false);
+                }
+            });
+
+            if (this.whisperStatusTestButton) {
+                this.whisperStatusTestButton.addEventListener('click', async (event) => {
+                    event.stopPropagation();
+                    this.whisperStatusTestButton.disabled = true;
+                    this.whisperStatusTestButton.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Testando…';
+                    await this.loadWhisperStatus(true);
+                    this.whisperStatusTestButton.disabled = false;
+                    this.whisperStatusTestButton.innerHTML = '<i class="fas fa-vial"></i> Testar backend agora';
+                });
+            }
+
+            document.addEventListener('click', (event) => {
+                if (!this.whisperStatusPopover.classList.contains('is-open')) return;
+                if (!this.whisperStatusPopover.contains(event.target) && !this.whisperStatusButton.contains(event.target)) {
+                    this.hideWhisperStatusPopover();
+                }
+            });
+
+            document.addEventListener('keydown', (event) => {
+                if (event.key === 'Escape' && this.whisperStatusPopover.classList.contains('is-open')) {
+                    this.hideWhisperStatusPopover();
+                }
             });
         }
 
@@ -426,11 +608,28 @@ class MainWindowUI {
             });
 
             window.electronAPI.onRecordingStarted(() => {
+                this._isTranscribing = false;
                 this.handleRecordingStarted();
             });
 
-            window.electronAPI.onRecordingStopped(() => {
+            window.electronAPI.onRecordingCaptureStopped(() => {
+                this._isTranscribing = true;
                 this.handleRecordingStopped();
+                if (window.electronAPI.confirmAudioCaptureStopped) {
+                    window.electronAPI.confirmAudioCaptureStopped();
+                }
+            });
+
+            window.electronAPI.onRecordingStopped(() => {
+                this._isTranscribing = false;
+                this.handleRecordingStopped();
+            });
+
+            window.electronAPI.onTranscriptionProgress((_event, progress) => {
+                // Periodic Whisper segments can run while audio capture is still
+                // active; do not disable the stop button until finalization.
+                this._isTranscribing = !!(progress && progress.finalizing);
+                this.updateMicButtonState();
             });
 
             window.electronAPI.onSkillChanged((event, data) => {
@@ -442,7 +641,14 @@ class MainWindowUI {
             window.electronAPI.onSpeechAvailability((event, data) => {
                 this.speechAvailable = !!(data && data.available);
                 this.applyMicVisibility();
+                this.loadWhisperStatus(false);
             });
+
+            if (window.electronAPI.onSpeechStatus) {
+                window.electronAPI.onSpeechStatus(() => {
+                    this.loadWhisperStatus(false);
+                });
+            }
 
             // Listen for coding language changes from other windows
             window.electronAPI.onCodingLanguageChanged((event, data) => {
@@ -642,7 +848,17 @@ class MainWindowUI {
     }
 
     handleRecordingStarted() {
+        this._isTranscribing = false;
+        if (this.isRecording && (this._captureStartPromise || this._audioContext || this._mediaStream)) {
+            logger.debug('Duplicate recording-started event ignored', {
+                component: 'MainWindowUI',
+                captureActive: !!(this._audioContext || this._mediaStream),
+                captureStarting: !!this._captureStartPromise
+            });
+            return;
+        }
         this.isRecording = true;
+        this._captureRestartCount = 0;
         if (this.micButton) {
             this.micButton.classList.add('recording');
         }
@@ -660,6 +876,7 @@ class MainWindowUI {
             this._startRendererAudioCapture();
         }
         logger.debug('Recording started', { component: 'MainWindowUI' });
+        this.updateMicButtonState();
     }
 
     handleRecordingStopped() {
@@ -668,6 +885,7 @@ class MainWindowUI {
             this.micButton.classList.remove('recording');
         }
         this._stopRendererAudioCapture();
+        this.updateMicButtonState();
         logger.debug('Recording stopped', { component: 'MainWindowUI' });
     }
 
@@ -676,60 +894,257 @@ class MainWindowUI {
      * This is used for Whisper on Windows where node-record-lpcm16's sox/rec
      * dependencies are unavailable.
      */
-    async _startRendererAudioCapture() {
-        try {
-            this._stopRendererAudioCapture();
+    _startRendererAudioCapture() {
+        if (this._captureStartPromise) {
+            return this._captureStartPromise;
+        }
+        if (this._audioContext || this._mediaStream || this._scriptNode) {
+            logger.debug('Renderer audio capture already active', { component: 'MainWindowUI' });
+            return Promise.resolve();
+        }
 
-            const stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                    sampleRate: { ideal: 16000 }
-                }
-            });
-            this._mediaStream = stream;
+        const generation = ++this._captureGeneration;
+        const startPromise = (async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true,
+                        sampleRate: { ideal: 16000 }
+                    }
+                });
 
-            const audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                sampleRate: 16000
-            });
-            this._audioContext = audioContext;
-
-            const source = audioContext.createMediaStreamSource(stream);
-            const bufferSize = 4096;
-            const scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
-            this._scriptNode = scriptNode;
-
-            scriptNode.onaudioprocess = (event) => {
-                if (!this.isRecording || !window.electronAPI || !window.electronAPI.sendAudioChunk) {
+                if (!this.isRecording || generation !== this._captureGeneration) {
+                    stream.getTracks().forEach((track) => track.stop());
                     return;
                 }
-                const inputData = event.inputBuffer.getChannelData(0);
-                const pcm16 = new Int16Array(inputData.length);
-                for (let i = 0; i < inputData.length; i++) {
-                    const s = Math.max(-1, Math.min(1, inputData[i]));
-                    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                this._mediaStream = stream;
+
+                const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                const audioContext = new AudioContextClass({ sampleRate: 16000 });
+                if (!this.isRecording || generation !== this._captureGeneration) {
+                    await audioContext.close().catch(() => {});
+                    stream.getTracks().forEach((track) => track.stop());
+                    return;
                 }
-                window.electronAPI.sendAudioChunk(pcm16.buffer);
-            };
+                this._audioContext = audioContext;
+                this._captureStats = {
+                    generation,
+                    startedAt: Date.now(),
+                    lastAudioProcessAt: 0,
+                    lastLogAt: Date.now(),
+                    loggedChunks: 0,
+                    loggedBytes: 0,
+                    totalChunks: 0,
+                    totalBytes: 0
+                };
 
-            source.connect(scriptNode);
-            scriptNode.connect(audioContext.destination);
+                const source = audioContext.createMediaStreamSource(stream);
+                const bufferSize = 4096;
+                const scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
+                this._scriptNode = scriptNode;
 
-            logger.info('Renderer audio capture started', { component: 'MainWindowUI' });
-        } catch (error) {
-            logger.error('Failed to start renderer audio capture', {
-                component: 'MainWindowUI',
-                error: error.message
-            });
-            // Notify main process so it can stop the recording state
+                scriptNode.onaudioprocess = (event) => {
+                    if (!this.isRecording || generation !== this._captureGeneration ||
+                        !window.electronAPI || !window.electronAPI.sendAudioChunk) {
+                        return;
+                    }
+                    const inputData = event.inputBuffer.getChannelData(0);
+                    const pcm16 = new Int16Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        const sample = Math.max(-1, Math.min(1, inputData[i]));
+                        pcm16[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+                    }
+
+                    const stats = this._captureStats;
+                    const now = Date.now();
+                    if (stats && stats.generation === generation) {
+                        stats.totalChunks += 1;
+                        stats.totalBytes += pcm16.byteLength;
+                        stats.lastAudioProcessAt = now;
+                    }
+                    try {
+                        window.electronAPI.sendAudioChunk(pcm16.buffer);
+                    } catch (error) {
+                        logger.error('Failed to send renderer audio chunk', {
+                            component: 'MainWindowUI',
+                            error: error.message
+                        });
+                    }
+                };
+
+                audioContext.onstatechange = () => {
+                    const state = audioContext.state;
+                    logger.debug('Renderer audio context state changed', { component: 'MainWindowUI', state, generation });
+                    if (state === 'suspended' && this.isRecording && generation === this._captureGeneration) {
+                        audioContext.resume().then(() => {
+                            logger.debug('Renderer audio context resumed', { component: 'MainWindowUI', generation });
+                        }).catch((error) => {
+                            logger.debug('Renderer audio context resume failed', { component: 'MainWindowUI', generation, error: error.message });
+                        });
+                    }
+                };
+
+                const audioTrack = stream.getAudioTracks && stream.getAudioTracks()[0];
+                if (audioTrack && audioTrack.addEventListener) {
+                    audioTrack.addEventListener('mute', () => {
+                        logger.debug('Renderer microphone track muted', { component: 'MainWindowUI', generation });
+                    });
+                    audioTrack.addEventListener('unmute', () => {
+                        logger.debug('Renderer microphone track unmuted', { component: 'MainWindowUI', generation });
+                    });
+                    audioTrack.addEventListener('ended', () => {
+                        logger.debug('Renderer microphone track ended', { component: 'MainWindowUI', generation });
+                        if (this.isRecording && generation === this._captureGeneration) {
+                            this._restartRendererAudioCapture('microphone-track-ended');
+                        }
+                    });
+                }
+
+                source.connect(scriptNode);
+                scriptNode.connect(audioContext.destination);
+                this._startRendererCaptureWatchdog(generation);
+
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+
+                logger.info('Renderer audio capture started', { component: 'MainWindowUI', generation, audioContextState: audioContext.state });
+            } catch (error) {
+                if (!this.isRecording || generation !== this._captureGeneration) {
+                    logger.debug('Renderer audio capture start cancelled', { component: 'MainWindowUI', generation });
+                    return;
+                }
+                logger.error('Failed to start renderer audio capture', {
+                    component: 'MainWindowUI',
+                    error: error.message
+                });
+                try {
+                    await window.electronAPI.stopSpeechRecognition();
+                } catch (_) { /* ignore */ }
+            }
+        })();
+
+        this._captureStartPromise = startPromise;
+        startPromise.then(() => {
+            if (this._captureStartPromise === startPromise) {
+                this._captureStartPromise = null;
+            }
+        }, () => {
+            if (this._captureStartPromise === startPromise) {
+                this._captureStartPromise = null;
+            }
+        });
+        return startPromise;
+    }
+
+    _startRendererCaptureWatchdog(generation) {
+        if (this._captureWatchdog) {
+            clearInterval(this._captureWatchdog);
+        }
+        if (this._captureStatsTimer) {
+            clearInterval(this._captureStatsTimer);
+        }
+        this._captureWatchdog = setInterval(() => {
+            this._checkRendererAudioCapture(generation);
+        }, 1000);
+        this._captureStatsTimer = setInterval(() => {
+            this._logRendererCaptureHeartbeat();
+        }, 1000);
+    }
+
+    _logRendererCaptureHeartbeat() {
+        const stats = this._captureStats;
+        if (!stats) {
+            return;
+        }
+        const now = Date.now();
+        const intervalMs = Math.max(1, now - stats.lastLogAt);
+        const intervalChunks = stats.totalChunks - stats.loggedChunks;
+        const intervalBytes = stats.totalBytes - stats.loggedBytes;
+        logger.debug('Renderer audio capture heartbeat', {
+            component: 'MainWindowUI',
+            generation: stats.generation,
+            totalChunks: stats.totalChunks,
+            totalBytes: stats.totalBytes,
+            intervalChunks,
+            intervalBytes,
+            chunksPerSecond: Number((intervalChunks * 1000 / intervalMs).toFixed(1)),
+            lastChunkAgeMs: stats.lastAudioProcessAt ? now - stats.lastAudioProcessAt : null,
+            audioContextState: this._audioContext ? this._audioContext.state : 'missing',
+            restartCount: this._captureRestartCount
+        });
+        stats.lastLogAt = now;
+        stats.loggedChunks = stats.totalChunks;
+        stats.loggedBytes = stats.totalBytes;
+    }
+
+    async _checkRendererAudioCapture(generation) {
+        if (!this.isRecording || generation !== this._captureGeneration || !this._captureStats) {
+            return;
+        }
+        const now = Date.now();
+        const stats = this._captureStats;
+        const audioContext = this._audioContext;
+        if (!audioContext) {
+            return;
+        }
+
+        if (audioContext.state === 'suspended') {
+            logger.debug('Renderer audio capture found suspended AudioContext', { component: 'MainWindowUI', generation });
             try {
-                await window.electronAPI.stopSpeechRecognition();
-            } catch (_) { /* ignore */ }
+                await audioContext.resume();
+                logger.debug('Renderer audio capture resumed suspended AudioContext', { component: 'MainWindowUI', generation });
+            } catch (error) {
+                logger.debug('Renderer audio capture could not resume AudioContext', { component: 'MainWindowUI', generation, error: error.message });
+            }
+        }
+
+        const lastActivityAt = stats.lastAudioProcessAt || stats.startedAt;
+        const gapMs = now - lastActivityAt;
+        if (gapMs > 1500 && !this._captureRestartPromise) {
+            logger.debug('Renderer audio capture stall detected', { component: 'MainWindowUI', generation, gapMs, audioContextState: audioContext.state, totalChunks: stats.totalChunks });
+            await this._restartRendererAudioCapture('no-audio-process-events');
         }
     }
 
+    async _restartRendererAudioCapture(reason) {
+        if (this._captureRestartPromise || !this.isRecording) {
+            return;
+        }
+        const restartPromise = (async () => {
+            this._captureRestartCount += 1;
+            logger.debug('Restarting renderer audio capture', { component: 'MainWindowUI', reason, restartCount: this._captureRestartCount });
+            this._stopRendererAudioCapture();
+            if (this.isRecording) {
+                await this._startRendererAudioCapture();
+            }
+        })();
+        this._captureRestartPromise = restartPromise;
+        restartPromise.then(() => {
+            if (this._captureRestartPromise === restartPromise) {
+                this._captureRestartPromise = null;
+            }
+        }, () => {
+            if (this._captureRestartPromise === restartPromise) {
+                this._captureRestartPromise = null;
+            }
+        });
+        return restartPromise;
+    }
+
     _stopRendererAudioCapture() {
+        this._captureGeneration += 1;
+        if (this._captureWatchdog) {
+            clearInterval(this._captureWatchdog);
+            this._captureWatchdog = null;
+        }
+        if (this._captureStatsTimer) {
+            clearInterval(this._captureStatsTimer);
+            this._captureStatsTimer = null;
+        }
+        this._captureStartPromise = null;
         try {
             if (this._scriptNode) {
                 this._scriptNode.disconnect();
@@ -741,13 +1156,11 @@ class MainWindowUI {
                 this._mediaStream = null;
             }
             if (this._audioContext) {
+                this._audioContext.onstatechange = null;
                 this._audioContext.close().catch(() => {});
                 this._audioContext = null;
             }
-            if (this._captureInterval) {
-                clearInterval(this._captureInterval);
-                this._captureInterval = null;
-            }
+            this._captureStats = null;
         } catch (error) {
             logger.error('Error stopping renderer audio capture', {
                 component: 'MainWindowUI',
@@ -1227,6 +1640,20 @@ class MainWindowUI {
             margin: 8px 0;
         `;
         return separator;
+    }
+
+    showWhisperStatusPopover() {
+        if (!this.whisperStatusPopover) return;
+        this.whisperStatusPopover.classList.add('is-open');
+        this.whisperStatusPopover.setAttribute('aria-hidden', 'false');
+        this.resizeWindowToContent();
+    }
+
+    hideWhisperStatusPopover() {
+        if (!this.whisperStatusPopover) return;
+        this.whisperStatusPopover.classList.remove('is-open');
+        this.whisperStatusPopover.setAttribute('aria-hidden', 'true');
+        setTimeout(() => this.resizeWindowToContent(), 120);
     }
 
     toggleShortcutsPopover() {

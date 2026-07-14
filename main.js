@@ -100,24 +100,26 @@ const llmService = require("./src/services/llm.service");
 // Managers
 const windowManager = require("./src/managers/window.manager");
 const sessionManager = require("./src/managers/session.manager");
+const MobileSyncService = require("./src/services/mobile-sync.service");
 
 class ApplicationController {
   constructor() {
     this.isReady = false;
     this.starting = false;
-    this.activeSkill = "dsa";
+    this.activeSkill = "general";
   // Default to C++ so language is enforced from first run
   this.codingLanguage = "cpp";
     this.speechAvailable = false;
+    this._speechInitializationTimer = null;
+    this.mobileSync = new MobileSyncService({ logger });
 
-    // Utterance coalescing: VAD emits a transcript per natural pause, but a
-    // single spoken question can still arrive as a few fragments (mid-thought
-    // pauses). We buffer fragments and debounce so one question yields one LLM
-    // call instead of several slow, half-answered ones.
+    // Voice fragments are display-only until the recording session reaches its
+    // final transcription barrier. The LLM receives one consolidated message.
     this._utteranceBuffer = "";
-    this._utteranceTimer = null;
     this._utteranceDispatchInFlight = false;
-    this._utteranceCoalesceMs = 800;
+    this._speechSessionId = 0;
+    this._speechTranscriptionComplete = false;
+    this._audioIpcStats = null;
 
     // First-run onboarding: detects missing .env / API key and triggers
     // a settings-window prompt on first launch so users don't have to
@@ -253,6 +255,12 @@ class ApplicationController {
       const isFirstRun = status.needsOnboarding;
 
       await windowManager.initializeWindows({ showMainWindow: !isFirstRun });
+      try {
+        const mobileSyncInfo = await this.mobileSync.start();
+        logger.info("Mobile sync is available", mobileSyncInfo);
+      } catch (error) {
+        logger.warn("Mobile sync could not be started", { error: error.message });
+      }
       this.setupGlobalShortcuts();
 
       // Initialize default stealth mode with terminal icon
@@ -288,6 +296,10 @@ class ApplicationController {
         currentDesktop: "detected",
       });
 
+      if (!this.isFirstRun) {
+        this.scheduleSpeechInitialization();
+      }
+
       sessionManager.addEvent("Application started");
     } catch (error) {
       this.starting = false;
@@ -296,6 +308,39 @@ class ApplicationController {
       });
       app.quit();
     }
+  }
+
+  scheduleSpeechInitialization() {
+    if (this._speechInitializationTimer) {
+      return;
+    }
+
+    // The Whisper CLI probe uses spawnSync. Delaying it until after the main
+    // window is visible makes launch and second-instance focusing responsive.
+    this._speechInitializationTimer = setTimeout(() => {
+      this._speechInitializationTimer = null;
+      try {
+        speechService.initializeClient();
+        this.speechAvailable = speechService.isAvailable
+          ? speechService.isAvailable()
+          : false;
+        BrowserWindow.getAllWindows().forEach((window) => {
+          if (!window.isDestroyed()) {
+            window.webContents.send("speech-availability", {
+              available: this.speechAvailable,
+            });
+          }
+        });
+        logger.info("Speech service initialized after window startup", {
+          speechAvailable: this.speechAvailable,
+          provider: speechService.provider,
+        });
+      } catch (error) {
+        logger.warn("Deferred speech initialization failed", {
+          error: error.message,
+        });
+      }
+    }, 250);
   }
 
   setupNetworkConfiguration() {
@@ -323,9 +368,19 @@ class ApplicationController {
   }
 
   setupPermissions() {
+    const allowedPermissions = ["media", "microphone", "camera", "display-capture"];
+
+    session.defaultSession.setPermissionCheckHandler(
+      (_webContents, permission, _origin, details) => {
+        if (permission === "media") {
+          return !details?.mediaType || details.mediaType === "audio";
+        }
+        return allowedPermissions.includes(permission);
+      }
+    );
+
     session.defaultSession.setPermissionRequestHandler(
       (webContents, permission, callback) => {
-        const allowedPermissions = ["microphone", "camera", "display-capture"];
         const granted = allowedPermissions.includes(permission);
 
         logger.debug("Permission request", { permission, granted });
@@ -363,25 +418,75 @@ class ApplicationController {
   }
 
   setupServiceEventHandlers() {
-    speechService.on("recording-started", () => {
+    speechService.on("recording-started", (payload = {}) => {
+      this._speechSessionId = payload.sessionId || (this._speechSessionId + 1);
+      this._speechTranscriptionComplete = false;
+      this._utteranceBuffer = "";
+      this._audioIpcStats = {
+        startedAt: Date.now(),
+        lastLogAt: Date.now(),
+        loggedChunks: 0,
+        loggedBytes: 0,
+        totalChunks: 0,
+        totalBytes: 0
+      };
       BrowserWindow.getAllWindows().forEach((window) => {
-        window.webContents.send("recording-started");
+        window.webContents.send("recording-started", { sessionId: this._speechSessionId });
       });
     });
 
-    speechService.on("recording-stopped", () => {
+    speechService.on("recording-capture-stopped", (payload = {}) => {
+      if (payload.sessionId && payload.sessionId !== this._speechSessionId) {
+        return;
+      }
       BrowserWindow.getAllWindows().forEach((window) => {
-        window.webContents.send("recording-stopped");
+        window.webContents.send("recording-capture-stopped", {
+          sessionId: payload.sessionId || this._speechSessionId
+        });
       });
     });
 
-    speechService.on("transcription", (text) => {
-      this.handleTranscriptionFragment(text);
+    speechService.on("recording-stopped", (payload = {}) => {
+      if (payload.sessionId && payload.sessionId !== this._speechSessionId) {
+        return;
+      }
+      this._speechTranscriptionComplete = true;
+      if (this._audioIpcStats) {
+        logger.debug("Renderer audio IPC session ended", {
+          totalChunks: this._audioIpcStats.totalChunks,
+          totalBytes: this._audioIpcStats.totalBytes
+        });
+      }
+      this._audioIpcStats = null;
+      // This is the only point where voice text may reach the LLM. The speech
+      // service emits it only after the active segment and consolidated tail
+      // batches have completed.
+      this.dispatchCoalescedUtterance(payload.sessionId || this._speechSessionId);
+      BrowserWindow.getAllWindows().forEach((window) => {
+        window.webContents.send("recording-stopped", {
+          sessionId: payload.sessionId || this._speechSessionId
+        });
+      });
+    });
+
+    speechService.on("transcription", (text, metadata = {}) => {
+      this.handleTranscriptionFragment(text, metadata);
+      this.mobileSync.publish("transcription", {
+        text,
+        partial: metadata && metadata.partial === true,
+        timestamp: new Date().toISOString()
+      });
     });
 
     speechService.on("interim-transcription", (text) => {
       BrowserWindow.getAllWindows().forEach((window) => {
         window.webContents.send("interim-transcription", { text });
+      });
+    });
+
+    speechService.on("transcription-progress", (progress) => {
+      BrowserWindow.getAllWindows().forEach((window) => {
+        window.webContents.send("transcription-progress", progress);
       });
     });
 
@@ -426,6 +531,28 @@ class ApplicationController {
       return speechService.isAvailable ? speechService.isAvailable() : false;
     });
 
+    ipcMain.handle("get-speech-status", () => {
+      try {
+        return speechService.getHardwareStatus
+          ? speechService.getHardwareStatus({ probe: false })
+          : { ok: false, available: false, execution: { kind: 'unavailable', label: 'Indisponível' } };
+      } catch (error) {
+        logger.warn("Failed to read speech hardware status", { error: error.message });
+        return { ok: false, available: false, error: error.message, execution: { kind: 'unavailable', label: 'Indisponível' } };
+      }
+    });
+
+    ipcMain.handle("diagnose-speech", (event, options = {}) => {
+      try {
+        return speechService.getHardwareStatus
+          ? speechService.getHardwareStatus({ probe: options.probe === true })
+          : { ok: false, available: false, execution: { kind: 'unavailable', label: 'Indisponível' } };
+      } catch (error) {
+        logger.warn("Speech hardware diagnosis failed", { error: error.message });
+        return { ok: false, available: false, error: error.message, execution: { kind: 'unavailable', label: 'Indisponível' } };
+      }
+    });
+
     ipcMain.handle("start-speech-recognition", () => {
       speechService.startRecording();
       return speechService.getStatus();
@@ -438,9 +565,52 @@ class ApplicationController {
 
     // Raw PCM audio captured by the renderer's Web Audio API (Windows Whisper path)
     ipcMain.on("audio-chunk", (_event, data) => {
-      if (data && data.buffer) {
-        speechService.handleAudioChunkFromRenderer(Buffer.from(data.buffer));
+      const rawBuffer = data && data.buffer;
+      if (!rawBuffer) {
+        return;
       }
+      let buffer;
+      try {
+        if (Buffer.isBuffer(rawBuffer)) {
+          buffer = rawBuffer;
+        } else if (rawBuffer instanceof ArrayBuffer) {
+          buffer = Buffer.from(rawBuffer);
+        } else if (ArrayBuffer.isView(rawBuffer)) {
+          buffer = Buffer.from(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
+        } else {
+          buffer = Buffer.from(rawBuffer);
+        }
+      } catch (error) {
+        logger.debug("Renderer audio IPC payload rejected", { error: error.message });
+        return;
+      }
+
+      const stats = this._audioIpcStats;
+      if (stats) {
+        const now = Date.now();
+        stats.totalChunks += 1;
+        stats.totalBytes += buffer.length;
+        if (now - stats.lastLogAt >= 1000) {
+          const intervalMs = Math.max(1, now - stats.lastLogAt);
+          const intervalChunks = stats.totalChunks - stats.loggedChunks;
+          const intervalBytes = stats.totalBytes - stats.loggedBytes;
+          logger.debug("Renderer audio IPC heartbeat", {
+            totalChunks: stats.totalChunks,
+            totalBytes: stats.totalBytes,
+            intervalChunks,
+            intervalBytes,
+            chunksPerSecond: Number((intervalChunks * 1000 / intervalMs).toFixed(1))
+          });
+          stats.lastLogAt = now;
+          stats.loggedChunks = stats.totalChunks;
+          stats.loggedBytes = stats.totalBytes;
+        }
+      }
+      speechService.handleAudioChunkFromRenderer(buffer);
+    });
+
+    ipcMain.on("speech-capture-drained", () => {
+      speechService.confirmRendererCaptureStopped();
     });
 
     // Also handle direct send events for fallback
@@ -696,22 +866,10 @@ class ApplicationController {
       try {
         this.firstRunManager.markCompleted();
         this.isFirstRun = false;
-        // Reinitialize speech service with the latest persisted settings
-        // so the mic button reflects the provider/command set during onboarding.
-        speechService.initializeClient();
-        this.speechAvailable = speechService.isAvailable
-          ? speechService.isAvailable()
-          : false;
         // Show the main overlay window now that onboarding is done
-        // and API keys are configured.
+        // and API keys are configured before probing the local Whisper CLI.
         await windowManager.showMainWindow();
-        // Broadcast speech availability so the mic button appears
-        const { BrowserWindow } = require("electron");
-        BrowserWindow.getAllWindows().forEach((win) => {
-          if (!win.isDestroyed()) {
-            win.webContents.send("speech-availability", { available: this.speechAvailable });
-          }
-        });
+        this.scheduleSpeechInitialization();
         return { success: true };
       } catch (e) {
         return { success: false, error: e.message };
@@ -981,6 +1139,7 @@ class ApplicationController {
   navigateSkill(direction) {
     const availableSkills = [
       "dsa",
+      "general",
     ];
 
     const currentIndex = availableSkills.indexOf(this.activeSkill);
@@ -1047,6 +1206,7 @@ class ApplicationController {
         messageId,
         skill: this.activeSkill
       });
+      this.publishMobileResponseStart({ messageId, skill: this.activeSkill });
 
       const llmResult = await llmService.processImageWithSkillStream(
         capture.imageBuffer,
@@ -1059,6 +1219,7 @@ class ApplicationController {
             messageId,
             delta
           });
+          this.publishMobileResponseChunk({ messageId, delta });
         }
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
@@ -1113,6 +1274,7 @@ class ApplicationController {
         messageId,
         skill: this.activeSkill
       });
+      this.publishMobileResponseStart({ messageId, skill: this.activeSkill });
       windowManager.showLLMLoading();
 
       const llmResult = await llmService.processTextWithSkillStream(
@@ -1125,6 +1287,7 @@ class ApplicationController {
             messageId,
             delta
           });
+          this.publishMobileResponseChunk({ messageId, delta });
         }
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
@@ -1173,42 +1336,51 @@ class ApplicationController {
   }
 
   /**
-   * Buffer a transcribed fragment and (re)arm the coalesce debounce. Fragments
-   * are shown in the UI immediately so speech feels live, but the LLM is only
-   * asked once the speaker has actually paused — this is what stops one spoken
-   * line from producing two separate, slow answers.
+   * Buffer a display fragment. Voice fragments remain outside session memory
+   * and cannot dispatch the LLM until recording-stopped marks finalization.
    */
-  handleTranscriptionFragment(text) {
+  handleTranscriptionFragment(text, metadata = {}) {
     const fragment = (text || "").trim();
     if (!fragment) {
       return;
     }
 
-    // Show the live transcript right away in all windows.
-    sessionManager.addUserInput(fragment, 'speech');
+    if (metadata.sessionId && this._speechSessionId &&
+        metadata.sessionId !== this._speechSessionId) {
+      logger.debug("Ignored stale transcription fragment", {
+        fragmentLength: fragment.length,
+        fragmentSessionId: metadata.sessionId,
+        currentSessionId: this._speechSessionId
+      });
+      return;
+    }
+
+    // Fragments are display-only while the session is active. They are not
+    // persisted as separate user messages and never trigger the LLM here.
     BrowserWindow.getAllWindows().forEach((window) => {
-      window.webContents.send("transcription-received", { text: fragment });
+      window.webContents.send("transcription-received", {
+        text: fragment,
+        sessionId: metadata.sessionId || this._speechSessionId,
+        partial: metadata.partial === true,
+        consolidated: metadata.consolidated === true
+      });
     });
 
     this._utteranceBuffer = this._utteranceBuffer
-      ? `${this._utteranceBuffer} ${fragment}`
+      ? this._utteranceBuffer + " " + fragment
       : fragment;
-
-    if (this._utteranceTimer) {
-      clearTimeout(this._utteranceTimer);
-    }
-    this._utteranceTimer = setTimeout(() => {
-      this._utteranceTimer = null;
-      this.dispatchCoalescedUtterance();
-    }, this._utteranceCoalesceMs);
   }
 
   /**
-   * Send the coalesced utterance to the LLM. If a previous dispatch is still
-   * running, leave the buffer intact and let that dispatch's completion pick it
-   * up — so we never pile up overlapping requests for the same person talking.
+   * Send one finalized voice utterance to the LLM after all Whisper work ends.
    */
-  async dispatchCoalescedUtterance() {
+  async dispatchCoalescedUtterance(sessionId = this._speechSessionId) {
+    if (sessionId && this._speechSessionId && sessionId !== this._speechSessionId) {
+      return;
+    }
+    if (!this._speechTranscriptionComplete) {
+      return;
+    }
     if (this._utteranceDispatchInFlight) {
       return;
     }
@@ -1221,6 +1393,9 @@ class ApplicationController {
 
     try {
       const sessionHistory = sessionManager.getOptimizedHistory();
+      // Persist exactly one finalized voice message, after taking the prior
+      // history snapshot so the current text is not duplicated in the prompt.
+      sessionManager.addUserInput(combined, 'speech');
       await this.processTranscriptionWithLLM(combined, sessionHistory);
     } catch (error) {
       logger.error("Failed to process transcription with LLM", {
@@ -1230,8 +1405,8 @@ class ApplicationController {
     } finally {
       this._utteranceDispatchInFlight = false;
       // Anything that arrived while we were busy gets answered now.
-      if (this._utteranceBuffer.trim()) {
-        this.dispatchCoalescedUtterance();
+      if (this._speechTranscriptionComplete && this._utteranceBuffer.trim()) {
+        this.dispatchCoalescedUtterance(this._speechSessionId);
       }
     }
   }
@@ -1278,6 +1453,7 @@ class ApplicationController {
         messageId,
         skill: this.activeSkill
       });
+      this.publishMobileResponseStart({ messageId, skill: this.activeSkill });
       // Surface the overlay immediately so streamed tokens are visible there
       // too, instead of the overlay only appearing once the full answer lands.
       windowManager.showLLMLoading();
@@ -1292,6 +1468,7 @@ class ApplicationController {
             messageId,
             delta
           });
+          this.publishMobileResponseChunk({ messageId, delta });
         }
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
@@ -1434,6 +1611,24 @@ class ApplicationController {
     });
 
     windowManager.broadcastToAllWindows("transcription-llm-response", broadcastData);
+    this.mobileSync.publish("response-complete", {
+      response: llmResult.response,
+      metadata: llmResult.metadata,
+      messageId: broadcastData.messageId,
+      skill: this.activeSkill,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  publishMobileResponseStart(data) {
+    this.mobileSync.publish("response-start", {
+      ...data,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  publishMobileResponseChunk(data) {
+    this.mobileSync.publish("response-chunk", data);
   }
 
   onWindowAllClosed() {
@@ -1464,7 +1659,15 @@ class ApplicationController {
   }
 
   onWillQuit() {
+    if (this._speechInitializationTimer) {
+      clearTimeout(this._speechInitializationTimer);
+      this._speechInitializationTimer = null;
+    }
     globalShortcut.unregisterAll();
+    if (typeof speechService.shutdown === "function") {
+      speechService.shutdown();
+    }
+    this.mobileSync.stop();
     windowManager.destroyAllWindows();
 
     const sessionStats = sessionManager.getMemoryUsage();
@@ -1482,6 +1685,7 @@ class ApplicationController {
         cwd: process.cwd(),
         dataDir: app.getPath("userData"),
         platform: process.platform,
+        engine: process.env.WHISPER_ENGINE || "whisper-cpp",
       });
     }
     return this._whisperInstaller;
@@ -1494,18 +1698,33 @@ class ApplicationController {
     // distinguish "unset" from "stale value from a previous load".
     return {
       codingLanguage: this.codingLanguage || "cpp",
-      activeSkill: this.activeSkill || "dsa",
+      activeSkill: this.activeSkill || "general",
       appIcon: this.appIcon || "terminal",
       selectedIcon: this.appIcon || "terminal",
       windowGap: windowManager.windowGap,
 
-      speechProvider: speechService.provider || "whisper",
+      speechProvider: process.env.SPEECH_PROVIDER ||
+        ((process.env.AZURE_SPEECH_KEY && process.env.AZURE_SPEECH_REGION)
+          ? "azure"
+          : (speechService.provider !== "disabled" ? speechService.provider : "whisper")),
       azureKey: process.env.AZURE_SPEECH_KEY || "",
       azureRegion: process.env.AZURE_SPEECH_REGION || "",
+      whisperEngine: process.env.WHISPER_ENGINE || "whisper-cpp",
       whisperCommand: process.env.WHISPER_COMMAND || "",
       whisperModel: process.env.WHISPER_MODEL || "turbo",
       whisperLanguage: process.env.WHISPER_LANGUAGE || "en",
       whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
+      whisperFasterDevice: process.env.WHISPER_FASTER_DEVICE || "cpu",
+      whisperFasterComputeType: process.env.WHISPER_FASTER_COMPUTE_TYPE || "int8",
+      whisperCppCommand: process.env.WHISPER_CPP_COMMAND || "",
+      whisperCppPython: process.env.WHISPER_CPP_PYTHON || "",
+      whisperCppThreads: process.env.WHISPER_CPP_THREADS || "",
+      whisperCppBlas: process.env.WHISPER_CPP_BLAS || "auto",
+      whisperCppBackend: process.env.WHISPER_CPP_BACKEND || "vulkan",
+      whisperBatchSize: process.env.WHISPER_BATCH_SIZE || "4",
+      whisperBatchTimeoutMs: process.env.WHISPER_BATCH_TIMEOUT_MS || "2000",
+      whisperMaxConcurrent: process.env.WHISPER_MAX_CONCURRENT || "4",
+      whisperBeamSize: process.env.WHISPER_BEAM_SIZE || "5",
       geminiKey: process.env.GEMINI_API_KEY || "",
 
       azureConfigured: !!process.env.AZURE_SPEECH_KEY && !!process.env.AZURE_SPEECH_REGION,
@@ -1548,6 +1767,9 @@ class ApplicationController {
       if (settings.speechProvider === "azure" || settings.speechProvider === "whisper") {
         envUpdates.SPEECH_PROVIDER = settings.speechProvider;
       }
+      if (settings.whisperEngine !== undefined) {
+        envUpdates.WHISPER_ENGINE = settings.whisperEngine || "whisper-cpp";
+      }
       if (settings.azureKey !== undefined) {
         envUpdates.AZURE_SPEECH_KEY = settings.azureKey;
       }
@@ -1556,6 +1778,39 @@ class ApplicationController {
       }
       if (settings.whisperCommand !== undefined) {
         envUpdates.WHISPER_COMMAND = settings.whisperCommand;
+      }
+      if (settings.whisperFasterDevice !== undefined) {
+        envUpdates.WHISPER_FASTER_DEVICE = settings.whisperFasterDevice || "cpu";
+      }
+      if (settings.whisperFasterComputeType !== undefined) {
+        envUpdates.WHISPER_FASTER_COMPUTE_TYPE = settings.whisperFasterComputeType || "int8";
+      }
+      if (settings.whisperCppCommand !== undefined) {
+        envUpdates.WHISPER_CPP_COMMAND = settings.whisperCppCommand;
+      }
+      if (settings.whisperCppPython !== undefined) {
+        envUpdates.WHISPER_CPP_PYTHON = settings.whisperCppPython;
+      }
+      if (settings.whisperCppThreads !== undefined) {
+        envUpdates.WHISPER_CPP_THREADS = String(settings.whisperCppThreads || "");
+      }
+      if (settings.whisperCppBlas !== undefined) {
+        envUpdates.WHISPER_CPP_BLAS = String(settings.whisperCppBlas || "auto");
+      }
+      if (settings.whisperCppBackend !== undefined) {
+        envUpdates.WHISPER_CPP_BACKEND = String(settings.whisperCppBackend || "vulkan");
+      }
+      if (settings.whisperBatchSize !== undefined) {
+        envUpdates.WHISPER_BATCH_SIZE = String(settings.whisperBatchSize || "4");
+      }
+      if (settings.whisperBatchTimeoutMs !== undefined) {
+        envUpdates.WHISPER_BATCH_TIMEOUT_MS = String(settings.whisperBatchTimeoutMs || "2000");
+      }
+      if (settings.whisperMaxConcurrent !== undefined) {
+        envUpdates.WHISPER_MAX_CONCURRENT = String(settings.whisperMaxConcurrent || "4");
+      }
+      if (settings.whisperBeamSize !== undefined) {
+        envUpdates.WHISPER_BEAM_SIZE = String(settings.whisperBeamSize || "5");
       }
       if (settings.whisperModel !== undefined) {
         envUpdates.WHISPER_MODEL = settings.whisperModel;
@@ -1575,6 +1830,14 @@ class ApplicationController {
       // equal and skip the speech re-init below (the exact stale-mic-after-install
       // bug the re-init guards against).
       const prevWhisperCommand = process.env.WHISPER_COMMAND || '';
+      const prevWhisperEngine = process.env.WHISPER_ENGINE || 'whisper-cpp';
+      const prevWhisperFasterDevice = process.env.WHISPER_FASTER_DEVICE || 'cpu';
+      const prevWhisperFasterComputeType = process.env.WHISPER_FASTER_COMPUTE_TYPE || 'int8';
+      const prevWhisperCppCommand = process.env.WHISPER_CPP_COMMAND || "";
+      const prevWhisperCppPython = process.env.WHISPER_CPP_PYTHON || "";
+      const prevWhisperCppThreads = process.env.WHISPER_CPP_THREADS || "";
+      const prevWhisperCppBlas = process.env.WHISPER_CPP_BLAS || "auto";
+      const prevWhisperCppBackend = process.env.WHISPER_CPP_BACKEND || "vulkan";
 
       const persistedKeys = this.persistEnvUpdates(envUpdates);
 
@@ -1603,7 +1866,21 @@ class ApplicationController {
       const providerChanged = settings.speechProvider && speechService.provider !== settings.speechProvider;
       const whisperCommandChanged = settings.whisperCommand !== undefined &&
         prevWhisperCommand !== String(settings.whisperCommand || '');
-      if (providerChanged || whisperCommandChanged) {
+      const whisperEngineChanged = settings.whisperEngine !== undefined &&
+        prevWhisperEngine !== String(settings.whisperEngine || 'whisper-cpp');
+      const whisperFasterDeviceChanged = settings.whisperFasterDevice !== undefined &&
+        prevWhisperFasterDevice !== String(settings.whisperFasterDevice || 'cpu');
+      const whisperFasterComputeTypeChanged = settings.whisperFasterComputeType !== undefined &&
+        prevWhisperFasterComputeType !== String(settings.whisperFasterComputeType || 'int8');
+      const whisperCppCommandChanged = settings.whisperCppCommand !== undefined && prevWhisperCppCommand !== String(settings.whisperCppCommand || "");
+      const whisperCppPythonChanged = settings.whisperCppPython !== undefined && prevWhisperCppPython !== String(settings.whisperCppPython || "");
+      const whisperCppThreadsChanged = settings.whisperCppThreads !== undefined && prevWhisperCppThreads !== String(settings.whisperCppThreads || "");
+      const whisperCppBlasChanged = settings.whisperCppBlas !== undefined && prevWhisperCppBlas !== String(settings.whisperCppBlas || "auto");
+      const whisperCppBackendChanged = settings.whisperCppBackend !== undefined && prevWhisperCppBackend !== String(settings.whisperCppBackend || "vulkan");
+      if (whisperEngineChanged) {
+        this._whisperInstaller = null;
+      }
+      if (providerChanged || whisperCommandChanged || whisperEngineChanged || whisperFasterDeviceChanged || whisperFasterComputeTypeChanged || whisperCppCommandChanged || whisperCppPythonChanged || whisperCppThreadsChanged || whisperCppBlasChanged || whisperCppBackendChanged) {
         try {
           speechService.initializeClient();
           this.speechAvailable = speechService.isAvailable
@@ -1621,6 +1898,14 @@ class ApplicationController {
           logger.info('Speech service reinitialized after settings change', {
             providerChanged,
             whisperCommandChanged,
+            whisperEngineChanged,
+            whisperFasterDeviceChanged,
+            whisperFasterComputeTypeChanged,
+            whisperCppCommandChanged,
+            whisperCppPythonChanged,
+            whisperCppThreadsChanged,
+            whisperCppBlasChanged,
+            whisperCppBackendChanged,
             speechAvailable: this.speechAvailable,
           });
         } catch (e) {

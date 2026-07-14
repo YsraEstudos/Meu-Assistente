@@ -10,6 +10,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const azureKeyInput = document.getElementById('azureKey');
     const azureRegionInput = document.getElementById('azureRegion');
     const whisperCommandInput = document.getElementById('whisperCommand');
+    const whisperEngineSelect = document.getElementById('whisperEngine');
+    const whisperFasterDeviceSelect = document.getElementById('whisperFasterDevice');
+    const whisperFasterComputeTypeSelect = document.getElementById('whisperFasterComputeType');
+    const whisperCppCommandInput = document.getElementById('whisperCppCommand');
+    const whisperCppThreadsInput = document.getElementById('whisperCppThreads');
+    const whisperCppBlasSelect = document.getElementById('whisperCppBlas');
+    const whisperCppBackendSelect = document.getElementById('whisperCppBackend');
     const whisperModelInput = document.getElementById('whisperModel');
     const whisperLanguageInput = document.getElementById('whisperLanguage');
     const whisperSegmentMsInput = document.getElementById('whisperSegmentMs');
@@ -78,6 +85,13 @@ document.addEventListener('DOMContentLoaded', () => {
         if (azureKeyInput) azureKeyInput.value = settings.azureKey || '';
         if (azureRegionInput) azureRegionInput.value = settings.azureRegion || '';
         if (whisperCommandInput) whisperCommandInput.value = settings.whisperCommand || '';
+        if (whisperEngineSelect) whisperEngineSelect.value = settings.whisperEngine || 'whisper-cpp';
+        if (whisperFasterDeviceSelect) whisperFasterDeviceSelect.value = settings.whisperFasterDevice || 'cpu';
+        if (whisperFasterComputeTypeSelect) whisperFasterComputeTypeSelect.value = settings.whisperFasterComputeType || 'int8';
+        if (whisperCppCommandInput) whisperCppCommandInput.value = settings.whisperCppCommand || '';
+        if (whisperCppThreadsInput) whisperCppThreadsInput.value = settings.whisperCppThreads || '';
+        if (whisperCppBlasSelect) whisperCppBlasSelect.value = settings.whisperCppBlas === false ? 'false' : (settings.whisperCppBlas || 'auto');
+        if (whisperCppBackendSelect) whisperCppBackendSelect.value = settings.whisperCppBackend || 'vulkan';
         if (whisperModelInput) whisperModelInput.value = settings.whisperModel || '';
         if (whisperLanguageInput) whisperLanguageInput.value = settings.whisperLanguage || '';
         if (whisperSegmentMsInput) whisperSegmentMsInput.value = settings.whisperSegmentMs || '';
@@ -134,6 +148,13 @@ document.addEventListener('DOMContentLoaded', () => {
         if (azureKeyInput) settings.azureKey = azureKeyInput.value;
         if (azureRegionInput) settings.azureRegion = azureRegionInput.value;
         if (whisperCommandInput) settings.whisperCommand = whisperCommandInput.value;
+        if (whisperEngineSelect) settings.whisperEngine = whisperEngineSelect.value;
+        if (whisperFasterDeviceSelect) settings.whisperFasterDevice = whisperFasterDeviceSelect.value;
+        if (whisperFasterComputeTypeSelect) settings.whisperFasterComputeType = whisperFasterComputeTypeSelect.value;
+        if (whisperCppCommandInput) settings.whisperCppCommand = whisperCppCommandInput.value;
+        if (whisperCppThreadsInput) settings.whisperCppThreads = whisperCppThreadsInput.value;
+        if (whisperCppBlasSelect) settings.whisperCppBlas = whisperCppBlasSelect.value;
+        if (whisperCppBackendSelect) settings.whisperCppBackend = whisperCppBackendSelect.value;
         if (whisperModelInput) settings.whisperModel = whisperModelInput.value;
         if (whisperLanguageInput) settings.whisperLanguage = whisperLanguageInput.value;
         if (whisperSegmentMsInput) settings.whisperSegmentMs = whisperSegmentMsInput.value;
@@ -147,6 +168,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const updateSpeechFieldStates = () => {
         const provider = speechProviderSelect ? speechProviderSelect.value : 'azure';
+        const engine = whisperEngineSelect ? whisperEngineSelect.value : 'whisper-cpp';
+        const fasterOnlyItems = document.querySelectorAll('.faster-only');
+        fasterOnlyItems.forEach((element) => {
+            element.style.display = engine === 'faster' ? '' : 'none';
+        });
+        const cppOnlyItems = document.querySelectorAll('.cpp-only');
+        cppOnlyItems.forEach((element) => {
+            element.style.display = engine === 'whisper-cpp' ? '' : 'none';
+        });
+        if (whisperCommandInput) {
+            const whisperCommandItem = whisperCommandInput.closest('.settings-item');
+            if (whisperCommandItem) {
+                whisperCommandItem.style.display = engine === 'openai' ? '' : 'none';
+            }
+        }
 
         // Show/hide provider-specific field groups instead of just disabling
         // them. This keeps the settings UI clean — only the relevant fields
@@ -169,7 +205,7 @@ document.addEventListener('DOMContentLoaded', () => {
         [azureKeyInput, azureRegionInput].forEach(input => {
             if (input) input.disabled = provider !== 'azure';
         });
-        [whisperCommandInput, whisperModelInput, whisperLanguageInput, whisperSegmentMsInput].forEach(input => {
+        [whisperCommandInput, whisperModelInput, whisperLanguageInput, whisperSegmentMsInput, whisperEngineSelect, whisperFasterDeviceSelect, whisperFasterComputeTypeSelect, whisperCppCommandInput, whisperCppThreadsInput, whisperCppBlasSelect, whisperCppBackendSelect].forEach(input => {
             if (input) input.disabled = provider !== 'whisper';
         });
     };
@@ -179,6 +215,13 @@ document.addEventListener('DOMContentLoaded', () => {
         azureKeyInput,
         azureRegionInput,
         whisperCommandInput,
+        whisperEngineSelect,
+        whisperFasterDeviceSelect,
+        whisperFasterComputeTypeSelect,
+        whisperCppCommandInput,
+        whisperCppThreadsInput,
+        whisperCppBlasSelect,
+        whisperCppBackendSelect,
         whisperModelInput,
         whisperLanguageInput,
         whisperSegmentMsInput,
@@ -195,6 +238,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (speechProviderSelect) {
         speechProviderSelect.addEventListener('change', () => {
+            updateSpeechFieldStates();
+            saveSettings();
+        });
+    }
+
+    if (whisperEngineSelect) {
+        whisperEngineSelect.addEventListener('change', () => {
             updateSpeechFieldStates();
             saveSettings();
         });

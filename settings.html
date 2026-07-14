@@ -318,6 +318,7 @@
                         </div>
                         <select class="input-field" id="activeSkill">
                             <option value="dsa">Data Structures & Algorithms</option>
+                            <option value="general">General Assistant</option>
                         </select>
                     </div>
                 </div>
@@ -355,7 +356,7 @@
                     <div class="settings-item">
                         <div>
                             <div class="settings-item-label">Speech Provider</div>
-                            <div class="settings-item-description">Choose Azure Speech or a local OpenAI Whisper CLI</div>
+                            <div class="settings-item-description">Choose Azure Speech or a local Whisper backend</div>
                         </div>
                         <select class="input-field" id="speechProvider">
                             <option value="azure">Azure Speech</option>
@@ -391,6 +392,78 @@
                                 </div>
                                 <input type="text" class="input-field" id="whisperCommand" placeholder="whisper" style="max-width: 100%;">
                             </div>
+                        </div>
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">Whisper Engine</div>
+                                <div class="settings-item-description">Backend for local transcription</div>
+                            </div>
+                            <select class="input-field" id="whisperEngine">
+                                <option value="whisper-cpp">whisper.cpp + Vulkan (recommended for AMD)</option>
+                                <option value="faster">Faster Whisper (CPU/GPU fallback)</option>
+                                <option value="openai">OpenAI Whisper (legacy)</option>
+                            </select>
+                        </div>
+
+                        <div class="settings-item faster-only" style="display:none">
+                            <div>
+                                <div class="settings-item-label">Device</div>
+                                <div class="settings-item-description">Hardware acceleration for Faster Whisper</div>
+                            </div>
+                            <select class="input-field" id="whisperFasterDevice">
+                                <option value="auto">Auto-detect</option>
+                                <option value="cpu">CPU only</option>
+                                <option value="cuda">NVIDIA GPU (CUDA)</option>
+                            </select>
+                        </div>
+
+                        <div class="settings-item faster-only" style="display:none">
+                            <div>
+                                <div class="settings-item-label">Compute Type</div>
+                                <div class="settings-item-description">Precision/speed tradeoff</div>
+                            </div>
+                            <select class="input-field" id="whisperFasterComputeType">
+                                <option value="auto">Auto (recommended)</option>
+                                <option value="int8">INT8 (fast, low memory)</option>
+                                <option value="float16">FP16 (GPU, best quality)</option>
+                                <option value="int8_float16">INT8+FP16 hybrid</option>
+                            </select>
+                        </div>
+                        <div class="settings-item cpp-only" style="display:none">
+                            <div>
+                                <div class="settings-item-label">whisper.cpp Binary</div>
+                                <div class="settings-item-description">Optional full path to whisper-cli; leave empty to use the installer build</div>
+                            </div>
+                            <input type="text" class="input-field" id="whisperCppCommand" placeholder="whisper-cli">
+                        </div>
+                        <div class="settings-item cpp-only" style="display:none">
+                            <div>
+                                <div class="settings-item-label">CPU Threads</div>
+                                <div class="settings-item-description">Parallel CPU threads for whisper.cpp</div>
+                            </div>
+                            <input type="number" class="input-field" id="whisperCppThreads" min="1" max="32" step="1" placeholder="4">
+                        </div>
+                        <div class="settings-item cpp-only" style="display:none">
+                            <div>
+                                <div class="settings-item-label">OpenBLAS</div>
+                                <div class="settings-item-description">Use BLAS acceleration when available</div>
+                            </div>
+                            <select class="input-field" id="whisperCppBlas">
+                                <option value="auto">Auto-detect</option>
+                                <option value="true">Enabled</option>
+                                <option value="false">Disabled</option>
+                            </select>
+                        </div>
+                        <div class="settings-item cpp-only" style="display:none">
+                            <div>
+                                <div class="settings-item-label">GPU Backend</div>
+                                <div class="settings-item-description">Use Vulkan for Radeon/other supported GPUs</div>
+                            </div>
+                            <select class="input-field" id="whisperCppBackend">
+                                <option value="vulkan">Vulkan GPU</option>
+                                <option value="auto">Auto-detect</option>
+                                <option value="cpu">CPU only</option>
+                            </select>
                         </div>
                         <div class="settings-item">
                             <div>
