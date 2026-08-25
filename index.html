@@ -504,6 +504,13 @@
       <div class="command-separator"></div>
       <div class="command-item" id="micButton">
         <i class="fas fa-microphone"></i>
+        <span
+          id="micMeter"
+          class="mic-meter"
+          role="img"
+          aria-label="Nível do microfone: inativo"
+          title="Nível do microfone: inativo"
+        ><span id="micMeterFill" class="mic-meter-fill"></span></span>
       </div>
       <div class="command-item" id="whisperStatusButton" title="Status da transcrição local">
         <i class="fas fa-microchip"></i>
@@ -615,6 +622,7 @@
       </button>
     </div>
 
+    <script src="./src/ui/audio-meter.js"></script>
     <script src="./src/ui/main-window.js"></script>
   </body>
 </html>

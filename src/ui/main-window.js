@@ -30,6 +30,9 @@ class MainWindowUI {
         this._audioContext = null;
         this._mediaStream = null;
         this._scriptNode = null;
+        this._micMeter = null;
+        this._micAnalyser = null;
+        this._audioMonitorGain = null;
         this._captureWatchdog = null;
         this._captureStatsTimer = null;
         this._captureStartPromise = null;
@@ -337,6 +340,47 @@ class MainWindowUI {
         }
     }
 
+    _updateMicMeterState(state) {
+        const labels = {
+            IDLE: 'inativo',
+            CAPTURING: 'capturando',
+            DEGRADED: 'degradado',
+            ERROR: 'erro'
+        };
+        const normalizedState = labels[state] ? state : 'IDLE';
+        const label = `Nível do microfone: ${labels[normalizedState]}`;
+        if (this.micMeter) {
+            this.micMeter.dataset.state = normalizedState.toLowerCase();
+            this.micMeter.setAttribute('aria-label', label);
+            this.micMeter.title = label;
+        }
+    }
+
+    _updateMicMeter(metrics = {}) {
+        if (!this.micMeterFill) return;
+        const dbfs = Number(metrics.dbfs);
+        const level = Number.isFinite(dbfs) ? Math.min(1, Math.max(0, (dbfs + 60) / 60)) : 0;
+        this.micMeterFill.style.transform = `scaleX(${level})`;
+        this.micMeterFill.classList.toggle('clipping', metrics.clipping === true);
+    }
+
+    _stopMicMeter() {
+        if (this._micMeter) {
+            this._micMeter.stop();
+            this._micMeter = null;
+        }
+        if (this._micAnalyser) {
+            try { this._micAnalyser.disconnect(); } catch (_) { /* best effort */ }
+            this._micAnalyser = null;
+        }
+        if (this._audioMonitorGain) {
+            try { this._audioMonitorGain.disconnect(); } catch (_) { /* best effort */ }
+            this._audioMonitorGain = null;
+        }
+        this._updateMicMeterState('IDLE');
+        this._updateMicMeter({ dbfs: -Infinity, clipping: false });
+    }
+
     updateSettingsIndicatorState() {
         if (this.settingsIndicator) {
             // Remove both classes first
@@ -394,6 +438,8 @@ class MainWindowUI {
         this.skillIndicator = document.getElementById('skillIndicator');
         this.settingsIndicator = document.getElementById('settingsIndicator'); // Optional
         this.micButton = document.getElementById('micButton');
+        this.micMeter = document.getElementById('micMeter');
+        this.micMeterFill = document.getElementById('micMeterFill');
         this.whisperStatusButton = document.getElementById('whisperStatusButton');
         this.whisperStatusPopover = document.getElementById('whisperStatusPopover');
         this.whisperStatusSummary = document.getElementById('whisperStatusSummary');
@@ -894,6 +940,83 @@ class MainWindowUI {
      * This is used for Whisper on Windows where node-record-lpcm16's sox/rec
      * dependencies are unavailable.
      */
+    _getAudioMonitorGain(audioContext) {
+        if (!this._audioMonitorGain) {
+            this._audioMonitorGain = audioContext.createGain();
+            this._audioMonitorGain.gain.value = 0;
+            this._audioMonitorGain.connect(audioContext.destination);
+        }
+        return this._audioMonitorGain;
+    }
+
+    _connectAudioNodeSilently(audioNode, audioContext) {
+        audioNode.connect(this._getAudioMonitorGain(audioContext));
+    }
+
+    _startMicMeter(audioContext, source, stream, generation) {
+        const meterApi = typeof window !== 'undefined' ? window.OpenCluelyAudioMeter : null;
+        if (!meterApi || typeof meterApi.AudioMeter !== 'function' || typeof audioContext.createAnalyser !== 'function') {
+            this._updateMicMeterState('DEGRADED');
+            return false;
+        }
+
+        try {
+            const analyser = audioContext.createAnalyser();
+            analyser.fftSize = 1024;
+            analyser.smoothingTimeConstant = 0;
+            source.connect(analyser);
+            analyser.connect(this._getAudioMonitorGain(audioContext));
+
+            const meter = new meterApi.AudioMeter({
+                analyser,
+                bufferSize: analyser.fftSize,
+                onUpdate: (metrics) => {
+                    if (this.isRecording && generation === this._captureGeneration) {
+                        this._updateMicMeter(metrics);
+                    }
+                },
+                onStateChange: (state) => {
+                    if (generation === this._captureGeneration) {
+                        this._updateMicMeterState(state);
+                    }
+                }
+            });
+
+            this._micAnalyser = analyser;
+            this._micMeter = meter;
+            if (!meter.start()) {
+                this._stopMicMeter();
+                this._updateMicMeterState('DEGRADED');
+                return false;
+            }
+
+            const audioTrack = stream && stream.getAudioTracks && stream.getAudioTracks()[0];
+            if (audioTrack && typeof audioTrack.addEventListener === 'function') {
+                audioTrack.addEventListener('mute', () => {
+                    if (generation === this._captureGeneration) this._updateMicMeterState('DEGRADED');
+                });
+                audioTrack.addEventListener('unmute', () => {
+                    if (generation === this._captureGeneration && this._micMeter?.running) {
+                        this._updateMicMeterState('CAPTURING');
+                    }
+                });
+                audioTrack.addEventListener('ended', () => {
+                    if (generation === this._captureGeneration) this._updateMicMeterState('DEGRADED');
+                });
+            }
+            return true;
+        } catch (error) {
+            logger.debug('Microphone meter unavailable; capture continues', {
+                component: 'MainWindowUI',
+                generation,
+                error: error.message
+            });
+            this._stopMicMeter();
+            this._updateMicMeterState('DEGRADED');
+            return false;
+        }
+    }
+
     _startRendererAudioCapture() {
         if (this._captureStartPromise) {
             return this._captureStartPromise;
@@ -941,6 +1064,7 @@ class MainWindowUI {
                 };
 
                 const source = audioContext.createMediaStreamSource(stream);
+                this._startMicMeter(audioContext, source, stream, generation);
                 const bufferSize = 4096;
                 const scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
                 this._scriptNode = scriptNode;
@@ -1003,7 +1127,7 @@ class MainWindowUI {
                 }
 
                 source.connect(scriptNode);
-                scriptNode.connect(audioContext.destination);
+                this._connectAudioNodeSilently(scriptNode, audioContext);
                 this._startRendererCaptureWatchdog(generation);
 
                 if (audioContext.state === 'suspended') {
@@ -1136,6 +1260,7 @@ class MainWindowUI {
 
     _stopRendererAudioCapture() {
         this._captureGeneration += 1;
+        this._stopMicMeter();
         if (this._captureWatchdog) {
             clearInterval(this._captureWatchdog);
             this._captureWatchdog = null;
