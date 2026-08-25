@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>OpenCluely — Sincronização</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+    body { margin: 0; min-height: 100vh; background: #0b1020; color: #e7ecff; }
+    main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
+    h1 { font-size: 21px; margin: 0; }
+    #status { color: #91a4d8; font-size: 13px; }
+    .card { background: #121a30; border: 1px solid #26365e; border-radius: 16px; padding: 18px; margin-bottom: 16px; }
+    .label { color: #91a4d8; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    #question { color: #b9c5e8; margin-top: 8px; white-space: pre-wrap; }
+    #answer { font-size: 18px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; min-height: 44px; }
+    #empty { color: #91a4d8; }
+    .connected { color: #65e6a1 !important; }
+    .working { border-color: #657eff; box-shadow: 0 0 0 1px #657eff33; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>OpenCluely</h1>
+      <div id="status">Conectando…</div>
+    </header>
+    <section class="card" id="answerCard">
+      <div class="label">Resposta da IA</div>
+      <div id="answer"><span id="empty">A próxima resposta aparecerá aqui.</span></div>
+    </section>
+    <section class="card">
+      <div class="label">Pergunta reconhecida</div>
+      <div id="question">—</div>
+    </section>
+  </main>
+  <script>
+    const token = '__TOKEN__';
+    const status = document.getElementById('status');
+    const answer = document.getElementById('answer');
+    const question = document.getElementById('question');
+    const card = document.getElementById('answerCard');
+    let currentMessageId = null;
+
+    function connect() {
+      const events = new EventSource(`/events?token=${encodeURIComponent(token)}`);
+      events.onopen = () => {
+        status.textContent = 'Conectado';
+        status.classList.add('connected');
+      };
+      events.onerror = () => {
+        status.textContent = 'Reconectando…';
+        status.classList.remove('connected');
+      };
+      events.addEventListener('response-start', (event) => {
+        const data = JSON.parse(event.data);
+        currentMessageId = data.messageId || null;
+        answer.textContent = '';
+        card.classList.add('working');
+      });
+      events.addEventListener('transcription', (event) => {
+        const data = JSON.parse(event.data);
+        question.textContent = data.text || '—';
+      });
+      events.addEventListener('response-chunk', (event) => {
+        const data = JSON.parse(event.data);
+        if (!currentMessageId || !data.messageId || data.messageId === currentMessageId) {
+          answer.textContent += data.delta || '';
+        }
+      });
+      events.addEventListener('response-complete', (event) => {
+        const data = JSON.parse(event.data);
+        currentMessageId = data.messageId || currentMessageId;
+        answer.textContent = data.response || answer.textContent || 'Sem resposta.';
+        card.classList.remove('working');
+      });
+      events.addEventListener('error-message', (event) => {
+        const data = JSON.parse(event.data);
+        answer.textContent = `Erro: ${data.error || 'não foi possível processar a resposta.'}`;
+        card.classList.remove('working');
+      });
+    }
+    connect();
+  </script>
+</body>
+</html>

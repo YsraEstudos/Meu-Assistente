@@ -9,6 +9,7 @@ const os = require('os');
  *   - Decide whether this is the user's first launch of OpenCluely
  *   - Auto-create a default `.env` from `env.example` if one is missing
  *   - Report whether a Gemini API key is configured (the only required key)
+ *   - Seed Whisper engine/config defaults without forcing Faster installs
  *   - Persist a "first-run completed" sentinel so we don't nag on every launch
  *
  * The settings UI is the source of truth for API-key entry. This module
@@ -80,12 +81,20 @@ class FirstRunManager {
   getStatus() {
     const env = this._readEnv();
     const gemini = (env.GEMINI_API_KEY || '').trim();
+    const whisperEngine = String(env.WHISPER_ENGINE || 'whisper-cpp').trim().toLowerCase() || 'whisper-cpp';
     return {
       envExists: fs.existsSync(this.envPath),
       sentinelExists: fs.existsSync(this.sentinelPath),
       geminiConfigured: !!gemini && gemini !== 'your_gemini_api_key_here',
       azureConfigured: !!(env.AZURE_SPEECH_KEY || '').trim() && !!(env.AZURE_SPEECH_REGION || '').trim(),
-      whisperConfigured: !!(env.WHISPER_COMMAND || '').trim(),
+      whisperConfigured: whisperEngine === 'faster'
+        ? (!!(env.WHISPER_FASTER_DEVICE || '').trim() || !!(env.WHISPER_FASTER_COMPUTE_TYPE || '').trim() || !!(env.WHISPER_COMMAND || '').trim())
+        : (whisperEngine === 'whisper-cpp'
+          ? !!(env.WHISPER_CPP_COMMAND || '').trim()
+          : !!(env.WHISPER_COMMAND || '').trim()),
+      whisperEngine,
+      whisperFasterConfigured: whisperEngine === 'faster',
+      whisperCppConfigured: whisperEngine === 'whisper-cpp',
       needsOnboarding: this.needsOnboarding()
     };
   }
@@ -145,11 +154,24 @@ class FirstRunManager {
       'GEMINI_API_KEY=your_gemini_api_key_here',
       '',
       '# Speech provider: "whisper" (local) or "azure" (cloud).',
+      '# Whisper engine: openai uses the existing CLI; faster uses a Python venv; whisper-cpp uses whisper-cli.',
+      'WHISPER_ENGINE=whisper-cpp',
       '# WHISPER_COMMAND is auto-set to the project-local venv when you',
       '# install Whisper through the onboarding wizard, so no PATH change',
       '# or restart is needed.',
       'SPEECH_PROVIDER=whisper',
-      'WHISPER_COMMAND=whisper',
+      'WHISPER_COMMAND=',
+      '# Faster Whisper settings are only used when WHISPER_ENGINE=faster.',
+      'WHISPER_FASTER_DEVICE=cpu',
+      'WHISPER_FASTER_COMPUTE_TYPE=int8',
+      '# whisper.cpp settings are only used when WHISPER_ENGINE=whisper-cpp.',
+      'WHISPER_CPP_COMMAND=',
+      'WHISPER_CPP_PYTHON=',
+      'WHISPER_CPP_THREADS=4',
+      'WHISPER_CPP_BLAS=auto',
+      'WHISPER_CPP_BACKEND=vulkan',
+      '# WHISPER_CPP_MODEL_DIR=',
+      '# WHISPER_CPP_MODEL=',
       '# WHISPER_MODEL_DIR is optional. Leave it unset and the app stores model',
       '# weights in a stable app-data folder. Set an absolute path to override.',
       '# WHISPER_MODEL_DIR=',

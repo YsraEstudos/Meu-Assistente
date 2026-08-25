@@ -1029,7 +1029,7 @@ class WindowManager {
   }
 
   switchToWindow(windowType) {
-    if (this.windows.has('chat') && this.windows.get('chat').isVisible()) {
+    if (windowType === 'chat' && this.windows.has('chat') && this.windows.get('chat').isVisible()) {
       this.hideChatWindow();
       return;
     }
@@ -1041,6 +1041,10 @@ class WindowManager {
 
     if (this.isScreenBeingShared) {
       return;
+    }
+
+    if (windowType === 'chat') {
+      this._ensureMainWindowVisible();
     }
 
     const targetWindow = this.windows.get(windowType);
@@ -1779,7 +1783,33 @@ class WindowManager {
     return this.windowGap;
   }
 
+  _ensureMainWindowVisible() {
+    const mainWindow = this.windows.get('main');
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+
+    try {
+      if (typeof mainWindow.isMinimized === 'function' && mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
+      if (!mainWindow.isVisible()) {
+        if (typeof mainWindow.setVisibleOnAllWorkspaces === 'function') {
+          mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+        }
+        mainWindow.setAlwaysOnTop(true);
+        if (typeof mainWindow.showInactive === 'function') {
+          mainWindow.showInactive();
+        } else {
+          mainWindow.show();
+        }
+        logger.debug('Main window restored while opening chat');
+      }
+    } catch (error) {
+      logger.warn('Failed to preserve main window while opening chat', { error: error.message });
+    }
+  }
+
   showChatWindow() {
+    this._ensureMainWindowVisible();
     const chatWindow = this.windows.get('chat');
     if (chatWindow && !chatWindow.isDestroyed()) {
       this.showOnCurrentDesktop(chatWindow);

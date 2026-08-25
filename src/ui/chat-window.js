@@ -15,6 +15,8 @@ try {
 class ChatWindowUI {
     constructor() {
         this.isRecording = false;
+        this.isFinalizing = false;
+        this.micTogglePending = false;
         this.isInteractive = true; // Start in interactive mode
         this.elements = {};
         
@@ -95,20 +97,37 @@ class ChatWindowUI {
                 if (data && data.status) {
                     this.addMessage(data.status, 'system');
                     
-                    // Update recording state based on status
-                    if (data.status.includes('started') || data.status.includes('Recording')) {
-                        this.handleRecordingStarted();
-                    } else if (data.status.includes('stopped') || data.status.includes('ended')) {
-                        this.handleRecordingStopped();
-                    }
+                    // Status text is informational. Recording state changes only
+                    // through explicit recording events.
                 }
             });
             
             window.electronAPI.onSpeechError((event, data) => {
                 if (data && data.error) {
                     this.addMessage(`Speech Error: ${data.error}`, 'error');
+                    this.isFinalizing = false;
                     this.handleRecordingStopped(); // Stop recording on error
                 }
+            });
+
+            window.electronAPI.onRecordingStarted?.(() => {
+                this.isFinalizing = false;
+                this.handleRecordingStarted();
+            });
+
+            window.electronAPI.onRecordingCaptureStopped?.(() => {
+                this.isFinalizing = true;
+                this.handleRecordingStopped();
+            });
+
+            window.electronAPI.onRecordingStopped?.(() => {
+                this.isFinalizing = false;
+                this.handleRecordingStopped();
+            });
+
+            window.electronAPI.onTranscriptionProgress?.((_event, progress) => {
+                this.isFinalizing = !!(progress && progress.finalizing);
+                this.updateMicButtonState();
             });
             
             // Skill handlers
@@ -179,6 +198,12 @@ class ChatWindowUI {
         logger.debug('Chat window event listeners set up');
     }
 
+    updateMicButtonState() {
+        if (this.elements.micButton) {
+            this.elements.micButton.disabled = !this.isInteractive || this.micTogglePending || this.isFinalizing;
+        }
+    }
+
     setupUIHandlers() {
         // Microphone button
         this.elements.micButton.addEventListener('click', async () => {
@@ -187,15 +212,28 @@ class ChatWindowUI {
                 return;
             }
             
+            if (this.micTogglePending || this.isFinalizing) return;
+
+            this.micTogglePending = true;
+            this.updateMicButtonState();
             try {
-                if (this.isRecording) {
-                    await window.electronAPI.stopSpeechRecognition();
-                } else {
-                    await window.electronAPI.startSpeechRecognition();
+                const status = this.isRecording
+                    ? await window.electronAPI.stopSpeechRecognition()
+                    : await window.electronAPI.startSpeechRecognition();
+                if (status) {
+                    this.isFinalizing = !!status.isFinalizing;
+                    if (status.isRecording && !this.isRecording) {
+                        this.handleRecordingStarted();
+                    } else if (!status.isRecording && this.isRecording) {
+                        this.handleRecordingStopped();
+                    }
                 }
             } catch (error) {
                 this.addMessage(`Speech recognition error: ${error.message}`, 'error');
                 logger.error('Speech recognition failed', { error: error.message });
+            } finally {
+                this.micTogglePending = false;
+                this.updateMicButtonState();
             }
         });
         
@@ -223,6 +261,7 @@ class ChatWindowUI {
     handleInteractionEnabled() {
         this.isInteractive = true;
         this.elements.chatContainer.classList.remove('non-interactive');
+        this.updateMicButtonState();
         this.showInteractionIndicator('Interactive', true);
         logger.debug('Interaction mode enabled in chat');
     }
@@ -230,12 +269,16 @@ class ChatWindowUI {
     handleInteractionDisabled() {
         this.isInteractive = false;
         this.elements.chatContainer.classList.add('non-interactive');
+        this.updateMicButtonState();
         this.showInteractionIndicator('Non-Interactive', false);
         logger.debug('Interaction mode disabled in chat');
     }
 
     handleRecordingStarted() {
+        if (this.isRecording) return;
         this.isRecording = true;
+        this.isFinalizing = false;
+        this.updateMicButtonState();
         if (this.elements.recordingIndicator) {
             this.elements.recordingIndicator.style.display = 'block';
         }
@@ -251,6 +294,7 @@ class ChatWindowUI {
 
     handleRecordingStopped() {
         this.isRecording = false;
+        this.updateMicButtonState();
         if (this.elements.recordingIndicator) {
             this.elements.recordingIndicator.style.display = 'none';
         }
@@ -266,19 +310,16 @@ class ChatWindowUI {
 
     handleTranscription(text) {
         if (text && text.trim()) {
-            // Hide listening animation first
-            this.hideListeningAnimation();
-            
-            // Show transcribed text with a slight delay for smooth transition
+            if (!this.isRecording) {
+                this.hideListeningAnimation();
+            }
+
+            // Show each fragment before the final answer. The thinking state is
+            // started by the explicit LLM-response-start event only.
             setTimeout(() => {
                 this.addMessage(text, 'transcription');
-                
-                // Show thinking indicator after transcription
-                setTimeout(() => {
-                    this.showThinkingIndicator();
-                }, 300);
             }, 200);
-            
+
             logger.debug('Transcription received in chat', { textLength: text.length });
         } else {
             console.warn('❌ Transcription text is empty or invalid:', text);

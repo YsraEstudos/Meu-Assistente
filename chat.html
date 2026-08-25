@@ -637,6 +637,35 @@
         margin-left: 4px;
       }
 
+      .transcription-progress {
+        display: none;
+        position: fixed;
+        top: 104px;
+        left: 50%;
+        transform: translateX(-50%);
+        max-width: calc(100% - 32px);
+        padding: 7px 12px;
+        border: 1px solid rgba(76, 175, 80, 0.38);
+        border-radius: 14px;
+        background: rgba(15, 22, 18, 0.92);
+        color: rgba(235, 255, 239, 0.94);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.2px;
+        z-index: 1001;
+        pointer-events: none;
+      }
+
+      .transcription-progress.active {
+        display: block;
+        animation: fadeInUp 0.2s ease-out;
+      }
+
+      .mic-button:disabled {
+        cursor: wait;
+        opacity: 0.55;
+      }
+
       /* Interim text overlay */
       .interim-overlay {
         position: fixed;
@@ -688,6 +717,15 @@
         </div>
       </div>
 
+      <div class="listening-indicator" id="listeningIndicator" role="status" aria-live="polite">
+        <div class="listening-wave" aria-hidden="true">
+          <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+        </div>
+        <span class="listening-text" id="listeningText">Gravando…</span>
+        <span class="listening-duration" id="listeningDuration">0s</span>
+      </div>
+      <div class="transcription-progress" id="transcriptionProgress" role="status" aria-live="polite"></div>
+
       <!-- Interim Text Overlay -->
       <div class="interim-overlay" id="interimOverlay"></div>
 
@@ -732,6 +770,8 @@
       const chatContainer = document.getElementById('chatContainer');
       const listeningIndicator = document.getElementById('listeningIndicator');
       const listeningDuration = document.getElementById('listeningDuration');
+      const listeningText = document.getElementById('listeningText');
+      const transcriptionProgress = document.getElementById('transcriptionProgress');
       const interimOverlay = document.getElementById('interimOverlay');
       const clearHistoryBtn = document.getElementById('clearHistoryBtn');
 
@@ -740,6 +780,9 @@
       let listeningStartTime = null;
       let listeningTimer = null;
       let speechAvailable = false;
+      let micTogglePending = false;
+      let isTranscribing = false;
+      let progressHideTimer = null;
 
       // Chat persistence and deduplication
       const CHAT_HISTORY_KEY = 'opencluely_chat_history_v1';
@@ -800,10 +843,14 @@
         if (chatMessages) chatMessages.innerHTML = '';
       }
 
+      function updateMicButtonState() {
+        if (!micButton) return;
+        micButton.style.display = speechAvailable ? '' : 'none';
+        micButton.disabled = !isInteractive || !speechAvailable || micTogglePending || isTranscribing;
+      }
+
       function applyMicVisibility() {
-        if (micButton) {
-          micButton.style.display = speechAvailable ? '' : 'none';
-        }
+        updateMicButtonState();
       }
       
       async function initSpeechAvailability() {
@@ -938,6 +985,11 @@
       function showListeningAnimation() {
         if (listeningIndicator) {
           listeningIndicator.classList.add('active');
+          if (listeningText) listeningText.textContent = 'Gravando…';
+
+          // Recording-started can be broadcast by more than one window path.
+          // Keep a single timer when the event is repeated.
+          if (listeningTimer) return;
 
           // Start timer
           listeningStartTime = Date.now();
@@ -969,6 +1021,54 @@
         listeningStartTime = null;
       }
 
+      function updateTranscriptionProgress(progress) {
+        if (!transcriptionProgress || !progress) return;
+
+        if (progressHideTimer) {
+          clearTimeout(progressHideTimer);
+          progressHideTimer = null;
+        }
+
+        if (progress.state === 'recording') {
+          transcriptionProgress.classList.remove('active');
+          transcriptionProgress.textContent = '';
+          isTranscribing = false;
+          updateMicButtonState();
+          return;
+        }
+
+        if (progress.state === 'complete') {
+          isTranscribing = false;
+          transcriptionProgress.textContent = 'Transcrição concluída';
+          transcriptionProgress.classList.add('active');
+          progressHideTimer = setTimeout(() => {
+            transcriptionProgress.classList.remove('active');
+            transcriptionProgress.textContent = '';
+          }, 1500);
+          updateMicButtonState();
+          return;
+        }
+
+        const completed = Number(progress.completedSegments) || 0;
+        const current = Math.max(1, Number(progress.currentSegment) || completed + 1);
+        const total = Math.max(current, Number(progress.totalSegments) || current);
+        const draining = progress.phase === 'draining' || progress.finalizing;
+        // Periodic segments are transcribed while recording too. Only lock the
+        // mic after capture has stopped and the final queue is draining.
+        isTranscribing = !!progress.finalizing;
+        if (draining) {
+          const tailIndex = Number(progress.tailBatchIndex) || 1;
+          const tailTotal = Number(progress.tailBatchTotal) || 1;
+          transcriptionProgress.textContent = progress.currentLabel
+            ? progress.currentLabel + '…'
+            : `Transcrevendo áudio restante ${tailIndex}/${tailTotal}…`;
+        } else {
+          transcriptionProgress.textContent = `Transcrevendo segmento ${current}/${total}…`;
+        }
+        transcriptionProgress.classList.add('active');
+        updateMicButtonState();
+      }
+
       function showInterimText(text) {
         if (!interimOverlay) return;
 
@@ -982,7 +1082,10 @@
 
       // Recording Event Handlers
       function handleRecordingStarted() {
+        if (isRecording) return;
         isRecording = true;
+        isTranscribing = false;
+        updateMicButtonState();
 
         if (recordingIndicator) {
           recordingIndicator.style.display = 'block';
@@ -994,8 +1097,9 @@
         showListeningAnimation();
       }
 
-      function handleRecordingStopped() {
+      function handleRecordingStopped({ captureStopped = false } = {}) {
         isRecording = false;
+        updateMicButtonState();
 
         if (recordingIndicator) {
           recordingIndicator.style.display = 'none';
@@ -1005,22 +1109,22 @@
         }
 
         hideListeningAnimation();
-        addMessage('Stopped Listening', 'system');
+        if (!captureStopped) {
+          addMessage('Stopped Listening', 'system');
+        }
       }
 
       function handleTranscription(text) {
         if (text && typeof text === 'string' && text.trim().length > 0) {
-          // Hide listening animation first
-          hideListeningAnimation();
+          if (!isRecording) {
+            hideListeningAnimation();
+          }
 
-          // Show transcribed text with slight delay for smooth transition
+          // Show each fragment before the final answer. Thinking starts only
+          // when the main process explicitly begins the completed transcription
+          // request.
           setTimeout(() => {
             addMessage(text.trim(), 'transcription');
-            
-            // Show thinking indicator after transcription
-            setTimeout(() => {
-              showThinkingIndicator();
-            }, 300);
           }, 200);
         } else {
           console.warn('Invalid or empty transcription text - ignoring:', text);
@@ -1172,11 +1276,8 @@
           if (data && data.status) {
             addMessage(data.status, 'system');
 
-            if (data.status.includes('started') || data.status.includes('Recording')) {
-              handleRecordingStarted();
-            } else if (data.status.includes('stopped') || data.status.includes('ended')) {
-              handleRecordingStopped();
-            }
+            // Speech state is driven only by explicit recording events. Status
+            // text is informational; "Recording stopped" must never start UI capture.
           }
         });
 
@@ -1193,8 +1294,20 @@
           handleRecordingStarted();
         });
 
+        whysperAPI.onRecordingCaptureStopped(() => {
+          isTranscribing = true;
+          handleRecordingStopped({ captureStopped: true });
+          updateMicButtonState();
+        });
+
         whysperAPI.onRecordingStopped(() => {
+          isTranscribing = false;
           handleRecordingStopped();
+          updateMicButtonState();
+        });
+
+        whysperAPI.onTranscriptionProgress((event, progress) => {
+          updateTranscriptionProgress(progress);
         });
 
         whysperAPI.onSessionCleared(() => {
@@ -1202,6 +1315,11 @@
         });
 
         // Replace transcription LLM handler to store text + snippets
+        whysperAPI.onTranscriptionLlmResponseStart?.(() => {
+          hideThinkingIndicator();
+          showThinkingIndicator();
+        });
+
         whysperAPI.onTranscriptionLlmResponse((event, data) => {
           if (data && data.response) {
             try { hideThinkingIndicator(); } catch (_) {}
@@ -1226,18 +1344,28 @@
             return;
           }
 
+          if (micTogglePending || isTranscribing) return;
+
+          micTogglePending = true;
+          updateMicButtonState();
           try {
-            if (isRecording) {
-              if (whysperAPI) {
-                const result = await whysperAPI.stopSpeechRecognition();
-              }
-            } else {
-              if (whysperAPI) {
-                const result = await whysperAPI.startSpeechRecognition();
+            const result = isRecording
+              ? await whysperAPI.stopSpeechRecognition()
+              : await whysperAPI.startSpeechRecognition();
+
+            if (result) {
+              isTranscribing = !!result.isFinalizing;
+              if (result.isRecording && !isRecording) {
+                handleRecordingStarted();
+              } else if (!result.isRecording && isRecording) {
+                handleRecordingStopped({ captureStopped: isTranscribing });
               }
             }
           } catch (error) {
             addMessage("Error in recognizing speech", 'error');
+          } finally {
+            micTogglePending = false;
+            updateMicButtonState();
           }
         });
       }

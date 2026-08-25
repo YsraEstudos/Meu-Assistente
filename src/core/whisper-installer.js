@@ -131,6 +131,10 @@ class WhisperInstaller {
     // system install dirs may be read-only), so we default to userData.
     this.dataDir = options.dataDir || this.cwd;
     this.platform = options.platform || process.platform;
+    const requestedEngine = String(options.engine || process.env.WHISPER_ENGINE || 'openai').trim().toLowerCase();
+    this.engine = ['cpp', 'whisper.cpp', 'whispercpp', 'whisper-cpp'].includes(requestedEngine)
+      ? 'whisper-cpp'
+      : (requestedEngine === 'faster' ? 'faster' : 'openai');
     this.runExec = options.runExec || runExec;
   }
 
@@ -139,6 +143,8 @@ class WhisperInstaller {
   // ─────────────────────────────────────────────────────────────────
 
   get venvPath() {
+    if (this.engine === 'faster') return path.join(this.dataDir, '.venv-faster-whisper');
+    if (this.engine === 'whisper-cpp') return path.join(this.dataDir, '.venv-whisper-cpp');
     return path.join(this.dataDir, '.venv-whisper');
   }
 
@@ -150,6 +156,8 @@ class WhisperInstaller {
    * cause of models being "downloaded" but not found at transcribe time.
    */
   get modelDir() {
+    if (this.engine === 'faster') return path.join(this.dataDir, '.faster-whisper-models');
+    if (this.engine === 'whisper-cpp') return path.join(this.dataDir, '.whisper-cpp-models');
     return path.join(this.dataDir, '.whisper-models');
   }
 
@@ -175,6 +183,8 @@ class WhisperInstaller {
   // ─────────────────────────────────────────────────────────────────
 
   async detect() {
+    if (this.engine === 'whisper-cpp') return this._detectWhisperCpp();
+    if (this.engine === 'faster') return this._detectFaster();
     // 1. Honor WHISPER_COMMAND env if user has it set already
     const fromEnv = (process.env.WHISPER_COMMAND || '').trim();
     if (fromEnv) {
@@ -233,6 +243,8 @@ class WhisperInstaller {
    * @returns {Promise<{ok: boolean, command: string|null, message: string, logs: string}>}
    */
   async install({ onProgress } = {}) {
+    if (this.engine === 'whisper-cpp') return this._installWhisperCpp({ onProgress });
+    if (this.engine === 'faster') return this._installFaster({ onProgress });
     const log = (line) => {
       if (typeof onProgress === 'function') onProgress(line);
     };
@@ -364,6 +376,220 @@ class WhisperInstaller {
     };
   }
 
+  async _detectWhisperCpp() {
+    const binary = this._findWhisperCppBinary();
+    const base = {
+      found: false,
+      command: null,
+      version: null,
+      source: 'none',
+      engine: 'whisper-cpp',
+      available: false,
+      backend: process.env.WHISPER_CPP_BACKEND || 'vulkan'
+    };
+    if (!binary) return base;
+    const probe = await this.runExec(binary, ['--help'], { timeout: 15000 });
+    if (!probe.ok) return { ...base, command: binary, source: 'probe' };
+    const versionMatch = ((probe.stdout || '') + '\n' + (probe.stderr || '')).match(/whisper\.cpp[^\d]*(\d+(?:\.\d+)+)/i);
+    return { ...base, found: true, available: true, command: binary, version: versionMatch ? versionMatch[1] : null, source: process.env.WHISPER_CPP_COMMAND ? 'env' : 'probe' };
+  }
+
+  async _detectFaster() {
+    const vp = this.venvPaths;
+    const device = process.env.WHISPER_FASTER_DEVICE || 'cpu';
+    const computeType = process.env.WHISPER_FASTER_COMPUTE_TYPE || 'int8';
+    if (!fs.existsSync(vp.python)) return { found: false, command: null, version: null, source: 'none', engine: 'faster', available: false, device, computeType };
+    const probe = await this.runExec(vp.python, ['-c', 'import faster_whisper; print("ok")'], { timeout: 15000 });
+    return { found: probe.ok, command: probe.ok ? vp.python : null, version: probe.ok ? 'faster-whisper' : null, source: 'venv', engine: 'faster', available: probe.ok, device, computeType };
+  }
+
+  async _installFaster({ onProgress } = {}) {
+    const log = (line) => { if (typeof onProgress === 'function' && line) onProgress(line); };
+    const python = this._detectPython();
+    if (!python) return { ok: false, command: null, message: 'Python 3 not found for Faster Whisper.', logs: '' };
+    const vp = this.venvPaths;
+    if (!fs.existsSync(vp.python)) {
+      const preflight = await this.runExec(python, ['-c', 'import ensurepip, venv'], { timeout: 15000 });
+      if (!preflight.ok) return { ok: false, command: null, message: 'Python is missing the venv/ensurepip module.', logs: preflight.stderr || '' };
+      log('→ Creating Faster Whisper venv at ' + this.venvPath + '…');
+      const venvResult = await this.runExec(python, ['-m', 'venv', this.venvPath], { timeout: 60000, onProgress: log });
+      if (!venvResult.ok) return { ok: false, command: null, message: 'Failed to create Faster Whisper venv: ' + (venvResult.stderr || venvResult.error), logs: venvResult.stderr || '' };
+    }
+    const gpu = await this._detectGpu(python, log);
+    let device = 'cpu';
+    let computeType = 'int8';
+    if (gpu.device === 'cuda') {
+      device = 'cuda';
+      computeType = 'float16';
+      log('NVIDIA GPU detected: ' + (gpu.gpuName || 'NVIDIA GPU') + '. Installing CUDA support…');
+    } else if (gpu.vulkan && gpu.vulkanGpuName) {
+      log('AMD/other GPU detected through Vulkan, but Faster Whisper will use safe CPU int8.');
+    } else {
+      log('No Faster Whisper GPU runtime detected. Using device=cpu, compute_type=int8.');
+    }
+    const pipResult = await this.runExec(vp.python, ['-m', 'pip', 'install', '--upgrade', 'pip', 'faster-whisper'], { timeout: INSTALL_TIMEOUT_MS, onProgress: log });
+    if (!pipResult.ok) return { ok: false, command: null, message: 'pip install failed: ' + (pipResult.stderr || pipResult.error), logs: pipResult.stderr || '' };
+    let supportLogs = '';
+    if (device === 'cuda') {
+      const cudaResult = await this.runExec(vp.python, ['-m', 'pip', 'install', 'nvidia-cublas-cu12', 'nvidia-cudnn-cu12'], { timeout: INSTALL_TIMEOUT_MS, onProgress: log });
+      supportLogs = cudaResult.stdout || '';
+      if (!cudaResult.ok) log('! CUDA runtime packages could not be installed: ' + (cudaResult.stderr || cudaResult.error));
+    }
+    return { ok: true, command: vp.python + ' -m scripts.faster-whisper-worker', message: 'Installed Faster Whisper into ' + this.venvPath, logs: [pipResult.stdout, supportLogs].filter(Boolean).join('\n'), engine: 'faster', modelDir: this.modelDir, device, computeType, gpuName: gpu.gpuName || gpu.vulkanGpuName || '' };
+  }
+
+  _getScriptPath(filename) {
+    const candidates = [];
+    if (process.resourcesPath) candidates.push(path.join(process.resourcesPath, 'app.asar.unpacked', 'scripts', filename));
+    candidates.push(path.resolve(__dirname, '..', '..', 'scripts', filename));
+    candidates.push(path.join(this.cwd, 'scripts', filename));
+    return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+  }
+
+  async _detectGpu(python, log) {
+    const fallback = { device: 'cpu', cuda: false, rocm: false, gpuName: '', vulkan: false, vulkanGpuName: '' };
+    const scriptPath = this._getScriptPath('detect-gpu.py');
+    if (!scriptPath) return fallback;
+    const result = await this.runExec(python, [scriptPath], { timeout: 10000 });
+    if (!result.ok) {
+      if (typeof log === 'function') log('! GPU detection failed; continuing with CPU fallback.');
+      return fallback;
+    }
+    try {
+      const payload = JSON.parse(String(result.stdout || '').trim());
+      const device = ['cuda', 'rocm', 'cpu'].includes(payload.device) ? payload.device : 'cpu';
+      return { device, cuda: device === 'cuda', rocm: device === 'rocm', gpuName: String(payload.gpuName || ''), vulkan: payload.vulkan === true, vulkanGpuName: String(payload.vulkanGpuName || '') };
+    } catch (_) {
+      if (typeof log === 'function') log('! GPU detection returned invalid JSON; continuing with CPU fallback.');
+      return fallback;
+    }
+  }
+
+  async _detectCpu(python, log) {
+    const fallback = { vendor: 'unknown', cpuName: '', has_avx2: false, has_avx512: false, blas_available: false, openblas_version: null, logical_cpus: 1, platform: this.platform };
+    const scriptPath = this._getScriptPath('detect-cpu.py');
+    if (!scriptPath) return fallback;
+    const result = await this.runExec(python, [scriptPath], { timeout: 10000 });
+    if (!result.ok) {
+      if (typeof log === 'function') log('! CPU detection failed; continuing without CPU hints.');
+      return fallback;
+    }
+    try {
+      return { ...fallback, ...JSON.parse(String(result.stdout || '').trim()) };
+    } catch (_) {
+      if (typeof log === 'function') log('! CPU detection returned invalid JSON; continuing without CPU hints.');
+      return fallback;
+    }
+  }
+
+  _resolveTool(command) {
+    if (!command) return null;
+    if (path.isAbsolute(command) && fs.existsSync(command)) return command;
+    try {
+      const locator = this.platform === 'win32' ? 'where' : 'which';
+      const result = require('child_process').spawnSync(locator, [command], { encoding: 'utf8', windowsHide: true });
+      if (result.status === 0) return String(result.stdout || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean) || command;
+    } catch (_) { /* ignore */ }
+    return null;
+  }
+
+  _findWhisperCppBinary() {
+    const configured = (process.env.WHISPER_CPP_COMMAND || '').trim();
+    if (configured) {
+      const parsed = this._parseCommandString(configured);
+      if (parsed && parsed[0]) {
+        if (fs.existsSync(parsed[0])) return parsed[0];
+        const resolved = this._resolveTool(parsed[0]);
+        if (resolved) return resolved;
+      }
+    }
+    const extension = this.platform === 'win32' ? '.exe' : '';
+    const roots = [path.join(this.dataDir, '.whisper.cpp'), path.join(this.cwd, '.whisper.cpp'), path.join(this.cwd, 'whisper.cpp')];
+    const candidates = [];
+    for (const root of roots) {
+      candidates.push(path.join(root, 'build', 'bin', 'whisper-cli' + extension), path.join(root, 'build', 'bin', 'Release', 'whisper-cli' + extension), path.join(root, 'build', 'Release', 'whisper-cli' + extension), path.join(root, 'build', 'bin', 'main' + extension), path.join(root, 'build', 'bin', 'Release', 'main' + extension));
+    }
+    for (const candidate of candidates) if (fs.existsSync(candidate)) return candidate;
+    for (const command of this.platform === 'win32' ? ['whisper-cli.exe', 'whisper-cli', 'main.exe', 'main'] : ['whisper-cli', 'main']) {
+      const resolved = this._resolveTool(command);
+      if (resolved) return resolved;
+    }
+    return null;
+  }
+
+  async _installWhisperCpp({ onProgress } = {}) {
+    const log = (line) => { if (typeof onProgress === 'function' && line) onProgress(line); };
+    const python = this._detectPython();
+    if (!python) return { ok: false, command: null, message: 'Python 3 is required for whisper.cpp.', logs: '' };
+    log('→ Detecting CPU and Vulkan capabilities…');
+    const cpu = await this._detectCpu(python, log);
+    const gpu = await this._detectGpu(python, log);
+    const threads = Math.max(1, Math.min(32, Number(cpu.logical_cpus) || 4));
+    const vulkanEnabled = gpu.vulkan === true;
+    log('✓ CPU: ' + (cpu.cpuName || cpu.vendor || 'unknown') + ' (' + threads + ' logical CPUs)');
+    if (vulkanEnabled) log('✓ Vulkan GPU: ' + (gpu.vulkanGpuName || gpu.gpuName || 'GPU') + ' — enabling Vulkan');
+    else log('→ Vulkan runtime unavailable — building CPU fallback');
+
+    const vp = this.venvPaths;
+    if (!fs.existsSync(vp.python)) {
+      const preflight = await this.runExec(python, ['-c', 'import ensurepip, venv'], { timeout: 15000 });
+      if (!preflight.ok) return { ok: false, command: null, message: 'Python is missing the venv/ensurepip module.', logs: preflight.stderr || '' };
+      log('→ Creating whisper.cpp worker venv at ' + this.venvPath + '…');
+      const venvResult = await this.runExec(python, ['-m', 'venv', this.venvPath], { timeout: 60000, onProgress: log });
+      if (!venvResult.ok) return { ok: false, command: null, message: 'Failed to create whisper.cpp worker venv: ' + (venvResult.stderr || venvResult.error), logs: venvResult.stderr || '' };
+    }
+
+    let binary = this._findWhisperCppBinary();
+    let buildLogs = '';
+    if (!binary) {
+      const git = this._resolveTool('git');
+      const cmake = this._resolveTool('cmake');
+      if (!git || !cmake) return { ok: false, command: null, message: 'whisper.cpp not found. Install Git and CMake or set WHISPER_CPP_COMMAND.', logs: '' };
+      const sourceDir = path.join(this.dataDir, '.whisper.cpp');
+      if (!fs.existsSync(path.join(sourceDir, 'CMakeLists.txt'))) {
+        log('→ Cloning whisper.cpp v1.9.1…');
+        const clone = await this.runExec(git, ['clone', '--branch', 'v1.9.1', '--depth', '1', 'https://github.com/ggml-org/whisper.cpp.git', sourceDir], { timeout: 600000, onProgress: log });
+        buildLogs += clone.stdout || '';
+        if (!clone.ok) return { ok: false, command: null, message: 'Failed to clone whisper.cpp: ' + (clone.stderr || clone.error), logs: buildLogs };
+      }
+      const buildDir = path.join(sourceDir, 'build');
+      const configureArgs = ['-S', sourceDir, '-B', buildDir, '-DCMAKE_BUILD_TYPE=Release', '-DGGML_VULKAN=' + (vulkanEnabled ? 'ON' : 'OFF')];
+      if (cpu.blas_available) configureArgs.push('-DGGML_BLAS=ON', '-DGGML_BLAS_VENDOR=OpenBLAS');
+      log('→ Configuring whisper.cpp with ' + (vulkanEnabled ? 'Vulkan' : 'native CPU kernels') + '…');
+      const configure = await this.runExec(cmake, configureArgs, { timeout: 600000, onProgress: log });
+      buildLogs += configure.stdout || '';
+      if (!configure.ok) return { ok: false, command: null, message: 'CMake configuration failed: ' + (configure.stderr || configure.error), logs: buildLogs };
+      const build = await this.runExec(cmake, ['--build', buildDir, '--config', 'Release'], { timeout: 900000, onProgress: log });
+      buildLogs += build.stdout || '';
+      if (!build.ok) return { ok: false, command: null, message: 'whisper.cpp build failed: ' + (build.stderr || build.error), logs: buildLogs };
+      binary = this._findWhisperCppBinary();
+    }
+    if (!binary) return { ok: false, command: null, message: 'whisper-cli was not found after the build.', logs: buildLogs };
+    try { fs.mkdirSync(this.modelDir, { recursive: true }); } catch (_) { /* best effort */ }
+    return { ok: true, command: binary, binary, python: vp.python, engine: 'whisper-cpp', modelDir: this.modelDir, threads, blas: !!cpu.blas_available, backend: vulkanEnabled ? 'vulkan' : 'cpu', vulkan: vulkanEnabled, gpuName: gpu.vulkanGpuName || gpu.gpuName || '', message: 'Installed whisper.cpp v1.9.1 into ' + this.dataDir, logs: buildLogs };
+  }
+
+  _normaliseWhisperCppModelName(modelName) {
+    const raw = String(modelName || 'turbo').trim().toLowerCase().replace(/^ggml-/, '').replace(/\.bin$/, '');
+    return { turbo: 'large-v3-turbo', large: 'large-v3' }[raw] || raw;
+  }
+
+  async _downloadWhisperCppModel(modelName, { onProgress } = {}) {
+    const log = (line) => { if (typeof onProgress === 'function' && line) onProgress(line); };
+    const python = this._detectPython();
+    if (!python) return { ok: false, message: 'Python 3 is required to download whisper.cpp models.', path: null };
+    const modelPath = this._getModelPath(modelName);
+    if (fs.existsSync(modelPath)) return { ok: true, message: 'Model already exists', path: modelPath };
+    try { fs.mkdirSync(this.modelDir, { recursive: true }); } catch (_) { /* best effort */ }
+    const key = this._normaliseWhisperCppModelName(modelName);
+    const url = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-' + key + '.bin';
+    log('→ Downloading whisper.cpp ' + modelName + ' model…');
+    const script = 'import urllib.request; urllib.request.urlretrieve(' + JSON.stringify(url) + ', ' + JSON.stringify(modelPath) + '); print("model_downloaded")';
+    const result = await this.runExec(python, ['-c', script], { timeout: 900000, onProgress: log });
+    if (!result.ok || !fs.existsSync(modelPath)) return { ok: false, message: 'Model download failed: ' + (result.stderr || result.error), path: null };
+    return { ok: true, message: 'Model downloaded successfully', path: modelPath };
+  }
+
   /**
    * Probe for ffmpeg on PATH. Returns { found, path }.
    */
@@ -387,6 +613,27 @@ class WhisperInstaller {
    * Short platform-tailored hints to show the user in the wizard.
    */
   installHints() {
+    if (this.engine === 'whisper-cpp') {
+      return {
+        title: 'whisper.cpp v1.9.1 com Vulkan para GPU AMD',
+        steps: [
+          'Detecta a Radeon pelo runtime Vulkan antes da compilação.',
+          'Compila whisper.cpp v1.9.1 com GGML_VULKAN=ON quando o Vulkan SDK está disponível.',
+          'Executa whisper-cli como processo separado e confirma o backend no diagnóstico.',
+          'Se Vulkan ou o modelo falhar, usa Faster Whisper CPU int8 como fallback.',
+        ],
+      };
+    }
+    if (this.engine === 'faster') {
+      return {
+        title: 'Faster Whisper em venv isolado',
+        steps: [
+          'Usa CUDA somente quando nvidia-smi confirmar uma GPU NVIDIA.',
+          'Para AMD sem ROCm suportado, mantém CPU int8.',
+          'O worker fica isolado em .venv-faster-whisper.',
+        ],
+      };
+    }
     switch (this.platform) {
       case 'win32':
         return {
@@ -554,6 +801,7 @@ class WhisperInstaller {
   }
 
   async downloadModel(modelName = 'turbo', { onProgress } = {}) {
+    if (this.engine === 'whisper-cpp') return this._downloadWhisperCppModel(modelName, { onProgress });
     const log = (line) => {
       if (typeof onProgress === 'function' && line) {
         try { onProgress(line); } catch (_) { /* ignore */ }
@@ -617,7 +865,8 @@ class WhisperInstaller {
    * Get the expected model cache path inside our unified model dir.
    */
   _getModelPath(modelName) {
-    return path.join(this.modelDir, `${modelName}.pt`);
+    if (this.engine === 'whisper-cpp') return path.join(this.modelDir, 'ggml-' + this._normaliseWhisperCppModelName(modelName) + '.bin');
+    return path.join(this.modelDir, modelName + '.pt');
   }
 }
 

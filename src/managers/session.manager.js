@@ -8,7 +8,7 @@ class SessionManager {
     this.compressionEnabled = true;
     this.maxSize = config.get('session.maxMemorySize');
     this.compressionThreshold = config.get('session.compressionThreshold');
-    this.currentSkill = 'dsa'; // Default skill is DSA
+    this.currentSkill = 'general'; // Default skill accepts any topic
     this.isInitialized = false;
     
     this.initializeWithSkillPrompts();

@@ -795,7 +795,16 @@ Always respond to the point, do not repeat the question or unnecessary informati
       prompt += `\n\nCODING CONTEXT: Respond ONLY in ${languageTitle}. All code blocks must use triple backticks with language tag \`\`\`${fenceTag}\`\`\`. Do not include other languages unless explicitly asked.`;
     }
 
-    prompt += `
+    if (activeSkill === 'general') {
+      prompt += `
+
+## Response Rules:
+- Answer questions on any topic instead of asking for a DSA question.
+- Respond naturally to greetings and casual conversation.
+- Provide complete, useful answers with examples when appropriate.
+- Ask for clarification only when necessary.`;
+    } else {
+      prompt += `
 
 ## Response Rules:
 
@@ -831,6 +840,7 @@ If the user's input is a coding or DSA problem statement and contains no code, p
 
 Remember: Be intelligent about filtering - only provide detailed responses when the user actually needs help with ${activeSkill}.`;
 
+    }
     return prompt;
   }
 
@@ -1371,7 +1381,11 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     const seemsLikeQuestion = questionIndicators.some(indicator => textLower.includes(indicator));
 
     let response;
-    if (hasRelevantKeywords || seemsLikeQuestion) {
+    if (activeSkill === 'general') {
+      response = seemsLikeQuestion
+        ? "I'm having trouble processing that right now. Could you rephrase your question?"
+        : "I'm listening. Tell me what you need help with.";
+    } else if (hasRelevantKeywords || seemsLikeQuestion) {
       response = `I'm having trouble processing that right now, but it sounds like a ${activeSkill} question. Could you rephrase or ask more specifically about what you need help with?`;
     } else {
       response = `Yeah, I'm listening. Ask your question relevant to ${activeSkill}.`;

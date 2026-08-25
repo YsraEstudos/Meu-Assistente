@@ -48,6 +48,11 @@
     azureKey: '',
     azureRegion: '',
     whisperCmd: null,
+    whisperCppCommand: null,
+    whisperCppBackend: 'vulkan',
+    whisperEngine: 'whisper-cpp',
+    whisperFasterDevice: 'cpu',
+    whisperFasterComputeType: 'int8',
     whisperDetected: false,
     skippingWhisper: false,
     modelDownloadChoice: null, // 'now' | 'later'
@@ -55,6 +60,23 @@
     modelDownloaded: false,
     finished: false,
   };
+
+  function whisperSettingsPayload() {
+    const engine = state.whisperEngine || 'whisper-cpp';
+    const payload = { speechProvider: 'whisper', whisperEngine: engine };
+    if (engine === 'faster') {
+      payload.whisperCommand = '';
+      payload.whisperFasterDevice = state.whisperFasterDevice || 'cpu';
+      payload.whisperFasterComputeType = state.whisperFasterComputeType || 'int8';
+    } else if (engine === 'whisper-cpp') {
+      payload.whisperCommand = '';
+      payload.whisperCppCommand = state.whisperCppCommand || state.whisperCmd || '';
+      payload.whisperCppBackend = state.whisperCppBackend || 'vulkan';
+    } else if (state.whisperCmd) {
+      payload.whisperCommand = quoteCommandIfNeeded(state.whisperCmd);
+    }
+    return payload;
+  }
 
   // Screens are: welcome → apikey → speech → whisper? → finish
   // The whisper screen is only visited if state.speechProvider === 'whisper'
@@ -243,8 +265,13 @@
       const r = await window.electronAPI.detectWhisper();
       if (r.found) {
         state.whisperDetected = true;
-        state.whisperCmd = r.command;
-        detectCmd.textContent = r.command;
+        state.whisperEngine = r.engine || state.whisperEngine || 'whisper-cpp';
+        state.whisperFasterDevice = r.device || state.whisperFasterDevice;
+        state.whisperFasterComputeType = r.computeType || state.whisperFasterComputeType;
+        state.whisperCmd = state.whisperEngine === 'openai' ? r.command : null;
+        state.whisperCppCommand = state.whisperEngine === 'whisper-cpp' ? (r.command || null) : null;
+        state.whisperCppBackend = r.backend || state.whisperCppBackend || 'vulkan';
+        detectCmd.textContent = r.command || 'Faster Whisper venv';
         setDetectStatus('success', `Found v${r.version || '?'}`);
         appendLog(`✓ Detected Whisper CLI: ${r.command}`);
       } else {
@@ -286,10 +313,18 @@
       const r = await window.electronAPI.installWhisper();
       if (r.ok) {
         state.whisperDetected = true;
-        state.whisperCmd = r.command;
-        detectCmd.textContent = r.command;
+        state.whisperEngine = r.engine || state.whisperEngine || 'whisper-cpp';
+        state.whisperFasterDevice = r.device || state.whisperFasterDevice;
+        state.whisperFasterComputeType = r.computeType || state.whisperFasterComputeType;
+        state.whisperCmd = state.whisperEngine === 'openai' ? r.command : null;
+        state.whisperCppCommand = state.whisperEngine === 'whisper-cpp' ? (r.command || null) : null;
+        state.whisperCppBackend = r.backend || state.whisperCppBackend || 'vulkan';
+        detectCmd.textContent = r.command || 'Faster Whisper venv';
         setDetectStatus('success', 'Installed');
         appendLog(`\n✓ ${r.message}`);
+        if (window.electronAPI) {
+          await window.electronAPI.saveSettings(whisperSettingsPayload());
+        }
         if (btn) {
           // Keep button disabled — install is done. Show a checkmark
           // so the user sees the final state at a glance.
@@ -536,8 +571,8 @@
           payload.azureKey = state.azureKey;
           payload.azureRegion = state.azureRegion;
         }
-        if (state.speechProvider === 'whisper' && state.whisperCmd) {
-          payload.whisperCommand = quoteCommandIfNeeded(state.whisperCmd);
+        if (payload.speechProvider === 'whisper') {
+          Object.assign(payload, whisperSettingsPayload());
         }
         await window.electronAPI.saveSettings(payload);
       } catch (_) { /* surfaced elsewhere */ }
@@ -550,10 +585,10 @@
 
     // Whisper screen "Continue" — if user wants to skip install, mark and proceed
     if (name === 'whisper') {
-      // Persist whatever whisper command we found (could be empty if skipped)
-      if (window.electronAPI && state.whisperCmd) {
+      // Persist the selected engine and the installer's detected hardware defaults.
+      if (window.electronAPI && state.whisperDetected) {
         try {
-          await window.electronAPI.saveSettings({ whisperCommand: quoteCommandIfNeeded(state.whisperCmd) });
+          await window.electronAPI.saveSettings(whisperSettingsPayload());
         } catch (_) { /* ignore */ }
       }
     }

@@ -9,8 +9,24 @@ SETUP_WHISPER=1
 WHISPER_MODEL="${WHISPER_MODEL:-base}"
 WHISPER_LANGUAGE="${WHISPER_LANGUAGE:-en}"
 WHISPER_SEGMENT_MS="${WHISPER_SEGMENT_MS:-4000}"
+WHISPER_BATCH_SIZE="${WHISPER_BATCH_SIZE:-4}"
+WHISPER_BATCH_TIMEOUT_MS="${WHISPER_BATCH_TIMEOUT_MS:-2000}"
+WHISPER_MAX_CONCURRENT="${WHISPER_MAX_CONCURRENT:-4}"
+WHISPER_BEAM_SIZE="${WHISPER_BEAM_SIZE:-5}"
+WHISPER_ENGINE="${WHISPER_ENGINE:-whisper-cpp}"
+WHISPER_FASTER_DEVICE="${WHISPER_FASTER_DEVICE:-}"
+WHISPER_FASTER_COMPUTE_TYPE="${WHISPER_FASTER_COMPUTE_TYPE:-}"
+WHISPER_CPP_COMMAND="${WHISPER_CPP_COMMAND:-}"
+WHISPER_CPP_PYTHON="${WHISPER_CPP_PYTHON:-}"
+WHISPER_CPP_THREADS="${WHISPER_CPP_THREADS:-4}"
+WHISPER_CPP_BLAS="${WHISPER_CPP_BLAS:-auto}"
+WHISPER_CPP_BACKEND="${WHISPER_CPP_BACKEND:-vulkan}"
+WHISPER_CPP_MODEL_DIR="${WHISPER_CPP_MODEL_DIR:-.whisper-cpp-models}"
+WHISPER_CPP_MODEL="${WHISPER_CPP_MODEL:-}"
 WHISPER_VENV_DIR=".venv-whisper"
+WHISPER_FASTER_VENV_DIR=".venv-faster-whisper"
 WHISPER_MODEL_DIR=".whisper-models"
+WHISPER_FASTER_MODEL_DIR=".faster-whisper-models"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OS_NAME="unknown"
 PLATFORM_BUILD_SCRIPT="build"
@@ -50,6 +66,17 @@ Environment variables:
   WHISPER_MODEL           Whisper model to configure (default: turbo)
   WHISPER_LANGUAGE        Whisper language to configure (default: en)
   WHISPER_SEGMENT_MS      Segment size in ms (default: 4000)
+  WHISPER_ENGINE          Whisper engine selector: whisper-cpp|faster|openai (default: whisper-cpp)
+  WHISPER_CPP_COMMAND     whisper-cli binary path (default: auto-detected or built)
+  WHISPER_CPP_THREADS     whisper.cpp CPU threads (default: 4)
+  WHISPER_CPP_BLAS        OpenBLAS mode: auto|true|false (default: auto)
+  WHISPER_CPP_BACKEND     whisper.cpp backend: vulkan|cpu|auto (default: vulkan)
+  WHISPER_FASTER_DEVICE   Faster Whisper device (default: auto-detected)
+  WHISPER_FASTER_COMPUTE_TYPE Faster Whisper compute type (default: auto-detected)
+  WHISPER_BATCH_SIZE      Faster Whisper segments per batch (default: 4)
+  WHISPER_BATCH_TIMEOUT_MS Partial batch timeout in ms (default: 2000)
+  WHISPER_MAX_CONCURRENT  Faster Whisper worker concurrency (default: 4)
+  WHISPER_BEAM_SIZE       Faster Whisper beam size (default: 5)
 
 Example:
   GEMINI_API_KEY=your_key_here ./setup.sh --install-system-deps
@@ -121,6 +148,49 @@ ensure_env_file() {
       echo "Error: env.example is missing"
       exit 1
     fi
+  fi
+
+  if ! grep -q '^WHISPER_ENGINE=' .env 2>/dev/null; then
+    echo "WHISPER_ENGINE=${WHISPER_ENGINE}" >> .env
+  fi
+  if ! grep -q '^WHISPER_FASTER_DEVICE=' .env 2>/dev/null; then
+    echo "WHISPER_FASTER_DEVICE=${WHISPER_FASTER_DEVICE:-cpu}" >> .env
+  fi
+  if ! grep -q '^WHISPER_FASTER_COMPUTE_TYPE=' .env 2>/dev/null; then
+    echo "WHISPER_FASTER_COMPUTE_TYPE=${WHISPER_FASTER_COMPUTE_TYPE:-int8}" >> .env
+  fi
+  if ! grep -q '^WHISPER_CPP_COMMAND=' .env 2>/dev/null; then
+    echo "WHISPER_CPP_COMMAND=${WHISPER_CPP_COMMAND}" >> .env
+  fi
+  if ! grep -q '^WHISPER_CPP_PYTHON=' .env 2>/dev/null; then
+    echo "WHISPER_CPP_PYTHON=${WHISPER_CPP_PYTHON}" >> .env
+  fi
+  if ! grep -q '^WHISPER_CPP_THREADS=' .env 2>/dev/null; then
+    echo "WHISPER_CPP_THREADS=${WHISPER_CPP_THREADS}" >> .env
+  fi
+  if ! grep -q '^WHISPER_CPP_BLAS=' .env 2>/dev/null; then
+    echo "WHISPER_CPP_BLAS=${WHISPER_CPP_BLAS}" >> .env
+  fi
+  if ! grep -q '^WHISPER_CPP_BACKEND=' .env 2>/dev/null; then
+    echo "WHISPER_CPP_BACKEND=${WHISPER_CPP_BACKEND}" >> .env
+  fi
+  if ! grep -q '^WHISPER_CPP_MODEL_DIR=' .env 2>/dev/null; then
+    echo "WHISPER_CPP_MODEL_DIR=${WHISPER_CPP_MODEL_DIR}" >> .env
+  fi
+  if ! grep -q '^WHISPER_CPP_MODEL=' .env 2>/dev/null; then
+    echo "WHISPER_CPP_MODEL=${WHISPER_CPP_MODEL}" >> .env
+  fi
+  if ! grep -q '^WHISPER_BATCH_SIZE=' .env 2>/dev/null; then
+    echo "WHISPER_BATCH_SIZE=${WHISPER_BATCH_SIZE}" >> .env
+  fi
+  if ! grep -q '^WHISPER_BATCH_TIMEOUT_MS=' .env 2>/dev/null; then
+    echo "WHISPER_BATCH_TIMEOUT_MS=${WHISPER_BATCH_TIMEOUT_MS}" >> .env
+  fi
+  if ! grep -q '^WHISPER_MAX_CONCURRENT=' .env 2>/dev/null; then
+    echo "WHISPER_MAX_CONCURRENT=${WHISPER_MAX_CONCURRENT}" >> .env
+  fi
+  if ! grep -q '^WHISPER_BEAM_SIZE=' .env 2>/dev/null; then
+    echo "WHISPER_BEAM_SIZE=${WHISPER_BEAM_SIZE}" >> .env
   fi
 }
 
@@ -217,9 +287,170 @@ install_node_deps() {
   fi
 }
 
+detect_faster_gpu() {
+  local gpu_json
+  local gpu_info
+  local gpu_device
+  local gpu_name
+
+  gpu_json=$("$PYTHON_BIN" scripts/detect-gpu.py 2>/dev/null || true)
+  gpu_info=$("$PYTHON_BIN" -c 'import json,sys; p=json.loads(sys.stdin.read()); print("{}|{}".format(p.get("device","cpu"),p.get("gpuName","")))' <<<"$gpu_json" 2>/dev/null || true)
+  gpu_device="${gpu_info%%|*}"
+  gpu_name="${gpu_info#*|}"
+  gpu_device="${gpu_device:-cpu}"
+
+  case "$gpu_device" in
+    cuda)
+      [[ -n "$WHISPER_FASTER_DEVICE" ]] || WHISPER_FASTER_DEVICE="cuda"
+      [[ -n "$WHISPER_FASTER_COMPUTE_TYPE" ]] || WHISPER_FASTER_COMPUTE_TYPE="float16"
+      echo "Detected GPU: ${gpu_name:-NVIDIA GPU}. Using device=${WHISPER_FASTER_DEVICE}, compute_type=${WHISPER_FASTER_COMPUTE_TYPE}"
+      ;;
+    rocm)
+      echo "Detected GPU: ${gpu_name:-AMD GPU}. ROCm support requires manual wheel installation."
+      [[ -n "$WHISPER_FASTER_DEVICE" ]] || WHISPER_FASTER_DEVICE="cpu"
+      [[ -n "$WHISPER_FASTER_COMPUTE_TYPE" ]] || WHISPER_FASTER_COMPUTE_TYPE="int8"
+      echo "Using safe fallback: device=${WHISPER_FASTER_DEVICE}, compute_type=${WHISPER_FASTER_COMPUTE_TYPE}"
+      ;;
+    *)
+      [[ -n "$WHISPER_FASTER_DEVICE" ]] || WHISPER_FASTER_DEVICE="cpu"
+      [[ -n "$WHISPER_FASTER_COMPUTE_TYPE" ]] || WHISPER_FASTER_COMPUTE_TYPE="int8"
+      echo "No supported GPU detected. Using device=${WHISPER_FASTER_DEVICE}, compute_type=${WHISPER_FASTER_COMPUTE_TYPE}"
+      ;;
+  esac
+
+  GPU_DETECTED_DEVICE="$gpu_device"
+}
+
+setup_whisper_cpp_env() {
+  if [[ "$SETUP_WHISPER" -ne 1 ]]; then
+    echo "Skipping whisper.cpp setup"
+    return
+  fi
+
+  require_command "$PYTHON_BIN" "Python 3 is required for whisper.cpp setup."
+  local cpu_json
+  local cpu_summary
+  cpu_json=$("$PYTHON_BIN" scripts/detect-cpu.py 2>/dev/null || true)
+  cpu_summary=$("$PYTHON_BIN" -c 'import json,sys; p=json.loads(sys.stdin.read() or "{}"); print("{}|{}|{}|{}".format(p.get("vendor","unknown"),p.get("has_avx2",False),p.get("has_avx512",False),p.get("blas_available",False)))' <<<"$cpu_json" 2>/dev/null || true)
+  echo "Detected CPU: ${cpu_summary:-unknown}"
+  local cpu_blas="${cpu_summary##*|}"
+  if [[ "$WHISPER_CPP_BLAS" == "auto" && "$cpu_blas" == "True" ]]; then
+    WHISPER_CPP_BLAS="true"
+  fi
+  local gpu_json
+  local gpu_summary
+  gpu_json=$("$PYTHON_BIN" scripts/detect-gpu.py 2>/dev/null || true)
+  gpu_summary=$("$PYTHON_BIN" -c 'import json,sys; p=json.loads(sys.stdin.read() or "{}"); print("{}|{}|{}".format(p.get("gpuName",""),p.get("vulkan",False),p.get("vulkanGpuName",""))) ' <<<"$gpu_json" 2>/dev/null || true)
+  local gpu_name="${gpu_summary%%|*}"
+  local gpu_vulkan="${gpu_summary#*|}"
+  gpu_vulkan="${gpu_vulkan%%|*}"
+  local vulkan_gpu_name="${gpu_summary##*|}"
+  if [[ "$gpu_vulkan" == "True" ]]; then
+    echo "Detected Vulkan GPU: ${vulkan_gpu_name:-${gpu_name:-GPU}}"
+  else
+    echo "Vulkan runtime not detected; whisper.cpp will use CPU"
+    if [[ "$WHISPER_CPP_BACKEND" == "vulkan" ]]; then
+      WHISPER_CPP_BACKEND="cpu"
+    fi
+  fi
+  if [[ "$WHISPER_CPP_BACKEND" == "auto" ]]; then
+    if [[ "$gpu_vulkan" == "True" ]]; then WHISPER_CPP_BACKEND="vulkan"; else WHISPER_CPP_BACKEND="cpu"; fi
+  fi
+
+
+  if [[ ! -d ".venv-whisper-cpp" ]]; then
+    echo "Creating whisper.cpp worker virtual environment at .venv-whisper-cpp"
+    "$PYTHON_BIN" -m venv .venv-whisper-cpp || {
+      echo "WARNING: Could not create .venv-whisper-cpp"
+      return
+    }
+  fi
+  if [[ "$OS_NAME" == "windows" ]]; then
+    WHISPER_CPP_PYTHON=".venv-whisper-cpp/Scripts/python.exe"
+  else
+    WHISPER_CPP_PYTHON=".venv-whisper-cpp/bin/python"
+  fi
+
+  local binary="${WHISPER_CPP_COMMAND:-}"
+  if [[ -z "$binary" ]] && command -v whisper-cli >/dev/null 2>&1; then
+    binary=$(command -v whisper-cli)
+  fi
+  if [[ -z "$binary" ]] && command -v main >/dev/null 2>&1; then
+    binary=$(command -v main)
+  fi
+
+  local source_dir=".whisper.cpp"
+  local build_dir="${source_dir}/build"
+  if [[ -z "$binary" && -x "$(command -v git 2>/dev/null || true)" && -x "$(command -v cmake 2>/dev/null || true)" ]]; then
+    if [[ ! -f "${source_dir}/CMakeLists.txt" ]]; then
+      echo "Cloning whisper.cpp into ${source_dir}"
+      git clone --branch v1.9.1 --depth 1 https://github.com/ggml-org/whisper.cpp.git "$source_dir" || {
+        echo "WARNING: Could not clone whisper.cpp"
+        return
+      }
+    fi
+    local cmake_args=("-S" "$source_dir" "-B" "$build_dir" "-DCMAKE_BUILD_TYPE=Release")
+    if [[ "$WHISPER_CPP_BACKEND" == "vulkan" ]]; then
+      cmake_args+=("-DGGML_VULKAN=ON")
+      echo "Configuring whisper.cpp v1.9.1 with Vulkan"
+    else
+      cmake_args+=("-DGGML_VULKAN=OFF")
+    fi
+    if [[ "$WHISPER_CPP_BLAS" == "true" ]]; then
+      cmake_args+=("-DGGML_BLAS=ON" "-DGGML_BLAS_VENDOR=OpenBLAS")
+      echo "Configuring whisper.cpp with OpenBLAS"
+    fi
+    cmake "${cmake_args[@]}" || {
+      echo "WARNING: CMake configuration failed for whisper.cpp"
+      return
+    }
+    cmake --build "$build_dir" --config Release || {
+      echo "WARNING: whisper.cpp build failed"
+      return
+    }
+    for candidate in \
+      "${source_dir}/build/bin/whisper-cli" \
+      "${source_dir}/build/bin/whisper-cli.exe" \
+      "${source_dir}/build/bin/Release/whisper-cli.exe" \
+      "${source_dir}/build/Release/whisper-cli.exe"; do
+      if [[ -f "$candidate" ]]; then
+        binary="$candidate"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "$binary" ]]; then
+    echo "WARNING: whisper-cli not found. Set WHISPER_CPP_COMMAND or install git + CMake and rerun setup."
+  else
+    echo "whisper.cpp binary: $binary"
+  fi
+
+  mkdir -p "${WHISPER_CPP_MODEL_DIR}"
+  upsert_env "SPEECH_PROVIDER" "whisper"
+  upsert_env "WHISPER_ENGINE" "whisper-cpp"
+  upsert_env "WHISPER_COMMAND" ""
+  upsert_env "WHISPER_CPP_COMMAND" "$binary"
+  upsert_env "WHISPER_CPP_PYTHON" "$WHISPER_CPP_PYTHON"
+  upsert_env "WHISPER_CPP_THREADS" "$WHISPER_CPP_THREADS"
+  upsert_env "WHISPER_CPP_BLAS" "$WHISPER_CPP_BLAS"
+  upsert_env "WHISPER_CPP_BACKEND" "$WHISPER_CPP_BACKEND"
+  upsert_env "WHISPER_CPP_MODEL_DIR" "$WHISPER_CPP_MODEL_DIR"
+  upsert_env "WHISPER_CPP_MODEL" "$WHISPER_CPP_MODEL"
+}
 setup_whisper_env() {
   if [[ "$SETUP_WHISPER" -ne 1 ]]; then
     echo "Skipping local Whisper setup"
+    return
+  fi
+
+  if [[ "$WHISPER_ENGINE" == "whisper-cpp" || "$WHISPER_ENGINE" == "cpp" ]]; then
+    setup_whisper_cpp_env
+    return
+  fi
+
+  if [[ "$WHISPER_ENGINE" != "faster" ]]; then
+    echo "WHISPER_ENGINE=openai; skipping local GPU setup"
     return
   fi
 
@@ -231,53 +462,63 @@ setup_whisper_env() {
 
   require_command "$PYTHON_BIN" "Python 3 is required for local Whisper setup."
 
-  if [[ ! -d "$WHISPER_VENV_DIR" ]]; then
-    echo "Creating Whisper virtual environment at $WHISPER_VENV_DIR"
-    "$PYTHON_BIN" -m venv "$WHISPER_VENV_DIR"
+  if [[ "$OS_NAME" == "windows" ]]; then
+    case "$(uname -m)" in
+      x86_64|amd64) ;;
+      i?86) echo "Faster Whisper is not supported on Windows ia32. Use x64 or set WHISPER_ENGINE=openai."; exit 1 ;;
+    esac
   fi
 
-  echo "Installing local Whisper into $WHISPER_VENV_DIR"
+  if [[ ! -d "$WHISPER_FASTER_VENV_DIR" ]]; then
+    echo "Creating Faster Whisper virtual environment at $WHISPER_FASTER_VENV_DIR"
+    "$PYTHON_BIN" -m venv "$WHISPER_FASTER_VENV_DIR"
+  fi
+
+  if [[ "$OS_NAME" == "windows" ]]; then WHISPER_PIP_PATH="${WHISPER_FASTER_VENV_DIR}/Scripts/pip.exe"; else WHISPER_PIP_PATH="${WHISPER_FASTER_VENV_DIR}/bin/pip"; fi
+
+  detect_faster_gpu
+
+  echo "Installing faster-whisper into $WHISPER_FASTER_VENV_DIR"
   "$WHISPER_PIP_PATH" install --upgrade pip || true
-  "$WHISPER_PIP_PATH" install openai-whisper || {
-    echo "WARNING: pip install openai-whisper failed. Whisper may be unavailable."
-    echo "Common causes: insufficient disk space (needs ~3-5 GB), missing Python headers, or network issues."
+  "$WHISPER_PIP_PATH" install faster-whisper || {
+    echo "WARNING: pip install faster-whisper failed. Faster Whisper may be unavailable."
+    echo "Common causes: insufficient disk space, missing Python headers, or network issues."
   }
 
-  mkdir -p "$WHISPER_MODEL_DIR"
+  if [[ "$GPU_DETECTED_DEVICE" == "cuda" ]]; then
+    echo "Installing CUDA runtime packages for Faster Whisper"
+    "$WHISPER_PIP_PATH" install nvidia-cublas-cu12 nvidia-cudnn-cu12 || {
+      echo "WARNING: CUDA runtime packages could not be installed. The CPU fallback may be required."
+    }
+  fi
+
+  mkdir -p "$WHISPER_FASTER_MODEL_DIR"
 
   # Verify the Whisper CLI actually exists before claiming it's configured
   local whisper_found=0
-  if [[ -f "$WHISPER_COMMAND_PATH" ]]; then
-    echo "Whisper CLI found at: $WHISPER_COMMAND_PATH"
+  if [[ -f "$WHISPER_FASTER_VENV_DIR/bin/python" || -f "$WHISPER_FASTER_VENV_DIR/Scripts/python.exe" ]]; then
+    echo "Faster Whisper venv ready at: $WHISPER_FASTER_VENV_DIR"
     whisper_found=1
   else
-    # Fallback: try python -m whisper inside the venv
-    local venv_python
-    if [[ "$OS_NAME" == "windows" ]]; then
-      venv_python="${WHISPER_VENV_DIR}/Scripts/python.exe"
-    else
-      venv_python="${WHISPER_VENV_DIR}/bin/python"
-    fi
-    if [[ -f "$venv_python" ]] && "$venv_python" -m whisper --help >/dev/null 2>&1; then
-      echo "Whisper CLI not found as standalone script, but 'python -m whisper' works."
-      echo "Adjusting WHISPER_COMMAND to use venv Python module."
-      WHISPER_COMMAND_PATH="$venv_python"
-      whisper_found=1
-    else
-      echo "WARNING: Whisper CLI not found at $WHISPER_COMMAND_PATH"
-      echo "Speech recognition will be unavailable until Whisper is properly installed."
-      echo "You can skip this with: ./setup.sh --skip-whisper"
-    fi
+    echo "WARNING: Faster Whisper venv not ready"
+    echo "Speech recognition will be unavailable until Faster Whisper is properly installed."
   fi
 
   upsert_env "SPEECH_PROVIDER" "whisper"
+  upsert_env "WHISPER_ENGINE" "faster"
   upsert_env "AZURE_SPEECH_KEY" ""
   upsert_env "AZURE_SPEECH_REGION" ""
-  upsert_env "WHISPER_COMMAND" "${WHISPER_COMMAND_PATH}"
-  upsert_env "WHISPER_MODEL_DIR" "${WHISPER_MODEL_DIR}"
+  upsert_env "WHISPER_COMMAND" ""
+  upsert_env "WHISPER_MODEL_DIR" "${WHISPER_FASTER_MODEL_DIR}"
   upsert_env "WHISPER_MODEL" "${WHISPER_MODEL}"
   upsert_env "WHISPER_LANGUAGE" "${WHISPER_LANGUAGE}"
   upsert_env "WHISPER_SEGMENT_MS" "${WHISPER_SEGMENT_MS}"
+  upsert_env "WHISPER_FASTER_DEVICE" "${WHISPER_FASTER_DEVICE}"
+  upsert_env "WHISPER_FASTER_COMPUTE_TYPE" "${WHISPER_FASTER_COMPUTE_TYPE}"
+  upsert_env "WHISPER_BATCH_SIZE" "${WHISPER_BATCH_SIZE}"
+  upsert_env "WHISPER_BATCH_TIMEOUT_MS" "${WHISPER_BATCH_TIMEOUT_MS}"
+  upsert_env "WHISPER_MAX_CONCURRENT" "${WHISPER_MAX_CONCURRENT}"
+  upsert_env "WHISPER_BEAM_SIZE" "${WHISPER_BEAM_SIZE}"
 
   if [[ "$whisper_found" -eq 1 ]]; then
     echo "Running Whisper smoke test"
