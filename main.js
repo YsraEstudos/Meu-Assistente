@@ -1,5 +1,6 @@
 const path = require("path");
 const fs = require("fs");
+const { fileURLToPath } = require("url");
 const { app, BrowserWindow, globalShortcut, session, ipcMain } = require("electron");
 
 // ── Resolve a stable .env location ──
@@ -20,7 +21,13 @@ function resolveEnvPath() {
     }
     return userDataEnv;
   } catch (_) {
-    return path.join(process.cwd(), ".env");
+    // On packaged macOS builds, process.cwd() may be inside a read-only .app
+    // bundle. Fall back to userData so .env writes never fail.
+    try {
+      return path.join(app.getPath("userData"), ".env");
+    } catch (e2) {
+      return path.join(process.cwd(), ".env");
+    }
   }
 }
 const ENV_PATH = resolveEnvPath();
@@ -352,7 +359,9 @@ class ApplicationController {
       try {
         const url = new URL(details.url);
         if (url.hostname === 'generativelanguage.googleapis.com') {
-          details.requestHeaders['User-Agent'] = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36';
+          details.requestHeaders['User-Agent'] = process.platform === 'darwin'
+            ? 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36'
+            : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36';
         }
       } catch (_) {
         // Leave malformed or non-HTTP requests untouched.
@@ -368,22 +377,56 @@ class ApplicationController {
   }
 
   setupPermissions() {
-    const allowedPermissions = ["media", "microphone", "camera", "display-capture"];
+    const appSession = session.defaultSession;
+    const isTrustedAppContents = (webContents) => {
+      if (!webContents || webContents.isDestroyed()) {
+        return false;
+      }
+      try {
+        const pagePath = path.resolve(fileURLToPath(webContents.getURL()));
+        const appRoot = path.resolve(__dirname);
+        const normalizeForComparison = (value) => process.platform === "win32"
+          ? value.toLowerCase()
+          : value;
+        const page = normalizeForComparison(pagePath);
+        const root = normalizeForComparison(appRoot + path.sep);
+        return page.startsWith(root);
+      } catch (_) {
+        return false;
+      }
+    };
 
-    session.defaultSession.setPermissionCheckHandler(
-      (_webContents, permission, _origin, details) => {
-        if (permission === "media") {
-          return !details?.mediaType || details.mediaType === "audio";
+    // Electron exposes camera/microphone access as the single `media`
+    // permission. The requested device type is provided separately in details.
+    appSession.setPermissionCheckHandler(
+      (webContents, permission, _requestingOrigin, details = {}) => {
+        if (!isTrustedAppContents(webContents)) {
+          return false;
         }
-        return allowedPermissions.includes(permission);
+        if (permission === "media") {
+          return !details.mediaType || details.mediaType === "audio";
+        }
+        return permission === "display-capture";
       }
     );
 
-    session.defaultSession.setPermissionRequestHandler(
-      (webContents, permission, callback) => {
-        const granted = allowedPermissions.includes(permission);
+    appSession.setPermissionRequestHandler(
+      (webContents, permission, callback, details = {}) => {
+        let granted = false;
+        if (isTrustedAppContents(webContents)) {
+          if (permission === "media") {
+            const mediaTypes = Array.isArray(details.mediaTypes) ? details.mediaTypes : [];
+            granted = mediaTypes.length === 0 || mediaTypes.includes("audio");
+          } else {
+            granted = permission === "display-capture";
+          }
+        }
 
-        logger.debug("Permission request", { permission, granted });
+        logger.debug("Permission request", {
+          permission,
+          mediaTypes: details.mediaTypes || [],
+          granted
+        });
         callback(granted);
       }
     );
@@ -936,7 +979,7 @@ class ApplicationController {
       try {
         const installer = this.getWhisperInstaller();
         const sender = event.sender;
-        const result = await installer.downloadModel(modelName || 'turbo', {
+        const result = await installer.downloadModel(modelName || 'small', {
           onProgress: (line) => {
             try { sender.send("install-progress", line); } catch (_) { /* ignore */ }
           },
@@ -1066,7 +1109,6 @@ class ApplicationController {
     if (currentStatus.isRecording) {
       try {
         speechService.stopRecording();
-        windowManager.hideChatWindow();
         logger.info("Speech recognition stopped via global shortcut");
       } catch (error) {
         logger.error("Error stopping speech recognition:", error);
@@ -1444,12 +1486,12 @@ class ApplicationController {
       const skillsRequiringProgrammingLanguage = ['dsa'];
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
-      // Stream the answer so it renders progressively in the chat + overlay.
+      // Stream the answer progressively to the configured speech target.
       // A unique messageId ties the start/chunk/final events to one bubble so
       // the UI never duplicates or interleaves concurrent responses.
       this._responseSeq = (this._responseSeq || 0) + 1;
       messageId = `tr-${Date.now()}-${this._responseSeq}`;
-      windowManager.broadcastToAllWindows("transcription-llm-response-start", {
+      this.sendToVoiceResponseWindows("transcription-llm-response-start", {
         messageId,
         skill: this.activeSkill
       });
@@ -1457,14 +1499,13 @@ class ApplicationController {
       // Surface the overlay immediately so streamed tokens are visible there
       // too, instead of the overlay only appearing once the full answer lands.
       windowManager.showLLMLoading();
-
       const llmResult = await llmService.processTranscriptionWithIntelligentResponseStream(
         cleanText,
         this.activeSkill,
         sessionHistory.recent,
         needsProgrammingLanguage ? this.codingLanguage : null,
         (delta) => {
-          windowManager.broadcastToAllWindows("transcription-llm-response-chunk", {
+          this.sendToVoiceResponseWindows("transcription-llm-response-chunk", {
             messageId,
             delta
           });
@@ -1481,18 +1522,15 @@ class ApplicationController {
         isTranscriptionResponse: true
       });
 
-      // Send response to chat windows
-      this.broadcastTranscriptionLLMResponse(llmResult);
-
-      // Also display in the overlay (LLM response) window so the answer
-      // appears in both the chat panel and the floating overlay, mirroring
-      // the behaviour of screenshot/image responses.
-      windowManager.showLLMResponse(llmResult.response, {
-        skill: this.activeSkill,
-        processingTime: llmResult.metadata.processingTime,
-        usedFallback: llmResult.metadata.usedFallback,
-        isTranscriptionResponse: true
-      });
+      this.sendTranscriptionLLMResponseToVoiceTargets(llmResult);
+      if (this.shouldShowVoiceOverlay()) {
+        windowManager.showLLMResponse(llmResult.response, {
+          skill: this.activeSkill,
+          processingTime: llmResult.metadata.processingTime,
+          usedFallback: llmResult.metadata.usedFallback,
+          isTranscriptionResponse: true
+        });
+      }
 
       logger.info("Transcription LLM response completed", {
         responseLength: llmResult.response.length,
@@ -1512,7 +1550,7 @@ class ApplicationController {
       // Try to provide a fallback response
       try {
         const fallbackResult = llmService.generateIntelligentFallbackResponse(text, this.activeSkill);
-        // Carry the streaming messageId so the chat/overlay replace the live
+        // Carry the streaming messageId so the target replaces the live
         // bubble instead of leaving it stuck and appending a duplicate.
         if (messageId) {
           fallbackResult.metadata = { ...fallbackResult.metadata, messageId };
@@ -1526,14 +1564,15 @@ class ApplicationController {
           fallbackReason: error.message
         });
 
-        this.broadcastTranscriptionLLMResponse(fallbackResult);
-        // Mirror to overlay window for consistency
-        windowManager.showLLMResponse(fallbackResult.response, {
-          skill: this.activeSkill,
-          processingTime: fallbackResult.metadata.processingTime,
-          usedFallback: true,
-          isTranscriptionResponse: true
-        });
+        this.sendTranscriptionLLMResponseToVoiceTargets(fallbackResult);
+        if (this.shouldShowVoiceOverlay()) {
+          windowManager.showLLMResponse(fallbackResult.response, {
+            skill: this.activeSkill,
+            processingTime: fallbackResult.metadata.processingTime,
+            usedFallback: true,
+            isTranscriptionResponse: true
+          });
+        }
         logger.info("Used fallback response for transcription", {
           skill: this.activeSkill,
           fallbackResponse: fallbackResult.response
@@ -1631,6 +1670,48 @@ class ApplicationController {
     this.mobileSync.publish("response-chunk", data);
   }
 
+  sendToChatWindow(channel, data) {
+    const chatWindow = windowManager.getWindow("chat");
+    if (!chatWindow || chatWindow.isDestroyed()) {
+      logger.warn("Chat window unavailable for speech event", { channel });
+      return;
+    }
+    chatWindow.webContents.send(channel, data);
+  }
+
+  getVoiceResponseTarget() {
+    const configured = String(process.env.WHISPER_RESPONSE_TARGET || 'both').trim().toLowerCase();
+    return ['chat', 'overlay', 'both'].includes(configured) ? configured : 'both';
+  }
+
+  shouldShowVoiceOverlay() {
+    return ['overlay', 'both'].includes(this.getVoiceResponseTarget());
+  }
+
+  sendToVoiceResponseWindows(channel, data) {
+    const target = this.getVoiceResponseTarget();
+    if (target === 'chat' || target === 'both') {
+      this.sendToChatWindow(channel, data);
+    }
+    if (target === 'overlay' || target === 'both') {
+      const responseWindow = windowManager.getWindow("llmResponse");
+      if (responseWindow && !responseWindow.isDestroyed()) {
+        responseWindow.webContents.send(channel, data);
+      }
+    }
+  }
+
+  sendTranscriptionLLMResponseToVoiceTargets(llmResult) {
+    const data = {
+      response: llmResult.response,
+      metadata: llmResult.metadata,
+      messageId: llmResult.metadata && llmResult.metadata.messageId,
+      skill: this.activeSkill,
+      isTranscriptionResponse: true
+    };
+    this.sendToVoiceResponseWindows("transcription-llm-response", data);
+  }
+
   onWindowAllClosed() {
     if (process.platform !== "darwin") {
       app.quit();
@@ -1711,8 +1792,12 @@ class ApplicationController {
       azureRegion: process.env.AZURE_SPEECH_REGION || "",
       whisperEngine: process.env.WHISPER_ENGINE || "whisper-cpp",
       whisperCommand: process.env.WHISPER_COMMAND || "",
-      whisperModel: process.env.WHISPER_MODEL || "turbo",
-      whisperLanguage: process.env.WHISPER_LANGUAGE || "en",
+      whisperModel: process.env.WHISPER_MODEL || "small",
+      whisperLanguage: process.env.WHISPER_LANGUAGE || "auto",
+      whisperDevice: process.env.WHISPER_DEVICE || "auto",
+      whisperCaptureMode: process.env.WHISPER_CAPTURE_MODE ||
+        (process.env.WHISPER_MANUAL_CAPTURE === "true" ? "manual" : "vad"),
+      whisperResponseTarget: process.env.WHISPER_RESPONSE_TARGET || "both",
       whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
       whisperFasterDevice: process.env.WHISPER_FASTER_DEVICE || "cpu",
       whisperFasterComputeType: process.env.WHISPER_FASTER_COMPUTE_TYPE || "int8",
@@ -1817,6 +1902,15 @@ class ApplicationController {
       }
       if (settings.whisperLanguage !== undefined) {
         envUpdates.WHISPER_LANGUAGE = settings.whisperLanguage;
+      }
+      if (["auto", "cpu", "cuda"].includes(settings.whisperDevice)) {
+        envUpdates.WHISPER_DEVICE = settings.whisperDevice;
+      }
+      if (["manual", "vad"].includes(settings.whisperCaptureMode)) {
+        envUpdates.WHISPER_CAPTURE_MODE = settings.whisperCaptureMode;
+      }
+      if (["chat", "overlay", "both"].includes(settings.whisperResponseTarget)) {
+        envUpdates.WHISPER_RESPONSE_TARGET = settings.whisperResponseTarget;
       }
       if (settings.whisperSegmentMs !== undefined) {
         envUpdates.WHISPER_SEGMENT_MS = String(settings.whisperSegmentMs);
@@ -2047,17 +2141,17 @@ class ApplicationController {
 
       // Set app icon for dock/taskbar
       if (process.platform === "darwin") {
-        // macOS - update dock icon
-        app.dock.setIcon(fullIconPath);
-
-        // Force dock refresh with multiple attempts
-        setTimeout(() => {
+        // macOS - update dock icon (only if dock is available)
+        if (app.dock) {
           app.dock.setIcon(fullIconPath);
-        }, 100);
 
-        setTimeout(() => {
-          app.dock.setIcon(fullIconPath);
-        }, 500);
+          // Force dock refresh with multiple attempts
+          const retryDockIcon = () => {
+            try { app.dock.setIcon(fullIconPath); } catch (_) { /* dock may not exist */ }
+          };
+          setTimeout(retryDockIcon, 100);
+          setTimeout(retryDockIcon, 500);
+        }
       } else {
         // Windows/Linux - update window icons
         windowManager.windows.forEach((window, type) => {
@@ -2101,19 +2195,6 @@ class ApplicationController {
         // Multiple attempts to ensure the name sticks
         app.setName(appName);
 
-        // Force update the bundle name for macOS stealth
-        const { execSync } = require("child_process");
-        try {
-          // Update the app's Info.plist CFBundleName in memory
-          if (process.mainModule && process.mainModule.filename) {
-            const appPath = process.mainModule.filename;
-            // Force set the bundle name directly
-            process.env.CFBundleName = appName.trim();
-          }
-        } catch (e) {
-          // Silently fail if we can't modify bundle info
-        }
-
         // Clear dock badge and reset
         if (app.dock) {
           app.dock.setBadge("");
@@ -2126,8 +2207,10 @@ class ApplicationController {
         }
       }
 
-      // Set app user model ID for Windows taskbar grouping
-      app.setAppUserModelId(`${appName.trim()}-${iconKey}`);
+      // Set app user model ID for Windows taskbar grouping (Windows only)
+      if (process.platform === "win32") {
+        app.setAppUserModelId(`${appName.trim()}-${iconKey}`);
+      }
 
       // Update all window titles to match the new app name
       const windows = windowManager.windows;

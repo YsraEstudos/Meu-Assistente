@@ -68,6 +68,9 @@
       "!.venv-faster-whisper/**/*",
       "!.whisper-models/**/*",
       "!.faster-whisper-models/**/*",
+      "!bin/**/*",
+      "!scripts/__pycache__/**/*",
+      "!**/*.pyc",
       "!eng.traineddata"
     ],
     "asarUnpack": [
@@ -77,7 +80,8 @@
       "scripts/whisper-worker.py",
       "scripts/faster-whisper-worker.py",
       "scripts/detect-cpu.py",
-      "scripts/whisper-cpp-worker.py"
+      "scripts/whisper-cpp-worker.py",
+      "scripts/whisper_worker.py"
     ],
     "mac": {
       "category": "public.app-category.utilities",

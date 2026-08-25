@@ -363,8 +363,7 @@ class WindowManager {
           titleBarStyle: 'hiddenInset',
           trafficLightPosition: { x: -100, y: -100 },
           acceptFirstMouse: true,
-          disableAutoHideCursor: true,
-          type: 'panel'
+          disableAutoHideCursor: true
         }),
         level: process.platform === 'darwin' ? 'floating' : undefined,
       };
@@ -385,7 +384,6 @@ class WindowManager {
         ...(process.platform === 'darwin' && {
           titleBarStyle: 'hiddenInset',
           trafficLightPosition: { x: -100, y: -100 },
-          type: 'panel',
           acceptFirstMouse: true
         }),
         level: process.platform === 'darwin' ? 'floating' : undefined,
@@ -409,7 +407,6 @@ class WindowManager {
         ...(process.platform === 'darwin' && {
           titleBarStyle: 'hiddenInset',
           trafficLightPosition: { x: -100, y: -100 },
-          type: 'panel',
           acceptFirstMouse: true
         }),
         level: process.platform === 'darwin' ? 'floating' : undefined,
@@ -1835,10 +1832,9 @@ class WindowManager {
 
   handleRecordingStopped() {
     this.isRecording = false;
-    this.hideChatWindow();
     // Notify all windows about recording state
     this.broadcastToAllWindows('recording-stopped');
-    logger.debug('Recording stopped, chat window hidden');
+    logger.debug('Recording stopped, chat window kept visible for the response');
   }
 
   broadcastSkillChange(skill) {
