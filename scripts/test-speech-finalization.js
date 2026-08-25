@@ -534,7 +534,7 @@ async function testEngineSwitchingPreservesFallback() {
 
   speechService._resolveWhisperCommand = () => ({ command: 'openai-cli', baseArgs: ['-m', 'whisper'] });
   speechService._resolveFasterWhisperLaunch = () => ({ command: 'faster-python', args: ['worker.py'] });
-  speechService._resolveWhisperCppLaunch = () => ({ command: 'cpp-python', args: ['worker.py'], binary: 'whisper-cli' });
+  speechService._resolveWhisperCppLaunch = () => ({ command: 'cpp-python', args: ['worker.py'], binary: 'whisper-cli', model: __filename });
 
   try {
     // Switch to faster

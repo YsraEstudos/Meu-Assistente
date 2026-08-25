@@ -11,12 +11,13 @@
     "test:audio-session": "node scripts/test-audio-session.js",
     "test:gpu": "node scripts/test-gpu-regression.js",
     "test:gpu:build": "node scripts/test-gpu-regression.js --target build",
-    "test:all": "npm run test-speech-finalization && npm run test:gpu && npm run test:audio-session",
+    "test:review-fixes": "node scripts/test-pr-review-fixes.js",
+    "test:all": "npm run test-speech-finalization && npm run test:gpu && npm run test:audio-session && npm run test:review-fixes",
+    "test:build:win": "npm run test-speech-finalization && npm run test:audio-session && npm run test:review-fixes",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",
-    "prebuild:win": "npm run test:all",
+    "prebuild:win": "npm run test:build:win",
     "build:win": "electron-builder --win",
-    "postbuild:win": "npm run test:gpu:build",
     "build:linux": "electron-builder --linux",
     "build:all": "electron-builder --mac --win --linux",
     "dist": "npm run build",
@@ -49,6 +50,7 @@
     "winston-daily-rotate-file": "^4.7.1"
   },
   "devDependencies": {
+    "@electron/asar": "^3.4.1",
     "electron": "^29.1.0",
     "electron-builder": "^24.13.3"
   },

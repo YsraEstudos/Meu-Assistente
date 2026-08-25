@@ -68,7 +68,7 @@ def main():
         except json.JSONDecodeError:
             continue
 
-        request_type = request.get("type")
+        request_type = request.get("type") if isinstance(request, dict) else None
         if request_type == "shutdown":
             send({"type": "stopped"})
             return 0

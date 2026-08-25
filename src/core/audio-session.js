@@ -47,7 +47,7 @@ const TRANSITIONS = Object.freeze({
   [AUDIO_SESSION_STATES.FINALIZING]: Object.freeze({
     [AUDIO_SESSION_EVENTS.FINALIZED]: AUDIO_SESSION_STATES.IDLE
   }),
-  [AUDIO_SESSION_STATES.ERROR]: Object.freeze()
+  [AUDIO_SESSION_STATES.ERROR]: Object.freeze({})
 });
 
 const PRIVATE_METADATA_PATTERN = /(?:pcm|audio|transcript|prompt|response|buffer|content)/i;
@@ -180,7 +180,7 @@ class AudioSessionStateMachine {
       from: before.state,
       to: nextState,
       sessionId,
-      generation: before.generation || this._generation,
+      generation: this._generation,
       reasonCode,
       source,
       durationMs: before.durationMs

@@ -264,7 +264,10 @@ class ApplicationController {
       await windowManager.initializeWindows({ showMainWindow: !isFirstRun });
       try {
         const mobileSyncInfo = await this.mobileSync.start();
-        logger.info("Mobile sync is available", mobileSyncInfo);
+        logger.info("Mobile sync is available", {
+          port: mobileSyncInfo.port,
+          urlCount: mobileSyncInfo.urls?.length || 0
+        });
       } catch (error) {
         logger.warn("Mobile sync could not be started", { error: error.message });
       }
@@ -470,6 +473,18 @@ class ApplicationController {
     speechService.on("recording-stopped", (payload = {}) => {
       if (payload.sessionId && payload.sessionId !== this._speechSessionId) {
         return;
+      }
+      const state = this.audioSession.getSnapshot().state;
+      if (state === AUDIO_SESSION_STATES.CAPTURING || state === AUDIO_SESSION_STATES.DEGRADED) {
+        this._observeAudioSession(AUDIO_SESSION_EVENTS.CAPTURE_STOPPED, {
+          reasonCode: "capture_stopped",
+          source: "speech_service"
+        });
+      } else if (state === AUDIO_SESSION_STATES.STARTING) {
+        this._observeAudioSession(AUDIO_SESSION_EVENTS.STOP_REQUESTED, {
+          reasonCode: "recording_stopped_before_capture",
+          source: "speech_service"
+        });
       }
       this._observeAudioSession(AUDIO_SESSION_EVENTS.FINALIZED, {
         reasonCode: "recording_stopped",

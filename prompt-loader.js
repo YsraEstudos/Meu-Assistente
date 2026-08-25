@@ -367,7 +367,7 @@ STRICT REQUIREMENTS:
     if (!this.promptsLoaded) {
       this.loadPrompts();
     }
-    return ['general', 'dsa'];
+    return Array.from(this.prompts.keys());
   }
 
   /**

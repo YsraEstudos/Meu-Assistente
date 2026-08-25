@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { normalizeWhisperEngine } = require('./whisper-engine');
 
 /**
  * First-run detection and onboarding helper.
@@ -81,7 +82,7 @@ class FirstRunManager {
   getStatus() {
     const env = this._readEnv();
     const gemini = (env.GEMINI_API_KEY || '').trim();
-    const whisperEngine = String(env.WHISPER_ENGINE || 'whisper-cpp').trim().toLowerCase() || 'whisper-cpp';
+    const whisperEngine = normalizeWhisperEngine(env.WHISPER_ENGINE || 'whisper-cpp');
     return {
       envExists: fs.existsSync(this.envPath),
       sentinelExists: fs.existsSync(this.sentinelPath),

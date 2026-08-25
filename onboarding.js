@@ -70,7 +70,8 @@
       payload.whisperFasterComputeType = state.whisperFasterComputeType || 'int8';
     } else if (engine === 'whisper-cpp') {
       payload.whisperCommand = '';
-      payload.whisperCppCommand = state.whisperCppCommand || state.whisperCmd || '';
+      const command = state.whisperCppCommand || state.whisperCmd;
+      if (command) payload.whisperCppCommand = command;
       payload.whisperCppBackend = state.whisperCppBackend || 'vulkan';
     } else if (state.whisperCmd) {
       payload.whisperCommand = quoteCommandIfNeeded(state.whisperCmd);
