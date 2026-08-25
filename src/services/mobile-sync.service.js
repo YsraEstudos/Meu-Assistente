@@ -95,13 +95,15 @@ class MobileSyncService {
     } catch (_) {
       return false;
     }
-    const queryToken = allowQuery ? url.searchParams.get('token') : null;
+    const queryTokens = allowQuery ? url.searchParams.getAll('token') : [];
+    const hasQueryToken = queryTokens.length > 0;
+    const queryToken = queryTokens.length === 1 ? queryTokens[0] : null;
     const cookieToken = String(headers.cookie || '')
       .split(';')
       .map((part) => part.trim())
       .find((part) => part.startsWith('opencluely_mobile_token='))
       ?.slice('opencluely_mobile_token='.length) || null;
-    const requestedToken = queryToken || cookieToken;
+    const requestedToken = hasQueryToken ? queryToken : cookieToken;
     const expected = Buffer.from(this.token);
     const actual = Buffer.from(requestedToken || '');
     return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);

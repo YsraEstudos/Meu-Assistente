@@ -5,6 +5,7 @@ node_modules/
 eng.traineddata
 dist/
 dist-packaged/
+bin/
 .DS_Store
 *.log
 .slim/deepwork/

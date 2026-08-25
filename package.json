@@ -8,12 +8,13 @@
     "dev": "env -u ELECTRON_RUN_AS_NODE electron . --no-sandbox --disable-gpu",
     "test-speech": "node scripts/test-speech.js",
     "test-speech-finalization": "node scripts/test-speech-finalization.js",
+    "test:security": "node scripts/test-security-boundaries.js",
     "test:audio-session": "node scripts/test-audio-session.js",
     "test:gpu": "node scripts/test-gpu-regression.js",
     "test:gpu:build": "node scripts/test-gpu-regression.js --target build",
     "test:review-fixes": "node scripts/test-pr-review-fixes.js",
-    "test:all": "npm run test-speech-finalization && npm run test:gpu && npm run test:audio-session && npm run test:review-fixes",
-    "test:build:win": "npm run test-speech-finalization && npm run test:audio-session && npm run test:review-fixes",
+    "test:all": "npm run test-speech-finalization && npm run test:gpu && npm run test:security && npm run test:audio-session && npm run test:review-fixes",
+    "test:build:win": "npm run test-speech-finalization && npm run test:security && npm run test:audio-session && npm run test:review-fixes",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",
     "prebuild:win": "npm run test:build:win",
@@ -70,6 +71,9 @@
       "!.venv-faster-whisper/**/*",
       "!.whisper-models/**/*",
       "!.faster-whisper-models/**/*",
+      "!bin/**/*",
+      "!scripts/__pycache__/**/*",
+      "!**/*.pyc",
       "!eng.traineddata"
     ],
     "asarUnpack": [
@@ -79,7 +83,8 @@
       "scripts/whisper-worker.py",
       "scripts/faster-whisper-worker.py",
       "scripts/detect-cpu.py",
-      "scripts/whisper-cpp-worker.py"
+      "scripts/whisper-cpp-worker.py",
+      "scripts/whisper_worker.py"
     ],
     "mac": {
       "category": "public.app-category.utilities",
