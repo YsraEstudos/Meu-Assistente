@@ -71,6 +71,11 @@ app.commandLine.appendSwitch("no-pings");
 const logger = require("./src/core/logger").createServiceLogger("MAIN");
 const config = require("./src/core/config");
 const FirstRunManager = require("./src/core/first-run");
+const {
+  AUDIO_SESSION_EVENTS,
+  AUDIO_SESSION_STATES,
+  AudioSessionStateMachine
+} = require("./src/core/audio-session");
 
 // ── Global crash guard ──
 // The speech path spawns external processes (Whisper CLI, and on macOS/Linux
@@ -101,6 +106,7 @@ const llmService = require("./src/services/llm.service");
 const windowManager = require("./src/managers/window.manager");
 const sessionManager = require("./src/managers/session.manager");
 const MobileSyncService = require("./src/services/mobile-sync.service");
+const performanceTracker = require("./src/core/performance");
 
 class ApplicationController {
   constructor() {
@@ -120,6 +126,7 @@ class ApplicationController {
     this._speechSessionId = 0;
     this._speechTranscriptionComplete = false;
     this._audioIpcStats = null;
+    this.audioSession = new AudioSessionStateMachine();
 
     // First-run onboarding: detects missing .env / API key and triggers
     // a settings-window prompt on first launch so users don't have to
@@ -430,6 +437,16 @@ class ApplicationController {
         totalChunks: 0,
         totalBytes: 0
       };
+      if (this.audioSession.getSnapshot().state === AUDIO_SESSION_STATES.IDLE) {
+        this._observeAudioSession(AUDIO_SESSION_EVENTS.START_REQUESTED, {
+          reasonCode: "recording_started",
+          source: "speech_service"
+        });
+      }
+      this._observeAudioSession(AUDIO_SESSION_EVENTS.CAPTURE_STARTED, {
+        reasonCode: "capture_started",
+        source: "speech_service"
+      });
       BrowserWindow.getAllWindows().forEach((window) => {
         window.webContents.send("recording-started", { sessionId: this._speechSessionId });
       });
@@ -439,6 +456,10 @@ class ApplicationController {
       if (payload.sessionId && payload.sessionId !== this._speechSessionId) {
         return;
       }
+      this._observeAudioSession(AUDIO_SESSION_EVENTS.CAPTURE_STOPPED, {
+        reasonCode: "capture_stopped",
+        source: "speech_service"
+      });
       BrowserWindow.getAllWindows().forEach((window) => {
         window.webContents.send("recording-capture-stopped", {
           sessionId: payload.sessionId || this._speechSessionId
@@ -450,6 +471,10 @@ class ApplicationController {
       if (payload.sessionId && payload.sessionId !== this._speechSessionId) {
         return;
       }
+      this._observeAudioSession(AUDIO_SESSION_EVENTS.FINALIZED, {
+        reasonCode: "recording_stopped",
+        source: "speech_service"
+      });
       this._speechTranscriptionComplete = true;
       if (this._audioIpcStats) {
         logger.debug("Renderer audio IPC session ended", {
@@ -502,12 +527,83 @@ class ApplicationController {
     });
 
     speechService.on("error", (error) => {
+      this._observeAudioSession(AUDIO_SESSION_EVENTS.ERROR, {
+        reasonCode: "speech_error",
+        source: "speech_service"
+      });
       // In error, still compute availability
       this.speechAvailable = speechService.isAvailable ? speechService.isAvailable() : false;
       BrowserWindow.getAllWindows().forEach((window) => {
         window.webContents.send("speech-error", { error, available: this.speechAvailable });
       });
     });
+  }
+
+  _observeAudioSession(type, { reasonCode, source } = {}) {
+    let before;
+    let result;
+    try {
+      before = this.audioSession.getSnapshot();
+      result = this.audioSession.dispatch({ type, reasonCode, source });
+    } catch (_) {
+      this._recordAudioSessionTelemetry({
+        event: type,
+        accepted: false,
+        transitioned: false,
+        from: before?.state || AUDIO_SESSION_STATES.IDLE,
+        to: before?.state || AUDIO_SESSION_STATES.IDLE,
+        sessionId: before?.sessionId || null,
+        generation: before?.generation || 0,
+        reasonCode: "observer_failed",
+        source: "main",
+        durationMs: before?.durationMs || 0
+      });
+      return null;
+    }
+
+    const transition = result.transition;
+    this._recordAudioSessionTelemetry({
+      event: type,
+      accepted: result.accepted === true,
+      transitioned: result.transitioned === true,
+      from: transition?.from || before.state,
+      to: transition?.to || result.snapshot.state,
+      sessionId: transition?.sessionId || result.snapshot.sessionId || before.sessionId || null,
+      generation: Number.isInteger(transition?.generation)
+        ? transition.generation
+        : result.snapshot.generation,
+      reasonCode: transition?.reasonCode || reasonCode || null,
+      source: transition?.source || source || null,
+      durationMs: Number.isFinite(transition?.durationMs)
+        ? transition.durationMs
+        : result.snapshot.durationMs
+    });
+    return result;
+  }
+
+  _recordAudioSessionTelemetry(metadata) {
+    const safeMetadata = {
+      event: typeof metadata.event === "string" ? metadata.event.slice(0, 64) : "unknown",
+      accepted: metadata.accepted === true,
+      transitioned: metadata.transitioned === true,
+      from: typeof metadata.from === "string" ? metadata.from.slice(0, 32) : null,
+      to: typeof metadata.to === "string" ? metadata.to.slice(0, 32) : null,
+      sessionId: typeof metadata.sessionId === "string" ? metadata.sessionId.slice(0, 64) : null,
+      generation: Number.isInteger(metadata.generation) ? metadata.generation : 0,
+      reasonCode: typeof metadata.reasonCode === "string" ? metadata.reasonCode.slice(0, 64) : null,
+      source: typeof metadata.source === "string" ? metadata.source.slice(0, 64) : null,
+      durationMs: Number.isFinite(metadata.durationMs) ? Math.max(0, metadata.durationMs) : 0
+    };
+
+    try {
+      performanceTracker.mark("audio-session-transition", safeMetadata);
+    } catch (_) {
+      try {
+        logger.warn("Audio session telemetry failed", { errorCode: "telemetry_write_failed" });
+      } catch (_) {
+        // Telemetry must never propagate into the speech lifecycle.
+      }
+    }
   }
 
   setupIPCHandlers() {
@@ -1663,6 +1759,10 @@ class ApplicationController {
       clearTimeout(this._speechInitializationTimer);
       this._speechInitializationTimer = null;
     }
+    this._observeAudioSession(AUDIO_SESSION_EVENTS.RESET, {
+      reasonCode: "app_shutdown",
+      source: "main"
+    });
     globalShortcut.unregisterAll();
     if (typeof speechService.shutdown === "function") {
       speechService.shutdown();
