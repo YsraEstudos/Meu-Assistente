@@ -349,21 +349,21 @@ class ApplicationController {
     
     // Allow HTTPS requests to Google APIs
     ses.webRequest.onBeforeSendHeaders((details, callback) => {
-      if (details.url.includes('generativelanguage.googleapis.com')) {
-        details.requestHeaders['User-Agent'] = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36';
+      try {
+        const url = new URL(details.url);
+        if (url.hostname === 'generativelanguage.googleapis.com') {
+          details.requestHeaders['User-Agent'] = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36';
+        }
+      } catch (_) {
+        // Leave malformed or non-HTTP requests untouched.
       }
       callback({ requestHeaders: details.requestHeaders });
     });
-    
-    // Handle certificate errors for Google APIs
-    ses.setCertificateVerifyProc((request, callback) => {
-      if (request.hostname === 'generativelanguage.googleapis.com') {
-        callback(0); // Trust Google's certificates
-      } else {
-        callback(-2); // Use default verification
-      }
-    });
-    
+
+    // Keep Electron's default certificate verification enabled. The API
+    // endpoint is HTTPS, but trusting every certificate for its hostname would
+    // allow a local proxy or compromised network to intercept the API key and
+    // conversation contents.
     logger.debug('Network configuration applied for Gemini API');
   }
 

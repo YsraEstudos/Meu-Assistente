@@ -82,9 +82,17 @@ class MobileSyncService {
   }
 
   isAuthorized(requestUrl) {
-    return typeof requestUrl === 'string' &&
-      Boolean(this.token) &&
-      requestUrl.includes(`token=${this.token}`);
+    if (typeof requestUrl !== 'string' || !this.token) {
+      return false;
+    }
+
+    try {
+      const url = new URL(requestUrl, `http://127.0.0.1:${this.port}`);
+      const tokens = url.searchParams.getAll('token');
+      return tokens.length === 1 && tokens[0] === this.token;
+    } catch (_) {
+      return false;
+    }
   }
 
   handleRequest(request, response) {
