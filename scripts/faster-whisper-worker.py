@@ -57,7 +57,7 @@ def main():
         fatal(f"faster_whisper unavailable: {exc}")
         return 1
 
-    kwargs = {"device": args.device, "compute_type": args.compute_type}
+    kwargs = {"device": args.device, "compute_type": args.compute_type, "num_workers": max_concurrent}
     if args.model_dir:
         kwargs["download_root"] = args.model_dir
 
@@ -138,7 +138,7 @@ def main():
         except Exception:
             continue
 
-        message_type = message.get("type")
+        message_type = message.get("type") if isinstance(message, dict) else None
         if message_type == "stop":
             emit({"type": "stopped", "reason": "stop requested"})
             return 0

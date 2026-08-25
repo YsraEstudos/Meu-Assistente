@@ -36,7 +36,6 @@
     </section>
   </main>
   <script>
-    const token = '__TOKEN__';
     const status = document.getElementById('status');
     const answer = document.getElementById('answer');
     const question = document.getElementById('question');
@@ -44,7 +43,7 @@
     let currentMessageId = null;
 
     function connect() {
-      const events = new EventSource(`/events?token=${encodeURIComponent(token)}`);
+      const events = new EventSource('/events');
       events.onopen = () => {
         status.textContent = 'Conectado';
         status.classList.add('connected');

@@ -386,6 +386,8 @@ const { spawn, spawnSync } = require('child_process');
 const { EventEmitter } = require('events');
 const logger = require('../core/logger').createServiceLogger('SPEECH');
 const config = require('../core/config');
+const { normalizeWhisperEngine } = require('../core/whisper-engine');
+const WHISPER_WORKER_REQUEST_TIMEOUT_MS = 210000;
 
 let sdk = null;
 try {
@@ -1293,7 +1295,13 @@ class SpeechService extends EventEmitter {
 
   _initializeWhisperCppClient() {
     const launch = this._resolveWhisperCppLaunch();
-    if (!launch) {
+    if (!launch || !launch.model || !fs.existsSync(launch.model)) {
+      if (launch && launch.model) {
+        logger.warn('whisper.cpp model is not available yet', { model: launch.model });
+      }
+      this.whisperCppLaunch = null;
+      this.available = false;
+      this.effectiveWhisperEngine = null;
       logger.warn('whisper.cpp engine unavailable; falling back to OpenAI Whisper backend');
       return false;
     }
@@ -1550,6 +1558,7 @@ class SpeechService extends EventEmitter {
     this._whisperPendingSegments = [];
     this._whisperRunningSegment = null;
     this._whisperFinalizationPromise = null;
+    this.isFinalizing = false;
     this._resolveRendererCaptureDrain();
     this._resetVadState();
     this.transcriptionInFlight = this.activeTranscriptionCount > 0;
@@ -1892,7 +1901,7 @@ class SpeechService extends EventEmitter {
       const vulkanMatch = selectedVulkanMatch
         || diagnostics.match(/(?:ggml_vulkan|vulkan device)[\s\S]*?(?:\d+\s*=\s*)?((?:AMD|NVIDIA|Intel)[^\r\n]+)/i);
       const usedGpu = /ggml_vulkan|vulkan device/i.test(diagnostics);
-      const backend = usedGpu ? 'vulkan' : (launch.backend === 'cpu' ? 'cpu' : 'cpu');
+      const backend = usedGpu ? 'vulkan' : 'cpu';
       return {
         success: !result.error && result.status === 0,
         usedGpu,
@@ -2049,7 +2058,8 @@ class SpeechService extends EventEmitter {
       const engine = this._getEffectiveWhisperEngine();
       const configured = engine === 'faster' ? this.fasterWhisperLaunch
         : (engine === 'whisper-cpp' ? this.whisperCppLaunch : this.whisperCommand);
-      return !!this.available && !!configured;
+      const modelReady = engine !== 'whisper-cpp' || Boolean(configured?.model && fs.existsSync(configured.model));
+      return !!this.available && !!configured && modelReady;
     }
 
     return false;
@@ -2104,10 +2114,7 @@ class SpeechService extends EventEmitter {
   }
 
   _getConfiguredWhisperEngine() {
-    const engine = this._getWhisperEngine();
-    if (engine === 'faster') return 'faster';
-    if (['cpp', 'whisper.cpp', 'whispercpp', 'whisper-cpp'].includes(engine)) return 'whisper-cpp';
-    return 'openai';
+    return normalizeWhisperEngine(this._getWhisperEngine());
   }
 
   _getEffectiveWhisperEngine() {
@@ -2412,6 +2419,18 @@ class SpeechService extends EventEmitter {
     }
   }
 
+  _settleWhisperWorkerRequest(requestId, settle) {
+    const request = this._whisperWorkerRequests.get(requestId);
+    if (!request) return false;
+    this._whisperWorkerRequests.delete(requestId);
+    if (request.timer) {
+      clearTimeout(request.timer);
+      request.timer = null;
+    }
+    settle(request);
+    return true;
+  }
+
   _handleWhisperWorkerMessage(worker, message) {
     if (this._whisperWorker !== worker || !message || typeof message !== 'object') {
       return;
@@ -2454,12 +2473,13 @@ class SpeechService extends EventEmitter {
       if (!request || request.worker !== worker) {
         return;
       }
-      this._whisperWorkerRequests.delete(message.id);
-      if (Array.isArray(message.results)) {
-        request.resolve(message.results);
-      } else {
-        request.reject(new Error(message.error || 'Whisper worker batch response was invalid'));
-      }
+      this._settleWhisperWorkerRequest(message.id, (pending) => {
+        if (Array.isArray(message.results)) {
+          pending.resolve(message.results);
+        } else {
+          pending.reject(new Error(message.error || 'Whisper worker batch response was invalid'));
+        }
+      });
       return;
     }
 
@@ -2471,24 +2491,25 @@ class SpeechService extends EventEmitter {
     if (!request || request.worker !== worker) {
       return;
     }
-    this._whisperWorkerRequests.delete(message.id);
-    if (message.ok) {
-      if (message.backend) {
-        this._lastWhisperRuntime = {
-          backend: String(message.backend),
-          gpuName: String(message.gpuName || ''),
-          at: Date.now()
-        };
+    this._settleWhisperWorkerRequest(message.id, (pending) => {
+      if (message.ok) {
+        if (message.backend) {
+          this._lastWhisperRuntime = {
+            backend: String(message.backend),
+            gpuName: String(message.gpuName || ''),
+            at: Date.now()
+          };
+        }
+        pending.resolve({
+          text: typeof message.text === 'string' ? message.text : '',
+          transcribeMs: Number(message.transcribeMs) || null,
+          backend: message.backend || null,
+          gpuName: message.gpuName || ''
+        });
+      } else {
+        pending.reject(new Error(message.error || 'Whisper worker transcription failed'));
       }
-      request.resolve({
-        text: typeof message.text === 'string' ? message.text : '',
-        transcribeMs: Number(message.transcribeMs) || null,
-        backend: message.backend || null,
-        gpuName: message.gpuName || ''
-      });
-    } else {
-      request.reject(new Error(message.error || 'Whisper worker transcription failed'));
-    }
+    });
   }
 
   _rejectWhisperWorkerStart(worker, error) {
@@ -2514,8 +2535,7 @@ class SpeechService extends EventEmitter {
 
     for (const [requestId, request] of this._whisperWorkerRequests) {
       if (request.worker === worker) {
-        this._whisperWorkerRequests.delete(requestId);
-        request.reject(error);
+        this._settleWhisperWorkerRequest(requestId, (pending) => pending.reject(error));
       }
     }
 
@@ -2540,8 +2560,7 @@ class SpeechService extends EventEmitter {
     this._whisperWorkerStart = null;
     for (const [requestId, request] of this._whisperWorkerRequests) {
       if (request.worker === worker) {
-        this._whisperWorkerRequests.delete(requestId);
-        request.reject(shutdownError);
+        this._settleWhisperWorkerRequest(requestId, (pending) => pending.reject(shutdownError));
       }
     }
     try {
@@ -2560,21 +2579,20 @@ class SpeechService extends EventEmitter {
 
     const id = 'whisper-' + Date.now() + '-' + (++this._whisperWorkerRequestSeq);
     return new Promise((resolve, reject) => {
-      this._whisperWorkerRequests.set(id, { worker, resolve, reject });
+      const request = { worker, resolve, reject, timer: null };
+      request.timer = setTimeout(() => {
+        this._settleWhisperWorkerRequest(id, (pending) => pending.reject(new Error('Whisper worker request timed out')));
+      }, WHISPER_WORKER_REQUEST_TIMEOUT_MS);
+      this._whisperWorkerRequests.set(id, request);
       try {
         worker.stdin.write(JSON.stringify({ type: 'transcribe', id, audioPath: audioFilePath }) + '\n', (error) => {
           if (!error) {
             return;
           }
-          const request = this._whisperWorkerRequests.get(id);
-          if (request) {
-            this._whisperWorkerRequests.delete(id);
-            reject(error);
-          }
+          this._settleWhisperWorkerRequest(id, (pending) => pending.reject(error));
         });
       } catch (error) {
-        this._whisperWorkerRequests.delete(id);
-        reject(error);
+        this._settleWhisperWorkerRequest(id, (pending) => pending.reject(error));
       }
     });
   }
@@ -2595,21 +2613,20 @@ class SpeechService extends EventEmitter {
       audioPath,
     }));
     return new Promise((resolve, reject) => {
-      this._whisperWorkerRequests.set(id, { worker, resolve, reject });
+      const request = { worker, resolve, reject, timer: null };
+      request.timer = setTimeout(() => {
+        this._settleWhisperWorkerRequest(id, (pending) => pending.reject(new Error('Whisper worker batch request timed out')));
+      }, WHISPER_WORKER_REQUEST_TIMEOUT_MS);
+      this._whisperWorkerRequests.set(id, request);
       try {
         worker.stdin.write(JSON.stringify({ type: 'transcribe_batch', id, items }) + '\n', (error) => {
           if (!error) {
             return;
           }
-          const request = this._whisperWorkerRequests.get(id);
-          if (request) {
-            this._whisperWorkerRequests.delete(id);
-            reject(error);
-          }
+          this._settleWhisperWorkerRequest(id, (pending) => pending.reject(error));
         });
       } catch (error) {
-        this._whisperWorkerRequests.delete(id);
-        reject(error);
+        this._settleWhisperWorkerRequest(id, (pending) => pending.reject(error));
       }
     });
   }

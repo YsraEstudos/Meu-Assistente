@@ -132,7 +132,7 @@ def _runtime_backend(output: str, requested: str, selected_device: str | None) -
     return "cpu", ""
 
 
-def _transcribe(args: argparse.Namespace, item: object) -> dict[str, object]:
+def _transcribe(args: argparse.Namespace, item: object, selected_device: str | None) -> dict[str, object]:
     request_id = item.get("id") if isinstance(item, dict) else None
     audio_path = item.get("audioPath") if isinstance(item, dict) else None
     base_result: dict[str, object] = {
@@ -149,7 +149,6 @@ def _transcribe(args: argparse.Namespace, item: object) -> dict[str, object]:
         return base_result
 
     started = time.monotonic()
-    selected_device = _select_vulkan_device(args.device) if args.backend != "cpu" else None
     try:
         with tempfile.TemporaryDirectory(prefix="opencluely-whisper-cpp-") as temp_dir:
             output_prefix = Path(temp_dir) / "transcript"
@@ -200,6 +199,7 @@ def _transcribe(args: argparse.Namespace, item: object) -> dict[str, object]:
 def main() -> int:
     args = parse_args()
     args.threads = max(1, args.threads)
+    selected_device = _select_vulkan_device(args.device) if args.backend != "cpu" else None
     if not _executable_available(args.binary):
         return fatal(f"whisper.cpp binary not found: {args.binary}", engine="whisper-cpp")
     if not Path(args.model).is_file():
@@ -233,7 +233,7 @@ def main() -> int:
             return 0
         if message_type != "transcribe":
             continue
-        result = _transcribe(args, message)
+        result = _transcribe(args, message, selected_device)
         result["type"] = "result"
         emit(result)
     return 0

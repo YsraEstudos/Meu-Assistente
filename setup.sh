@@ -199,7 +199,7 @@ upsert_env() {
   local value="$2"
 
   if grep -q "^${key}=" .env 2>/dev/null; then
-    perl -0pi -e "s|^${key}=.*\$|${key}=${value}|m" .env
+    KEY="$key" VALUE="$value" perl -0pi -e 'my $key = $ENV{KEY}; my $value = $ENV{VALUE}; my $pattern = quotemeta($key); s/^$pattern=.*$/$key . "=" . $value/mge' .env
   else
     printf "%s=%s\n" "$key" "$value" >> .env
   fi
@@ -484,7 +484,7 @@ setup_whisper_env() {
     echo "Common causes: insufficient disk space, missing Python headers, or network issues."
   }
 
-  if [[ "$GPU_DETECTED_DEVICE" == "cuda" ]]; then
+  if [[ "$GPU_DETECTED_DEVICE" == "cuda" || "$WHISPER_FASTER_DEVICE" == "cuda" ]]; then
     echo "Installing CUDA runtime packages for Faster Whisper"
     "$WHISPER_PIP_PATH" install nvidia-cublas-cu12 nvidia-cudnn-cu12 || {
       echo "WARNING: CUDA runtime packages could not be installed. The CPU fallback may be required."

@@ -12,7 +12,6 @@ async function main() {
   console.log('Speech provider:', status.provider);
   console.log('Initialized:', status.isInitialized);
   console.log('Available:', speechService.isAvailable());
-  console.log('Effective settings:', JSON.stringify(status.effectiveSettings, null, 2));
   console.log('Whisper engine:', status.effectiveSettings.whisperEngine);
   console.log('Faster device:', status.effectiveSettings.whisperFasterDevice);
   console.log('Faster compute type:', status.effectiveSettings.whisperFasterComputeType);

@@ -675,7 +675,9 @@ class LLMService {
     const sessionManager = require('../managers/session.manager');
     
     if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
-      const conversationHistory = sessionManager.getConversationHistory(10);
+      const conversationHistory = Array.isArray(sessionMemory)
+        ? sessionMemory
+        : sessionManager.getConversationHistory(10);
       const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage);
       return this.buildIntelligentTranscriptionRequestWithHistory(cleanText, activeSkill, conversationHistory, skillContext, programmingLanguage);
     }
@@ -779,11 +781,16 @@ class LLMService {
   }
 
   getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage) {
+    const skill = String(activeSkill || 'general').toLowerCase();
     let prompt = `# Intelligent Transcription Response System
 
-Assume you are asked a question in ${activeSkill.toUpperCase()} mode. Your job is to intelligently respond to question/message with appropriate brevity.
-Assume you are in an interview and you need to perform best in ${activeSkill.toUpperCase()} mode.
-Always respond to the point, do not repeat the question or unnecessary information which is not related to ${activeSkill}.`;
+Your job is to intelligently respond to the question or message with appropriate brevity.`;
+    if (skill !== 'general') {
+      prompt += `
+Assume you are asked a question in ${skill.toUpperCase()} mode.
+Assume you are in an interview and need to perform your best in ${skill.toUpperCase()} mode.
+Always respond to the point, without repeating the question or adding information unrelated to ${skill}.`;
+    }
 
     // Add programming language context if provided
     if (programmingLanguage) {
@@ -795,7 +802,7 @@ Always respond to the point, do not repeat the question or unnecessary informati
       prompt += `\n\nCODING CONTEXT: Respond ONLY in ${languageTitle}. All code blocks must use triple backticks with language tag \`\`\`${fenceTag}\`\`\`. Do not include other languages unless explicitly asked.`;
     }
 
-    if (activeSkill === 'general') {
+    if (skill === 'general') {
       prompt += `
 
 ## Response Rules:

@@ -3,6 +3,14 @@ document.addEventListener('DOMContentLoaded', () => {
         info: (...args) => console.log('[SettingsWindowUI]', ...args)
     };
 
+    // Keep renderer-side engine aliases aligned with the main-process contract.
+    const normalizeWhisperEngine = (value) => {
+        const engine = String(value || '').trim().toLowerCase();
+        if (engine === 'faster') return 'faster';
+        if (['cpp', 'whisper.cpp', 'whispercpp', 'whisper-cpp'].includes(engine)) return 'whisper-cpp';
+        return 'openai';
+    };
+
     // Get DOM elements
     const closeButton = document.getElementById('closeButton');
     const quitButton = document.getElementById('quitButton');
@@ -177,7 +185,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const updateSpeechFieldStates = () => {
         const provider = speechProviderSelect ? speechProviderSelect.value : 'azure';
-        const engine = whisperEngineSelect ? whisperEngineSelect.value : 'whisper-cpp';
+        const engine = normalizeWhisperEngine(whisperEngineSelect ? whisperEngineSelect.value : 'whisper-cpp');
         const fasterOnlyItems = document.querySelectorAll('.faster-only');
         fasterOnlyItems.forEach((element) => {
             element.style.display = engine === 'faster' ? '' : 'none';
