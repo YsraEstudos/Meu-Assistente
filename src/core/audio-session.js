@@ -47,7 +47,9 @@ const TRANSITIONS = Object.freeze({
   [AUDIO_SESSION_STATES.FINALIZING]: Object.freeze({
     [AUDIO_SESSION_EVENTS.FINALIZED]: AUDIO_SESSION_STATES.IDLE
   }),
-  [AUDIO_SESSION_STATES.ERROR]: Object.freeze({})
+  [AUDIO_SESSION_STATES.ERROR]: Object.freeze({
+    [AUDIO_SESSION_EVENTS.FINALIZED]: AUDIO_SESSION_STATES.IDLE
+  })
 });
 
 const PRIVATE_METADATA_PATTERN = /(?:pcm|audio|transcript|prompt|response|buffer|content)/i;

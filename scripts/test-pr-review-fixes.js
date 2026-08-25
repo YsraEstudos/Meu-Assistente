@@ -43,7 +43,7 @@ function testReviewFixContracts() {
   const testSpeechSource = read('scripts/test-speech.js');
   const mainWindowSource = read('src/ui/main-window.js');
 
-  assert(audioSource.includes('[AUDIO_SESSION_STATES.ERROR]: Object.freeze({})'));
+  assert(audioSource.includes('[AUDIO_SESSION_STATES.ERROR]: Object.freeze({'));
   assert(mainSource.includes('AUDIO_SESSION_EVENTS.CAPTURE_STOPPED'));
   assert(speechSource.includes('fs.existsSync(launch.model)'));
   assert(packageSource.includes('"test:build:win"'));
@@ -63,6 +63,13 @@ function testReviewFixContracts() {
   assert(speechSource.includes('this.isFinalizing = false;'));
   assert(mainWindowSource.includes('this.handleRecordingStopped();'));
   assert(mainWindowSource.includes('MAX_CAPTURE_RESTART_ATTEMPTS'));
+  const restartLimitStart = mainWindowSource.indexOf('if (this._captureRestartCount >= MAX_CAPTURE_RESTART_ATTEMPTS)');
+  const restartLimitEnd = mainWindowSource.indexOf('const restartPromise =', restartLimitStart);
+  const restartLimitBlock = mainWindowSource.slice(restartLimitStart, restartLimitEnd);
+  assert(restartLimitBlock.includes('stopSpeechRecognition'));
+  assert(restartLimitBlock.indexOf('stopSpeechRecognition') < restartLimitBlock.indexOf('handleRecordingStopped'));
+  const workerTimeout = speechSource.match(/const WHISPER_WORKER_REQUEST_TIMEOUT_MS = (\d+);/);
+  assert(workerTimeout && Number(workerTimeout[1]) > 180000);
   assert(mainWindowSource.includes('[...status.checks]'));
 }
 

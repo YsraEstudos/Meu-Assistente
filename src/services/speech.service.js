@@ -387,7 +387,7 @@ const { EventEmitter } = require('events');
 const logger = require('../core/logger').createServiceLogger('SPEECH');
 const config = require('../core/config');
 const { normalizeWhisperEngine } = require('../core/whisper-engine');
-const WHISPER_WORKER_REQUEST_TIMEOUT_MS = 120000;
+const WHISPER_WORKER_REQUEST_TIMEOUT_MS = 210000;
 
 let sdk = null;
 try {

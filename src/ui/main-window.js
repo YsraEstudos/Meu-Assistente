@@ -1125,6 +1125,16 @@ class MainWindowUI {
                 reason,
                 restartCount: this._captureRestartCount
             });
+            try {
+                if (window.electronAPI && typeof window.electronAPI.stopSpeechRecognition === 'function') {
+                    await window.electronAPI.stopSpeechRecognition();
+                }
+            } catch (error) {
+                logger.warn('Failed to stop main speech session after renderer capture failure', {
+                    component: 'MainWindowUI',
+                    error: error.message
+                });
+            }
             this.handleRecordingStopped();
             return;
         }

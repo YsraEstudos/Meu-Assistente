@@ -164,6 +164,14 @@ function testEveryValidTransition() {
 
   {
     const { machine } = createMachine();
+    startCapturing(machine);
+    assert.equal(machine.dispatch({ type: ERROR, reasonCode: 'transcription_failed' }).snapshot.state, ERROR_STATE);
+    assert.equal(machine.dispatch({ type: FINALIZED, reasonCode: 'recording_stopped' }).snapshot.state, IDLE);
+    assert.equal(machine.dispatch({ type: START_REQUESTED }).snapshot.state, STARTING);
+  }
+
+  {
+    const { machine } = createMachine();
     assert.equal(machine.dispatch({ type: RESET }).accepted, true);
     expectState(machine, IDLE);
     startCapturing(machine);
