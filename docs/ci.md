@@ -11,8 +11,10 @@ code never receives the release workflow's `contents: write` permission.
   present;
 - Linux and Windows packaging with publishing and code signing disabled.
 
-GPU, latency, benchmark, microphone, live Whisper, and other hardware-bound
-checks remain manual or trusted-environment checks. They are not suitable as
+GPU, live latency/benchmark runs, microphone, live Whisper, and other
+hardware-bound checks remain manual or trusted-environment checks. The
+deterministic contract tests for latency and benchmark configuration run in CI
+when their files are present. Full runtime measurements are not suitable as
 hosted pull-request gates because the GitHub runners do not provide the
 project's local GPU, Whisper model, or audio devices.
 

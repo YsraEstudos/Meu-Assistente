@@ -76,6 +76,8 @@ jobs:
             scripts/test-transcription-context.js
             scripts/test-ui-config.js
             scripts/test-repository-docs.js
+            scripts/test-speech-latency.js
+            scripts/test-benchmark-transcription.js
           )
 
           for test_file in "${optional_tests[@]}"; do
@@ -85,8 +87,9 @@ jobs:
             fi
           done
 
-          # GPU, latency, benchmark, microphone, and live Whisper tests require
-          # local hardware or downloaded model assets and are not hosted PR gates.
+          # Full GPU, live latency/benchmark, microphone, and live Whisper runs
+          # require local hardware or downloaded model assets and are not hosted
+          # PR gates.
 
   test-gate:
     name: CI / test
