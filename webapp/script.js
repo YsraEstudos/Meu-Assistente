@@ -160,7 +160,7 @@
       if (parsed.protocol !== 'https:' || parsed.hostname !== 'github.com' ||
           parsed.port || parsed.username || parsed.password ||
           parsed.pathname.indexOf(trustedPath) !== 0) return '#';
-      return parsed.href;
+      return parsed.origin + parsed.pathname;
     } catch (e) {
       return '#';
     }
