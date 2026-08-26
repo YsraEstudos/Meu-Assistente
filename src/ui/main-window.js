@@ -926,6 +926,10 @@ class MainWindowUI {
         const useRendererCapture = platform.includes('win') || platform.includes('mac');
         if (useRendererCapture) {
             this._startRendererAudioCapture();
+        } else {
+            // Linux records through the native recorder, so no renderer
+            // analyser exists; expose that limitation instead of staying idle.
+            this._updateMicMeterState('DEGRADED');
         }
         logger.debug('Recording started', { component: 'MainWindowUI' });
         this.updateMicButtonState();

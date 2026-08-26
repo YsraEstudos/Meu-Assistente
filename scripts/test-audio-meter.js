@@ -150,6 +150,11 @@ function testRendererMeterIntegrationContract() {
   assert.match(mainWindow, /new meterApi\.AudioMeter/);
   assert.match(mainWindow, /_stopMicMeter\(\)/);
   assert.match(mainWindow, /gain\.value\s*=\s*0/);
+  assert.match(
+    mainWindow,
+    /if \(useRendererCapture\) \{\s*this\._startRendererAudioCapture\(\);\s*\} else \{[\s\S]*?this\._updateMicMeterState\('DEGRADED'\);\s*\}/,
+    'native Linux capture must expose the meter degraded state'
+  );
 }
 
 testCalculateMeterMetrics();
