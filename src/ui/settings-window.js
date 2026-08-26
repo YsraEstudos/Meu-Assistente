@@ -3,6 +3,14 @@ document.addEventListener('DOMContentLoaded', () => {
         info: (...args) => console.log('[SettingsWindowUI]', ...args)
     };
 
+    // Keep renderer-side engine aliases aligned with the main-process contract.
+    const normalizeWhisperEngine = (value) => {
+        const engine = String(value || '').trim().toLowerCase();
+        if (engine === 'faster') return 'faster';
+        if (['cpp', 'whisper.cpp', 'whispercpp', 'whisper-cpp'].includes(engine)) return 'whisper-cpp';
+        return 'openai';
+    };
+
     // Get DOM elements
     const closeButton = document.getElementById('closeButton');
     const quitButton = document.getElementById('quitButton');
@@ -19,6 +27,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const whisperCppBackendSelect = document.getElementById('whisperCppBackend');
     const whisperModelInput = document.getElementById('whisperModel');
     const whisperLanguageInput = document.getElementById('whisperLanguage');
+    const whisperDeviceSelect = document.getElementById('whisperDevice');
+    const whisperCaptureModeSelect = document.getElementById('whisperCaptureMode');
+    const whisperResponseTargetSelect = document.getElementById('whisperResponseTarget');
     const whisperSegmentMsInput = document.getElementById('whisperSegmentMs');
     const geminiKeyInput = document.getElementById('geminiKey');
     const windowGapInput = document.getElementById('windowGap');
@@ -94,6 +105,9 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperCppBackendSelect) whisperCppBackendSelect.value = settings.whisperCppBackend || 'vulkan';
         if (whisperModelInput) whisperModelInput.value = settings.whisperModel || '';
         if (whisperLanguageInput) whisperLanguageInput.value = settings.whisperLanguage || '';
+        if (whisperDeviceSelect) whisperDeviceSelect.value = settings.whisperDevice || 'auto';
+        if (whisperCaptureModeSelect) whisperCaptureModeSelect.value = settings.whisperCaptureMode || 'vad';
+        if (whisperResponseTargetSelect) whisperResponseTargetSelect.value = settings.whisperResponseTarget || 'both';
         if (whisperSegmentMsInput) whisperSegmentMsInput.value = settings.whisperSegmentMs || '';
         if (geminiKeyInput) geminiKeyInput.value = settings.geminiKey || '';
         if (windowGapInput) windowGapInput.value = settings.windowGap || '';
@@ -157,6 +171,9 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperCppBackendSelect) settings.whisperCppBackend = whisperCppBackendSelect.value;
         if (whisperModelInput) settings.whisperModel = whisperModelInput.value;
         if (whisperLanguageInput) settings.whisperLanguage = whisperLanguageInput.value;
+        if (whisperDeviceSelect) settings.whisperDevice = whisperDeviceSelect.value;
+        if (whisperCaptureModeSelect) settings.whisperCaptureMode = whisperCaptureModeSelect.value;
+        if (whisperResponseTargetSelect) settings.whisperResponseTarget = whisperResponseTargetSelect.value;
         if (whisperSegmentMsInput) settings.whisperSegmentMs = whisperSegmentMsInput.value;
         if (geminiKeyInput) settings.geminiKey = geminiKeyInput.value;
         if (windowGapInput) settings.windowGap = windowGapInput.value;
@@ -168,7 +185,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const updateSpeechFieldStates = () => {
         const provider = speechProviderSelect ? speechProviderSelect.value : 'azure';
-        const engine = whisperEngineSelect ? whisperEngineSelect.value : 'whisper-cpp';
+        const engine = normalizeWhisperEngine(whisperEngineSelect ? whisperEngineSelect.value : 'whisper-cpp');
         const fasterOnlyItems = document.querySelectorAll('.faster-only');
         fasterOnlyItems.forEach((element) => {
             element.style.display = engine === 'faster' ? '' : 'none';
@@ -205,7 +222,10 @@ document.addEventListener('DOMContentLoaded', () => {
         [azureKeyInput, azureRegionInput].forEach(input => {
             if (input) input.disabled = provider !== 'azure';
         });
-        [whisperCommandInput, whisperModelInput, whisperLanguageInput, whisperSegmentMsInput, whisperEngineSelect, whisperFasterDeviceSelect, whisperFasterComputeTypeSelect, whisperCppCommandInput, whisperCppThreadsInput, whisperCppBlasSelect, whisperCppBackendSelect].forEach(input => {
+        [whisperCommandInput, whisperModelInput, whisperLanguageInput, whisperSegmentMsInput,
+            whisperEngineSelect, whisperFasterDeviceSelect, whisperFasterComputeTypeSelect,
+            whisperCppCommandInput, whisperCppThreadsInput, whisperCppBlasSelect, whisperCppBackendSelect,
+            whisperDeviceSelect, whisperCaptureModeSelect, whisperResponseTargetSelect].forEach(input => {
             if (input) input.disabled = provider !== 'whisper';
         });
     };
@@ -224,6 +244,9 @@ document.addEventListener('DOMContentLoaded', () => {
         whisperCppBackendSelect,
         whisperModelInput,
         whisperLanguageInput,
+        whisperDeviceSelect,
+        whisperCaptureModeSelect,
+        whisperResponseTargetSelect,
         whisperSegmentMsInput,
         geminiKeyInput,
         windowGapInput

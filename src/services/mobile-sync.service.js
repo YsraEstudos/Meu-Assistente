@@ -15,6 +15,9 @@ class MobileSyncService {
   }
 
   async start() {
+    // This zero-configuration pairing endpoint is intentionally HTTP and LAN-facing.
+    // Treat the generated URL as a bearer secret and expose the port only on a
+    // trusted network; deployments that require hostile-network protection need TLS.
     if (this.server) {
       return this.getConnectionInfo();
     }
@@ -50,7 +53,10 @@ class MobileSyncService {
     }
 
     const info = this.getConnectionInfo();
-    this.logger?.info('Mobile sync server started', info);
+    this.logger?.info('Mobile sync server started', {
+      port: info.port,
+      urlCount: info.urls.length
+    });
     return info;
   }
 
@@ -69,7 +75,7 @@ class MobileSyncService {
     }
 
     addresses.sort((left, right) => {
-      const isPrivate = (address) => /^(10\\.|192\\.168\\.|172\\.(1[6-9]|2\\d|3[0-1])\\.)/.test(address);
+      const isPrivate = (address) => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(address);
       return Number(isPrivate(right)) - Number(isPrivate(left));
     });
 
@@ -81,21 +87,52 @@ class MobileSyncService {
     };
   }
 
-  isAuthorized(requestUrl) {
-    return typeof requestUrl === 'string' &&
-      Boolean(this.token) &&
-      requestUrl.includes(`token=${this.token}`);
+  isAuthorized(requestUrl, headers = {}, { allowQuery = true } = {}) {
+    if (!this.token || typeof requestUrl !== 'string') return false;
+    let url;
+    try {
+      url = new URL(requestUrl, `http://127.0.0.1:${this.port}`);
+    } catch (_) {
+      return false;
+    }
+    const queryTokens = allowQuery ? url.searchParams.getAll('token') : [];
+    const hasQueryToken = queryTokens.length > 0;
+    const queryToken = queryTokens.length === 1 ? queryTokens[0] : null;
+    const cookieToken = String(headers.cookie || '')
+      .split(';')
+      .map((part) => part.trim())
+      .find((part) => part.startsWith('opencluely_mobile_token='))
+      ?.slice('opencluely_mobile_token='.length) || null;
+    const requestedToken = hasQueryToken ? queryToken : cookieToken;
+    const expected = Buffer.from(this.token);
+    const actual = Buffer.from(requestedToken || '');
+    return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
   }
 
   handleRequest(request, response) {
-    if (!this.isAuthorized(request.url)) {
+    let url;
+    try {
+      url = new URL(request.url, `http://127.0.0.1:${this.port}`);
+    } catch (_) {
+      response.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      response.end('Bad request');
+      return;
+    }
+
+    const pathname = url.pathname;
+    const isPage = pathname === '/' || pathname === '/mobile-sync.html';
+    if (!isPage && pathname !== '/events') {
+      response.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      response.end('Not found');
+      return;
+    }
+
+    if (!this.isAuthorized(request.url, request.headers, { allowQuery: isPage })) {
       try {
-        const requestedToken = new URL(request.url, 'http://127.0.0.1:' + this.port).searchParams.get('token') || '';
+        const requestedToken = isPage ? url.searchParams.get('token') || '' : '';
         this.logger?.warn('Mobile sync authorization rejected', {
-          requestTokenLength: requestedToken.length,
-          expectedTokenLength: this.token ? this.token.length : 0,
-          requestTokenSuffix: requestedToken.slice(-8),
-          expectedTokenSuffix: this.token ? this.token.slice(-8) : ''
+          hasToken: requestedToken.length > 0 || /(?:^|;\s*)opencluely_mobile_token=/.test(String(request.headers.cookie || '')),
+          tokenConfigured: Boolean(this.token)
         });
       } catch (_) { /* ignore diagnostic logging errors */ }
       response.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -103,7 +140,6 @@ class MobileSyncService {
       return;
     }
 
-    const pathname = String(request.url || '').split('?')[0];
     if (pathname === '/events') {
       response.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
@@ -120,14 +156,12 @@ class MobileSyncService {
     if (pathname === '/' || pathname === '/mobile-sync.html') {
       response.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-store'
+        'Cache-Control': 'no-store',
+        'Set-Cookie': 'opencluely_mobile_token=' + this.token + '; HttpOnly; SameSite=Strict; Path=/'
       });
-      response.end(this.page.replace('__TOKEN__', this.token));
+      response.end(this.page);
       return;
     }
-
-    response.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-    response.end('Not found');
   }
 
   publish(event, data) {

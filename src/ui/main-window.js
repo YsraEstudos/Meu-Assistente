@@ -10,6 +10,7 @@ const logger = {
     error: (...args) => console.error('[MainWindowUI ERROR]', ...args),
     warn: (...args) => console.warn('[MainWindowUI WARN]', ...args)
 };
+const MAX_CAPTURE_RESTART_ATTEMPTS = 3;
 
 class MainWindowUI {
     constructor() {
@@ -250,7 +251,7 @@ class MainWindowUI {
         });
 
         this.whisperStatusChecks.replaceChildren();
-        const checks = Array.isArray(status.checks) ? status.checks : [];
+        const checks = Array.isArray(status.checks) ? [...status.checks] : [];
         if (status.error) checks.push({ ok: false, label: status.error });
         checks.forEach((check) => {
             const item = document.createElement('li');
@@ -511,7 +512,7 @@ class MainWindowUI {
                         component: 'MainWindowUI',
                         error: error.message
                     });
-                    this.isRecording = false;
+                    this.handleRecordingStopped();
                 } finally {
                     this._micTogglePending = false;
                     this.updateMicButtonState();
@@ -574,6 +575,11 @@ class MainWindowUI {
                     this.showWhisperStatusPopover();
                     await this.loadWhisperStatus(false);
                 }
+            });
+            this.whisperStatusButton.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter' && event.key !== ' ') return;
+                event.preventDefault();
+                this.whisperStatusButton.click();
             });
 
             if (this.whisperStatusTestButton) {
@@ -1237,6 +1243,25 @@ class MainWindowUI {
         if (this._captureRestartPromise || !this.isRecording) {
             return;
         }
+        if (this._captureRestartCount >= MAX_CAPTURE_RESTART_ATTEMPTS) {
+            logger.error('Renderer audio capture restart limit reached', {
+                component: 'MainWindowUI',
+                reason,
+                restartCount: this._captureRestartCount
+            });
+            try {
+                if (window.electronAPI && typeof window.electronAPI.stopSpeechRecognition === 'function') {
+                    await window.electronAPI.stopSpeechRecognition();
+                }
+            } catch (error) {
+                logger.warn('Failed to stop main speech session after renderer capture failure', {
+                    component: 'MainWindowUI',
+                    error: error.message
+                });
+            }
+            this.handleRecordingStopped();
+            return;
+        }
         const restartPromise = (async () => {
             this._captureRestartCount += 1;
             logger.debug('Restarting renderer audio capture', { component: 'MainWindowUI', reason, restartCount: this._captureRestartCount });
@@ -1771,6 +1796,7 @@ class MainWindowUI {
         if (!this.whisperStatusPopover) return;
         this.whisperStatusPopover.classList.add('is-open');
         this.whisperStatusPopover.setAttribute('aria-hidden', 'false');
+        this.whisperStatusButton?.setAttribute('aria-expanded', 'true');
         this.resizeWindowToContent();
     }
 
@@ -1778,6 +1804,7 @@ class MainWindowUI {
         if (!this.whisperStatusPopover) return;
         this.whisperStatusPopover.classList.remove('is-open');
         this.whisperStatusPopover.setAttribute('aria-hidden', 'true');
+        this.whisperStatusButton?.setAttribute('aria-expanded', 'false');
         setTimeout(() => this.resizeWindowToContent(), 120);
     }
 

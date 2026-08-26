@@ -8,15 +8,18 @@
     "dev": "env -u ELECTRON_RUN_AS_NODE electron . --no-sandbox --disable-gpu",
     "test-speech": "node scripts/test-speech.js",
     "test-speech-finalization": "node scripts/test-speech-finalization.js",
+    "test:security": "node scripts/test-security-boundaries.js",
+    "test:audio-session": "node scripts/test-audio-session.js",
     "test:audio-meter": "node scripts/test-audio-meter.js",
     "test:gpu": "node scripts/test-gpu-regression.js",
     "test:gpu:build": "node scripts/test-gpu-regression.js --target build",
-    "test:all": "npm run test-speech-finalization && npm run test:gpu && npm run test:audio-meter",
+    "test:review-fixes": "node scripts/test-pr-review-fixes.js",
+    "test:all": "npm run test-speech-finalization && npm run test:gpu && npm run test:security && npm run test:audio-session && npm run test:review-fixes && npm run test:audio-meter",
+    "test:build:win": "npm run test-speech-finalization && npm run test:security && npm run test:audio-session && npm run test:review-fixes && npm run test:audio-meter",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",
-    "prebuild:win": "npm run test:all",
+    "prebuild:win": "npm run test:build:win",
     "build:win": "electron-builder --win",
-    "postbuild:win": "npm run test:gpu:build",
     "build:linux": "electron-builder --linux",
     "build:all": "electron-builder --mac --win --linux",
     "dist": "npm run build",
@@ -49,6 +52,7 @@
     "winston-daily-rotate-file": "^4.7.1"
   },
   "devDependencies": {
+    "@electron/asar": "^3.4.1",
     "electron": "^29.1.0",
     "electron-builder": "^24.13.3"
   },
@@ -68,6 +72,9 @@
       "!.venv-faster-whisper/**/*",
       "!.whisper-models/**/*",
       "!.faster-whisper-models/**/*",
+      "!bin/**/*",
+      "!scripts/__pycache__/**/*",
+      "!**/*.pyc",
       "!eng.traineddata"
     ],
     "asarUnpack": [
@@ -77,7 +84,8 @@
       "scripts/whisper-worker.py",
       "scripts/faster-whisper-worker.py",
       "scripts/detect-cpu.py",
-      "scripts/whisper-cpp-worker.py"
+      "scripts/whisper-cpp-worker.py",
+      "scripts/whisper_worker.py"
     ],
     "mac": {
       "category": "public.app-category.utilities",

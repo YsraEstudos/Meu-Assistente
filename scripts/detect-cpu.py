@@ -88,7 +88,7 @@ def _cpu_details() -> tuple[str, str, set[str]]:
                 for line in handle:
                     key, _, value = line.partition(":")
                     normalized = key.strip().lower()
-                    if normalized in {"model name", "hardware", "processor"} and not cpu_name:
+                    if normalized in {"model name", "hardware"} and not cpu_name:
                         cpu_name = value.strip()
                     elif normalized in {"vendor_id", "cpu implementer"} and not vendor_text:
                         vendor_text = value.strip()

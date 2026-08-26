@@ -1,5 +1,6 @@
 const path = require("path");
 const fs = require("fs");
+const { fileURLToPath } = require("url");
 const { app, BrowserWindow, globalShortcut, session, ipcMain } = require("electron");
 
 // ── Resolve a stable .env location ──
@@ -20,7 +21,13 @@ function resolveEnvPath() {
     }
     return userDataEnv;
   } catch (_) {
-    return path.join(process.cwd(), ".env");
+    // On packaged macOS builds, process.cwd() may be inside a read-only .app
+    // bundle. Fall back to userData so .env writes never fail.
+    try {
+      return path.join(app.getPath("userData"), ".env");
+    } catch (e2) {
+      return path.join(process.cwd(), ".env");
+    }
   }
 }
 const ENV_PATH = resolveEnvPath();
@@ -71,6 +78,11 @@ app.commandLine.appendSwitch("no-pings");
 const logger = require("./src/core/logger").createServiceLogger("MAIN");
 const config = require("./src/core/config");
 const FirstRunManager = require("./src/core/first-run");
+const {
+  AUDIO_SESSION_EVENTS,
+  AUDIO_SESSION_STATES,
+  AudioSessionStateMachine
+} = require("./src/core/audio-session");
 
 // ── Global crash guard ──
 // The speech path spawns external processes (Whisper CLI, and on macOS/Linux
@@ -101,6 +113,7 @@ const llmService = require("./src/services/llm.service");
 const windowManager = require("./src/managers/window.manager");
 const sessionManager = require("./src/managers/session.manager");
 const MobileSyncService = require("./src/services/mobile-sync.service");
+const performanceTracker = require("./src/core/performance");
 
 class ApplicationController {
   constructor() {
@@ -120,6 +133,7 @@ class ApplicationController {
     this._speechSessionId = 0;
     this._speechTranscriptionComplete = false;
     this._audioIpcStats = null;
+    this.audioSession = new AudioSessionStateMachine();
 
     // First-run onboarding: detects missing .env / API key and triggers
     // a settings-window prompt on first launch so users don't have to
@@ -257,7 +271,10 @@ class ApplicationController {
       await windowManager.initializeWindows({ showMainWindow: !isFirstRun });
       try {
         const mobileSyncInfo = await this.mobileSync.start();
-        logger.info("Mobile sync is available", mobileSyncInfo);
+        logger.info("Mobile sync is available", {
+          port: mobileSyncInfo.port,
+          urlCount: mobileSyncInfo.urls?.length || 0
+        });
       } catch (error) {
         logger.warn("Mobile sync could not be started", { error: error.message });
       }
@@ -349,41 +366,77 @@ class ApplicationController {
     
     // Allow HTTPS requests to Google APIs
     ses.webRequest.onBeforeSendHeaders((details, callback) => {
-      if (details.url.includes('generativelanguage.googleapis.com')) {
-        details.requestHeaders['User-Agent'] = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36';
+      try {
+        const url = new URL(details.url);
+        if (url.hostname === 'generativelanguage.googleapis.com') {
+          details.requestHeaders['User-Agent'] = process.platform === 'darwin'
+            ? 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36'
+            : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36';
+        }
+      } catch (_) {
+        // Leave malformed or non-HTTP requests untouched.
       }
       callback({ requestHeaders: details.requestHeaders });
     });
-    
-    // Handle certificate errors for Google APIs
-    ses.setCertificateVerifyProc((request, callback) => {
-      if (request.hostname === 'generativelanguage.googleapis.com') {
-        callback(0); // Trust Google's certificates
-      } else {
-        callback(-2); // Use default verification
-      }
-    });
-    
+
+    // Keep Electron's default certificate verification enabled. The API
+    // endpoint is HTTPS, but trusting every certificate for its hostname would
+    // allow a local proxy or compromised network to intercept the API key and
+    // conversation contents.
     logger.debug('Network configuration applied for Gemini API');
   }
 
   setupPermissions() {
-    const allowedPermissions = ["media", "microphone", "camera", "display-capture"];
+    const appSession = session.defaultSession;
+    const isTrustedAppContents = (webContents) => {
+      if (!webContents || webContents.isDestroyed()) {
+        return false;
+      }
+      try {
+        const pagePath = path.resolve(fileURLToPath(webContents.getURL()));
+        const appRoot = path.resolve(__dirname);
+        const normalizeForComparison = (value) => process.platform === "win32"
+          ? value.toLowerCase()
+          : value;
+        const page = normalizeForComparison(pagePath);
+        const root = normalizeForComparison(appRoot + path.sep);
+        return page.startsWith(root);
+      } catch (_) {
+        return false;
+      }
+    };
 
-    session.defaultSession.setPermissionCheckHandler(
-      (_webContents, permission, _origin, details) => {
-        if (permission === "media") {
-          return !details?.mediaType || details.mediaType === "audio";
+    // Electron exposes camera/microphone access as the single `media`
+    // permission. The requested device type is provided separately in details.
+    appSession.setPermissionCheckHandler(
+      (webContents, permission, _requestingOrigin, details = {}) => {
+        if (!isTrustedAppContents(webContents)) {
+          return false;
         }
-        return allowedPermissions.includes(permission);
+        if (permission === "media") {
+          return !details.mediaType || details.mediaType === "audio";
+        }
+        return permission === "display-capture";
       }
     );
 
-    session.defaultSession.setPermissionRequestHandler(
-      (webContents, permission, callback) => {
-        const granted = allowedPermissions.includes(permission);
+    appSession.setPermissionRequestHandler(
+      (webContents, permission, callback, details = {}) => {
+        let granted = false;
+        if (isTrustedAppContents(webContents)) {
+          if (permission === "media") {
+            const mediaTypes = Array.isArray(details.mediaTypes) ? details.mediaTypes : [];
+            granted = mediaTypes.length === 0 || mediaTypes.includes("audio");
+          } else {
+            granted = permission === "display-capture";
+          }
+        }
 
-        logger.debug("Permission request", { permission, granted });
+        logger.debug("Permission request", {
+          permission,
+          mediaTypes: details.mediaTypes || [],
+          granted
+        });
         callback(granted);
       }
     );
@@ -430,6 +483,16 @@ class ApplicationController {
         totalChunks: 0,
         totalBytes: 0
       };
+      if (this.audioSession.getSnapshot().state === AUDIO_SESSION_STATES.IDLE) {
+        this._observeAudioSession(AUDIO_SESSION_EVENTS.START_REQUESTED, {
+          reasonCode: "recording_started",
+          source: "speech_service"
+        });
+      }
+      this._observeAudioSession(AUDIO_SESSION_EVENTS.CAPTURE_STARTED, {
+        reasonCode: "capture_started",
+        source: "speech_service"
+      });
       BrowserWindow.getAllWindows().forEach((window) => {
         window.webContents.send("recording-started", { sessionId: this._speechSessionId });
       });
@@ -439,6 +502,10 @@ class ApplicationController {
       if (payload.sessionId && payload.sessionId !== this._speechSessionId) {
         return;
       }
+      this._observeAudioSession(AUDIO_SESSION_EVENTS.CAPTURE_STOPPED, {
+        reasonCode: "capture_stopped",
+        source: "speech_service"
+      });
       BrowserWindow.getAllWindows().forEach((window) => {
         window.webContents.send("recording-capture-stopped", {
           sessionId: payload.sessionId || this._speechSessionId
@@ -450,6 +517,22 @@ class ApplicationController {
       if (payload.sessionId && payload.sessionId !== this._speechSessionId) {
         return;
       }
+      const state = this.audioSession.getSnapshot().state;
+      if (state === AUDIO_SESSION_STATES.CAPTURING || state === AUDIO_SESSION_STATES.DEGRADED) {
+        this._observeAudioSession(AUDIO_SESSION_EVENTS.CAPTURE_STOPPED, {
+          reasonCode: "capture_stopped",
+          source: "speech_service"
+        });
+      } else if (state === AUDIO_SESSION_STATES.STARTING) {
+        this._observeAudioSession(AUDIO_SESSION_EVENTS.STOP_REQUESTED, {
+          reasonCode: "recording_stopped_before_capture",
+          source: "speech_service"
+        });
+      }
+      this._observeAudioSession(AUDIO_SESSION_EVENTS.FINALIZED, {
+        reasonCode: "recording_stopped",
+        source: "speech_service"
+      });
       this._speechTranscriptionComplete = true;
       if (this._audioIpcStats) {
         logger.debug("Renderer audio IPC session ended", {
@@ -502,12 +585,83 @@ class ApplicationController {
     });
 
     speechService.on("error", (error) => {
+      this._observeAudioSession(AUDIO_SESSION_EVENTS.ERROR, {
+        reasonCode: "speech_error",
+        source: "speech_service"
+      });
       // In error, still compute availability
       this.speechAvailable = speechService.isAvailable ? speechService.isAvailable() : false;
       BrowserWindow.getAllWindows().forEach((window) => {
         window.webContents.send("speech-error", { error, available: this.speechAvailable });
       });
     });
+  }
+
+  _observeAudioSession(type, { reasonCode, source } = {}) {
+    let before;
+    let result;
+    try {
+      before = this.audioSession.getSnapshot();
+      result = this.audioSession.dispatch({ type, reasonCode, source });
+    } catch (_) {
+      this._recordAudioSessionTelemetry({
+        event: type,
+        accepted: false,
+        transitioned: false,
+        from: before?.state || AUDIO_SESSION_STATES.IDLE,
+        to: before?.state || AUDIO_SESSION_STATES.IDLE,
+        sessionId: before?.sessionId || null,
+        generation: before?.generation || 0,
+        reasonCode: "observer_failed",
+        source: "main",
+        durationMs: before?.durationMs || 0
+      });
+      return null;
+    }
+
+    const transition = result.transition;
+    this._recordAudioSessionTelemetry({
+      event: type,
+      accepted: result.accepted === true,
+      transitioned: result.transitioned === true,
+      from: transition?.from || before.state,
+      to: transition?.to || result.snapshot.state,
+      sessionId: transition?.sessionId || result.snapshot.sessionId || before.sessionId || null,
+      generation: Number.isInteger(transition?.generation)
+        ? transition.generation
+        : result.snapshot.generation,
+      reasonCode: transition?.reasonCode || reasonCode || null,
+      source: transition?.source || source || null,
+      durationMs: Number.isFinite(transition?.durationMs)
+        ? transition.durationMs
+        : result.snapshot.durationMs
+    });
+    return result;
+  }
+
+  _recordAudioSessionTelemetry(metadata) {
+    const safeMetadata = {
+      event: typeof metadata.event === "string" ? metadata.event.slice(0, 64) : "unknown",
+      accepted: metadata.accepted === true,
+      transitioned: metadata.transitioned === true,
+      from: typeof metadata.from === "string" ? metadata.from.slice(0, 32) : null,
+      to: typeof metadata.to === "string" ? metadata.to.slice(0, 32) : null,
+      sessionId: typeof metadata.sessionId === "string" ? metadata.sessionId.slice(0, 64) : null,
+      generation: Number.isInteger(metadata.generation) ? metadata.generation : 0,
+      reasonCode: typeof metadata.reasonCode === "string" ? metadata.reasonCode.slice(0, 64) : null,
+      source: typeof metadata.source === "string" ? metadata.source.slice(0, 64) : null,
+      durationMs: Number.isFinite(metadata.durationMs) ? Math.max(0, metadata.durationMs) : 0
+    };
+
+    try {
+      performanceTracker.mark("audio-session-transition", safeMetadata);
+    } catch (_) {
+      try {
+        logger.warn("Audio session telemetry failed", { errorCode: "telemetry_write_failed" });
+      } catch (_) {
+        // Telemetry must never propagate into the speech lifecycle.
+      }
+    }
   }
 
   setupIPCHandlers() {
@@ -936,7 +1090,7 @@ class ApplicationController {
       try {
         const installer = this.getWhisperInstaller();
         const sender = event.sender;
-        const result = await installer.downloadModel(modelName || 'turbo', {
+        const result = await installer.downloadModel(modelName || 'small', {
           onProgress: (line) => {
             try { sender.send("install-progress", line); } catch (_) { /* ignore */ }
           },
@@ -1066,7 +1220,6 @@ class ApplicationController {
     if (currentStatus.isRecording) {
       try {
         speechService.stopRecording();
-        windowManager.hideChatWindow();
         logger.info("Speech recognition stopped via global shortcut");
       } catch (error) {
         logger.error("Error stopping speech recognition:", error);
@@ -1444,12 +1597,12 @@ class ApplicationController {
       const skillsRequiringProgrammingLanguage = ['dsa'];
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
-      // Stream the answer so it renders progressively in the chat + overlay.
+      // Stream the answer progressively to the configured speech target.
       // A unique messageId ties the start/chunk/final events to one bubble so
       // the UI never duplicates or interleaves concurrent responses.
       this._responseSeq = (this._responseSeq || 0) + 1;
       messageId = `tr-${Date.now()}-${this._responseSeq}`;
-      windowManager.broadcastToAllWindows("transcription-llm-response-start", {
+      this.sendToVoiceResponseWindows("transcription-llm-response-start", {
         messageId,
         skill: this.activeSkill
       });
@@ -1457,14 +1610,13 @@ class ApplicationController {
       // Surface the overlay immediately so streamed tokens are visible there
       // too, instead of the overlay only appearing once the full answer lands.
       windowManager.showLLMLoading();
-
       const llmResult = await llmService.processTranscriptionWithIntelligentResponseStream(
         cleanText,
         this.activeSkill,
         sessionHistory.recent,
         needsProgrammingLanguage ? this.codingLanguage : null,
         (delta) => {
-          windowManager.broadcastToAllWindows("transcription-llm-response-chunk", {
+          this.sendToVoiceResponseWindows("transcription-llm-response-chunk", {
             messageId,
             delta
           });
@@ -1481,18 +1633,15 @@ class ApplicationController {
         isTranscriptionResponse: true
       });
 
-      // Send response to chat windows
-      this.broadcastTranscriptionLLMResponse(llmResult);
-
-      // Also display in the overlay (LLM response) window so the answer
-      // appears in both the chat panel and the floating overlay, mirroring
-      // the behaviour of screenshot/image responses.
-      windowManager.showLLMResponse(llmResult.response, {
-        skill: this.activeSkill,
-        processingTime: llmResult.metadata.processingTime,
-        usedFallback: llmResult.metadata.usedFallback,
-        isTranscriptionResponse: true
-      });
+      this.sendTranscriptionLLMResponseToVoiceTargets(llmResult);
+      if (this.shouldShowVoiceOverlay()) {
+        windowManager.showLLMResponse(llmResult.response, {
+          skill: this.activeSkill,
+          processingTime: llmResult.metadata.processingTime,
+          usedFallback: llmResult.metadata.usedFallback,
+          isTranscriptionResponse: true
+        });
+      }
 
       logger.info("Transcription LLM response completed", {
         responseLength: llmResult.response.length,
@@ -1512,7 +1661,7 @@ class ApplicationController {
       // Try to provide a fallback response
       try {
         const fallbackResult = llmService.generateIntelligentFallbackResponse(text, this.activeSkill);
-        // Carry the streaming messageId so the chat/overlay replace the live
+        // Carry the streaming messageId so the target replaces the live
         // bubble instead of leaving it stuck and appending a duplicate.
         if (messageId) {
           fallbackResult.metadata = { ...fallbackResult.metadata, messageId };
@@ -1526,14 +1675,15 @@ class ApplicationController {
           fallbackReason: error.message
         });
 
-        this.broadcastTranscriptionLLMResponse(fallbackResult);
-        // Mirror to overlay window for consistency
-        windowManager.showLLMResponse(fallbackResult.response, {
-          skill: this.activeSkill,
-          processingTime: fallbackResult.metadata.processingTime,
-          usedFallback: true,
-          isTranscriptionResponse: true
-        });
+        this.sendTranscriptionLLMResponseToVoiceTargets(fallbackResult);
+        if (this.shouldShowVoiceOverlay()) {
+          windowManager.showLLMResponse(fallbackResult.response, {
+            skill: this.activeSkill,
+            processingTime: fallbackResult.metadata.processingTime,
+            usedFallback: true,
+            isTranscriptionResponse: true
+          });
+        }
         logger.info("Used fallback response for transcription", {
           skill: this.activeSkill,
           fallbackResponse: fallbackResult.response
@@ -1631,6 +1781,48 @@ class ApplicationController {
     this.mobileSync.publish("response-chunk", data);
   }
 
+  sendToChatWindow(channel, data) {
+    const chatWindow = windowManager.getWindow("chat");
+    if (!chatWindow || chatWindow.isDestroyed()) {
+      logger.warn("Chat window unavailable for speech event", { channel });
+      return;
+    }
+    chatWindow.webContents.send(channel, data);
+  }
+
+  getVoiceResponseTarget() {
+    const configured = String(process.env.WHISPER_RESPONSE_TARGET || 'both').trim().toLowerCase();
+    return ['chat', 'overlay', 'both'].includes(configured) ? configured : 'both';
+  }
+
+  shouldShowVoiceOverlay() {
+    return ['overlay', 'both'].includes(this.getVoiceResponseTarget());
+  }
+
+  sendToVoiceResponseWindows(channel, data) {
+    const target = this.getVoiceResponseTarget();
+    if (target === 'chat' || target === 'both') {
+      this.sendToChatWindow(channel, data);
+    }
+    if (target === 'overlay' || target === 'both') {
+      const responseWindow = windowManager.getWindow("llmResponse");
+      if (responseWindow && !responseWindow.isDestroyed()) {
+        responseWindow.webContents.send(channel, data);
+      }
+    }
+  }
+
+  sendTranscriptionLLMResponseToVoiceTargets(llmResult) {
+    const data = {
+      response: llmResult.response,
+      metadata: llmResult.metadata,
+      messageId: llmResult.metadata && llmResult.metadata.messageId,
+      skill: this.activeSkill,
+      isTranscriptionResponse: true
+    };
+    this.sendToVoiceResponseWindows("transcription-llm-response", data);
+  }
+
   onWindowAllClosed() {
     if (process.platform !== "darwin") {
       app.quit();
@@ -1663,6 +1855,10 @@ class ApplicationController {
       clearTimeout(this._speechInitializationTimer);
       this._speechInitializationTimer = null;
     }
+    this._observeAudioSession(AUDIO_SESSION_EVENTS.RESET, {
+      reasonCode: "app_shutdown",
+      source: "main"
+    });
     globalShortcut.unregisterAll();
     if (typeof speechService.shutdown === "function") {
       speechService.shutdown();
@@ -1711,8 +1907,12 @@ class ApplicationController {
       azureRegion: process.env.AZURE_SPEECH_REGION || "",
       whisperEngine: process.env.WHISPER_ENGINE || "whisper-cpp",
       whisperCommand: process.env.WHISPER_COMMAND || "",
-      whisperModel: process.env.WHISPER_MODEL || "turbo",
-      whisperLanguage: process.env.WHISPER_LANGUAGE || "en",
+      whisperModel: process.env.WHISPER_MODEL || "small",
+      whisperLanguage: process.env.WHISPER_LANGUAGE || "auto",
+      whisperDevice: process.env.WHISPER_DEVICE || "auto",
+      whisperCaptureMode: process.env.WHISPER_CAPTURE_MODE ||
+        (process.env.WHISPER_MANUAL_CAPTURE === "true" ? "manual" : "vad"),
+      whisperResponseTarget: process.env.WHISPER_RESPONSE_TARGET || "both",
       whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
       whisperFasterDevice: process.env.WHISPER_FASTER_DEVICE || "cpu",
       whisperFasterComputeType: process.env.WHISPER_FASTER_COMPUTE_TYPE || "int8",
@@ -1817,6 +2017,15 @@ class ApplicationController {
       }
       if (settings.whisperLanguage !== undefined) {
         envUpdates.WHISPER_LANGUAGE = settings.whisperLanguage;
+      }
+      if (["auto", "cpu", "cuda"].includes(settings.whisperDevice)) {
+        envUpdates.WHISPER_DEVICE = settings.whisperDevice;
+      }
+      if (["manual", "vad"].includes(settings.whisperCaptureMode)) {
+        envUpdates.WHISPER_CAPTURE_MODE = settings.whisperCaptureMode;
+      }
+      if (["chat", "overlay", "both"].includes(settings.whisperResponseTarget)) {
+        envUpdates.WHISPER_RESPONSE_TARGET = settings.whisperResponseTarget;
       }
       if (settings.whisperSegmentMs !== undefined) {
         envUpdates.WHISPER_SEGMENT_MS = String(settings.whisperSegmentMs);
@@ -2047,17 +2256,17 @@ class ApplicationController {
 
       // Set app icon for dock/taskbar
       if (process.platform === "darwin") {
-        // macOS - update dock icon
-        app.dock.setIcon(fullIconPath);
-
-        // Force dock refresh with multiple attempts
-        setTimeout(() => {
+        // macOS - update dock icon (only if dock is available)
+        if (app.dock) {
           app.dock.setIcon(fullIconPath);
-        }, 100);
 
-        setTimeout(() => {
-          app.dock.setIcon(fullIconPath);
-        }, 500);
+          // Force dock refresh with multiple attempts
+          const retryDockIcon = () => {
+            try { app.dock.setIcon(fullIconPath); } catch (_) { /* dock may not exist */ }
+          };
+          setTimeout(retryDockIcon, 100);
+          setTimeout(retryDockIcon, 500);
+        }
       } else {
         // Windows/Linux - update window icons
         windowManager.windows.forEach((window, type) => {
@@ -2101,19 +2310,6 @@ class ApplicationController {
         // Multiple attempts to ensure the name sticks
         app.setName(appName);
 
-        // Force update the bundle name for macOS stealth
-        const { execSync } = require("child_process");
-        try {
-          // Update the app's Info.plist CFBundleName in memory
-          if (process.mainModule && process.mainModule.filename) {
-            const appPath = process.mainModule.filename;
-            // Force set the bundle name directly
-            process.env.CFBundleName = appName.trim();
-          }
-        } catch (e) {
-          // Silently fail if we can't modify bundle info
-        }
-
         // Clear dock badge and reset
         if (app.dock) {
           app.dock.setBadge("");
@@ -2126,8 +2322,10 @@ class ApplicationController {
         }
       }
 
-      // Set app user model ID for Windows taskbar grouping
-      app.setAppUserModelId(`${appName.trim()}-${iconKey}`);
+      // Set app user model ID for Windows taskbar grouping (Windows only)
+      if (process.platform === "win32") {
+        app.setAppUserModelId(`${appName.trim()}-${iconKey}`);
+      }
 
       // Update all window titles to match the new app name
       const windows = windowManager.windows;
