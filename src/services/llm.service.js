@@ -1,7 +1,12 @@
 const { GoogleGenAI } = require('@google/genai');
 const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
-const { promptLoader } = require('../../prompt-loader');
+const contextBuilder = require('./context.builder');
+const {
+  buildTechnicalTranscriptionContext,
+  buildTranscriptionUserMessage
+} = require('./transcription-context');
+const performanceTracker = require('../core/performance');
 
 class LLMService {
   constructor() {
@@ -49,13 +54,27 @@ class LLMService {
       topK: 40,
       topP: 0.95,
       maxOutputTokens: 4096,
-      thinkingConfig: { thinkingBudget: 0 }
+      thinkingConfig: { thinkingLevel: 'medium' }
     };
 
     const merged = { ...fallback, ...defaults, ...overrides };
-    return Object.fromEntries(
+    const generationConfig = Object.fromEntries(
       Object.entries(merged).filter(([, value]) => value !== undefined && value !== null)
     );
+
+    // Gemini 3.6 Flash and Gemini 3.5 Flash-Lite use thinkingLevel and no
+    // longer accept the legacy sampling controls in generationConfig.
+    const model = this.model || config.get('llm.gemini.model');
+    if (model === 'gemini-3.6-flash' || model === 'gemini-3.5-flash-lite') {
+      delete generationConfig.temperature;
+      delete generationConfig.topK;
+      delete generationConfig.topP;
+      generationConfig.thinkingConfig = {
+        thinkingLevel: generationConfig.thinkingConfig?.thinkingLevel || 'medium'
+      };
+    }
+
+    return generationConfig;
   }
 
   applyGenerationDefaults(request, overrides = {}) {
@@ -135,8 +154,7 @@ class LLMService {
 
     try {
       // Build system instruction using the skill prompt (with optional language injection)
-      const { promptLoader } = require('../../prompt-loader');
-      const skillPrompt = promptLoader.getSkillPrompt(activeSkill, programmingLanguage) || '';
+      const imageContext = contextBuilder.buildImageContext({ activeSkill, codingLanguage: programmingLanguage });
 
       // Build request with text + image parts
       const base64 = imageBuffer.toString('base64');
@@ -155,8 +173,8 @@ class LLMService {
 
       this.applyGenerationDefaults(request);
 
-      if (skillPrompt && skillPrompt.trim().length > 0) {
-        request.systemInstruction = { parts: [{ text: skillPrompt }] };
+      if (imageContext.systemInstruction) {
+        request.systemInstruction = imageContext.systemInstruction;
       }
 
       // Execute with retries/timeout - try alternative method first for network reliability
@@ -238,8 +256,7 @@ class LLMService {
     this.requestCount++;
 
     try {
-      const { promptLoader } = require('../../prompt-loader');
-      const skillPrompt = promptLoader.getSkillPrompt(activeSkill, programmingLanguage) || '';
+      const imageContext = contextBuilder.buildImageContext({ activeSkill, codingLanguage: programmingLanguage });
       const base64 = imageBuffer.toString('base64');
 
       const geminiRequest = {
@@ -254,8 +271,8 @@ class LLMService {
         ]
       };
       this.applyGenerationDefaults(geminiRequest);
-      if (skillPrompt && skillPrompt.trim().length > 0) {
-        geminiRequest.systemInstruction = { parts: [{ text: skillPrompt }] };
+      if (imageContext.systemInstruction) {
+        geminiRequest.systemInstruction = imageContext.systemInstruction;
       }
 
       const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
@@ -553,231 +570,57 @@ class LLMService {
     }
   }
 
-  buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage) {
-    // Check if we have the new conversation history format
-    const sessionManager = require('../managers/session.manager');
-    
-    if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
-      const conversationHistory = sessionManager.getConversationHistory(15);
-      const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage);
-      return this.buildGeminiRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage);
-    }
-
-    // Fallback to old method for compatibility - now with programming language support
-    const requestComponents = promptLoader.getRequestComponents(
-      activeSkill, 
-      text, 
-      sessionMemory,
-      programmingLanguage
-    );
-
-    const request = {
-      contents: []
-    };
-
-    this.applyGenerationDefaults(request);
-
-    // Use the skill prompt that already has programming language injected
-    if (requestComponents.shouldUseModelMemory && requestComponents.skillPrompt) {
-      request.systemInstruction = {
-        parts: [{ text: requestComponents.skillPrompt }]
-      };
-      
-      logger.debug('Using language-enhanced system instruction for skill', {
-        skill: activeSkill,
-        programmingLanguage: programmingLanguage || 'not specified',
-        promptLength: requestComponents.skillPrompt.length,
-        requiresProgrammingLanguage: requestComponents.requiresProgrammingLanguage
-      });
-    }
-
-    request.contents.push({
-      role: 'user',
-      parts: [{ text: this.formatUserMessage(text, activeSkill) }]
+  buildGeminiRequest(text, activeSkill, historySnapshot = {}, programmingLanguage) {
+    const context = contextBuilder.build({
+      text,
+      activeSkill,
+      codingLanguage: programmingLanguage,
+      historySnapshot
     });
-
-    return request;
-  }
-
-  buildGeminiRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage) {
-    const request = {
-      contents: []
-    };
-
+    const request = { contents: context.contents };
     this.applyGenerationDefaults(request);
+    if (context.systemInstruction) request.systemInstruction = context.systemInstruction;
 
-    // Use the skill prompt from context (which may already include programming language)
-    if (skillContext.skillPrompt) {
-      request.systemInstruction = {
-        parts: [{ text: skillContext.skillPrompt }]
-      };
-      
-      logger.debug('Using skill context prompt as system instruction', {
-        skill: activeSkill,
-        programmingLanguage: programmingLanguage || 'not specified',
-        promptLength: skillContext.skillPrompt.length,
-        requiresProgrammingLanguage: skillContext.requiresProgrammingLanguage || false,
-        hasLanguageInjection: programmingLanguage && skillContext.requiresProgrammingLanguage
-      });
-    }
-
-    // Add conversation history (excluding system messages) with validation
-    const conversationContents = conversationHistory
-      .filter(event => {
-        return event.role !== 'system' && 
-               event.content && 
-               typeof event.content === 'string' && 
-               event.content.trim().length > 0;
-      })
-      .map(event => {
-        const content = event.content.trim();
-        return {
-          role: event.role === 'model' ? 'model' : 'user',
-          parts: [{ text: content }]
-        };
-      });
-
-    // Add the conversation history
-    request.contents.push(...conversationContents);
-
-    // Format and validate the current user input
-    const formattedMessage = this.formatUserMessage(text, activeSkill);
-    if (!formattedMessage || formattedMessage.trim().length === 0) {
-      throw new Error('Failed to format user message or message is empty');
-    }
-
-    // Add the current user input
-    request.contents.push({
-      role: 'user',
-      parts: [{ text: formattedMessage }]
-    });
-
-    logger.debug('Built Gemini request with conversation history', {
+    logger.debug('Built optimized Gemini request', {
       skill: activeSkill,
       programmingLanguage: programmingLanguage || 'not specified',
-      historyLength: conversationHistory.length,
-      totalContents: request.contents.length,
-      hasSystemInstruction: !!request.systemInstruction,
-      requiresProgrammingLanguage: skillContext.requiresProgrammingLanguage || false
+      ...context.stats
     });
-
+    performanceTracker.mark('llm-context-built', { skill: activeSkill, ...context.stats });
     return request;
   }
 
-  buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage) {
-    // Validate input text first
+  buildIntelligentTranscriptionRequest(text, activeSkill, historySnapshot = {}, programmingLanguage) {
     const cleanText = text && typeof text === 'string' ? text.trim() : '';
-    if (!cleanText) {
-      throw new Error('Empty or invalid transcription text provided to buildIntelligentTranscriptionRequest');
-    }
+    if (!cleanText) throw new Error('Empty or invalid transcription text provided to buildIntelligentTranscriptionRequest');
 
-    // Check if we have the new conversation history format
-    const sessionManager = require('../managers/session.manager');
-    
-    if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
-      const conversationHistory = Array.isArray(sessionMemory)
-        ? sessionMemory
-        : sessionManager.getConversationHistory(10);
-      const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage);
-      return this.buildIntelligentTranscriptionRequestWithHistory(cleanText, activeSkill, conversationHistory, skillContext, programmingLanguage);
-    }
-
-    // Fallback to basic intelligent request
-    const request = {
-      contents: []
-    };
-
-    this.applyGenerationDefaults(request);
-
-    // Add intelligent filtering system instruction
     const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage);
-    if (!intelligentPrompt) {
-      throw new Error('Failed to generate intelligent transcription prompt');
-    }
+    if (!intelligentPrompt) throw new Error('Failed to generate intelligent transcription prompt');
 
-    request.systemInstruction = {
-      parts: [{ text: intelligentPrompt }]
-    };
-
-    request.contents.push({
-      role: 'user',
-      parts: [{ text: cleanText }]
+    const context = contextBuilder.build({
+      text: cleanText,
+      activeSkill,
+      codingLanguage: programmingLanguage,
+      historySnapshot,
+      systemPrompt: intelligentPrompt,
+      currentMessage: buildTranscriptionUserMessage(cleanText, activeSkill)
     });
+    const request = { contents: context.contents };
+    this.applyGenerationDefaults(request);
+    request.systemInstruction = context.systemInstruction;
 
-    logger.debug('Built basic intelligent transcription request', {
+    logger.debug('Built optimized intelligent transcription request', {
       skill: activeSkill,
       programmingLanguage: programmingLanguage || 'not specified',
       textLength: cleanText.length,
-      hasSystemInstruction: !!request.systemInstruction
+      ...context.stats
     });
-
+    performanceTracker.mark('transcription-context-built', { skill: activeSkill, ...context.stats });
     return request;
   }
 
-  buildIntelligentTranscriptionRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage) {
-    const request = {
-      contents: []
-    };
-
-    this.applyGenerationDefaults(request);
-
-  // For chat/transcription messages, DO NOT include the full skill prompt; use only the intelligent filter prompt
-  const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage);
-  request.systemInstruction = { parts: [{ text: intelligentPrompt }] };
-
-    // Add recent conversation history (excluding system messages) with validation
-    const conversationContents = conversationHistory
-      .filter(event => {
-        // Filter out system messages and ensure content exists and is valid
-        return event.role !== 'system' && 
-               event.content && 
-               typeof event.content === 'string' && 
-               event.content.trim().length > 0;
-      })
-      .slice(-8) // Keep last 8 exchanges for context
-      .map(event => {
-        const content = event.content.trim();
-        if (!content) {
-          logger.warn('Empty content found in conversation history', { event });
-          return null;
-        }
-        return {
-          role: event.role === 'model' ? 'model' : 'user',
-          parts: [{ text: content }]
-        };
-      })
-      .filter(content => content !== null); // Remove any null entries
-
-    // Add the conversation history
-    request.contents.push(...conversationContents);
-
-    // Validate and add the current transcription
-    const cleanText = text && typeof text === 'string' ? text.trim() : '';
-    if (!cleanText) {
-      throw new Error('Empty or invalid transcription text provided');
-    }
-
-    request.contents.push({
-      role: 'user',
-      parts: [{ text: cleanText }]
-    });
-
-    // Ensure we have at least one content item
-    if (request.contents.length === 0) {
-      throw new Error('No valid content to send to Gemini API');
-    }
-
-    logger.debug('Built intelligent transcription request with conversation history', {
-      skill: activeSkill,
-      programmingLanguage: programmingLanguage || 'not specified',
-      historyLength: conversationHistory.length,
-      totalContents: request.contents.length,
-      hasSkillPrompt: !!skillContext.skillPrompt,
-      cleanTextLength: cleanText.length,
-      requiresProgrammingLanguage: skillContext.requiresProgrammingLanguage || false
-    });
-
-    return request;
+  buildIntelligentTranscriptionRequestWithHistory(text, activeSkill, historySnapshot, _skillContext, programmingLanguage) {
+    return this.buildIntelligentTranscriptionRequest(text, activeSkill, historySnapshot, programmingLanguage);
   }
 
   getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage) {
@@ -848,6 +691,8 @@ If the user's input is a coding or DSA problem statement and contains no code, p
 Remember: Be intelligent about filtering - only provide detailed responses when the user actually needs help with ${activeSkill}.`;
 
     }
+
+    prompt += `\n\n${buildTechnicalTranscriptionContext({ programmingLanguage })}`;
     return prompt;
   }
 

@@ -10,6 +10,8 @@
     "test-speech-finalization": "node scripts/test-speech-finalization.js",
     "test:security": "node scripts/test-security-boundaries.js",
     "test:audio-session": "node scripts/test-audio-session.js",
+    "test:transcription-context": "node scripts/test-transcription-context.js",
+    "perf:smoke": "node scripts/perf-smoke.js",
     "test:audio-meter": "node scripts/test-audio-meter.js",
     "test:speech-latency": "node scripts/test-speech-latency.js",
     "test:speech-benchmark": "node scripts/test-benchmark-transcription.js",
