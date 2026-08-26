@@ -113,7 +113,10 @@ const llmService = require("./src/services/llm.service");
 const windowManager = require("./src/managers/window.manager");
 const sessionManager = require("./src/managers/session.manager");
 const MobileSyncService = require("./src/services/mobile-sync.service");
+const ResponseStream = require("./src/services/response-stream");
 const performanceTracker = require("./src/core/performance");
+
+const AVAILABLE_SKILLS = ["general", "dsa"];
 
 class ApplicationController {
   constructor() {
@@ -125,6 +128,8 @@ class ApplicationController {
     this.speechAvailable = false;
     this._speechInitializationTimer = null;
     this.mobileSync = new MobileSyncService({ logger });
+    this.responseStream = new ResponseStream();
+    this._startupTrace = performanceTracker.begin("app-start");
 
     // Voice fragments are display-only until the recording session reaches its
     // final transcription barrier. The LLM receives one consolidated message.
@@ -133,6 +138,8 @@ class ApplicationController {
     this._speechSessionId = 0;
     this._speechTranscriptionComplete = false;
     this._audioIpcStats = null;
+    this._audioPorts = new Set();
+    this._audioChunkWindow = { count: 0, bytes: 0, resetAt: Date.now() + 1000, dropped: 0 };
     this.audioSession = new AudioSessionStateMachine();
 
     // First-run onboarding: detects missing .env / API key and triggers
@@ -233,6 +240,7 @@ class ApplicationController {
       return;
     }
     this.starting = true;
+    performanceTracker.mark("app-ready");
 
     // Force stealth mode IMMEDIATELY when app is ready
     app.setName("Terminal ");
@@ -352,6 +360,11 @@ class ApplicationController {
           speechAvailable: this.speechAvailable,
           provider: speechService.provider,
         });
+        if (speechService.provider === 'whisper' && typeof speechService.prewarmWhisper === 'function') {
+          speechService.prewarmWhisper().catch((error) => {
+            logger.warn('Deferred Whisper prewarm failed', { error: error.message });
+          });
+        }
       } catch (error) {
         logger.warn("Deferred speech initialization failed", {
           error: error.message,
@@ -378,11 +391,10 @@ class ApplicationController {
       }
       callback({ requestHeaders: details.requestHeaders });
     });
-
-    // Keep Electron's default certificate verification enabled. The API
-    // endpoint is HTTPS, but trusting every certificate for its hostname would
-    // allow a local proxy or compromised network to intercept the API key and
-    // conversation contents.
+    // Handle certificate errors for Google APIs
+    ses.setCertificateVerifyProc((request, callback) => {
+      callback(-2); // Use default verification
+    });
     logger.debug('Network configuration applied for Gemini API');
   }
 
@@ -541,18 +553,30 @@ class ApplicationController {
         });
       }
       this._audioIpcStats = null;
+    this._audioPorts = new Set();
+      this._audioChunkWindow = { count: 0, bytes: 0, resetAt: Date.now() + 1000, dropped: 0 };
       // This is the only point where voice text may reach the LLM. The speech
       // service emits it only after the active segment and consolidated tail
       // batches have completed.
+      if (typeof speechService.markLatencyEvent === 'function') {
+        speechService.markLatencyEvent('dispatchAt');
+      }
+      const latency = payload.latency || speechService.getLatencyMetrics?.() || null;
+      performanceTracker.mark('speech-consolidated-dispatch', {
+        sessionId: payload.sessionId || this._speechSessionId,
+        latency
+      });
       this.dispatchCoalescedUtterance(payload.sessionId || this._speechSessionId);
       BrowserWindow.getAllWindows().forEach((window) => {
         window.webContents.send("recording-stopped", {
-          sessionId: payload.sessionId || this._speechSessionId
+          sessionId: payload.sessionId || this._speechSessionId,
+          latency: speechService.getLatencyMetrics?.() || latency
         });
       });
     });
 
     speechService.on("transcription", (text, metadata = {}) => {
+      performanceTracker.mark("speech-transcription", { textLength: String(text || '').length, partial: metadata.partial === true });
       this.handleTranscriptionFragment(text, metadata);
       this.mobileSync.publish("transcription", {
         text,
@@ -664,6 +688,92 @@ class ApplicationController {
     }
   }
 
+  handleRendererAudioPayload(rawBuffer) {
+    if (!rawBuffer) return;
+    let buffer;
+    try {
+      if (Buffer.isBuffer(rawBuffer)) {
+        buffer = rawBuffer;
+      } else if (rawBuffer instanceof ArrayBuffer) {
+        buffer = Buffer.from(rawBuffer);
+      } else if (ArrayBuffer.isView(rawBuffer)) {
+        buffer = Buffer.from(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
+      } else {
+        buffer = Buffer.from(rawBuffer);
+      }
+    } catch (error) {
+      logger.debug("Renderer audio payload rejected", { error: error.message });
+      return;
+    }
+
+    const stats = this._audioIpcStats;
+    if (stats) {
+      const now = Date.now();
+      stats.totalChunks += 1;
+      stats.totalBytes += buffer.length;
+      if (stats.totalChunks === 1) performanceTracker.mark('audio-ipc-first-chunk', { bytes: buffer.length });
+      if (now - stats.lastLogAt >= 1000) {
+        const intervalMs = Math.max(1, now - stats.lastLogAt);
+        const intervalChunks = stats.totalChunks - stats.loggedChunks;
+        const intervalBytes = stats.totalBytes - stats.loggedBytes;
+        logger.debug("Renderer audio IPC heartbeat", {
+          totalChunks: stats.totalChunks,
+          totalBytes: stats.totalBytes,
+          intervalChunks,
+          intervalBytes,
+          chunksPerSecond: Number((intervalChunks * 1000 / intervalMs).toFixed(1))
+        });
+        stats.lastLogAt = now;
+        stats.loggedChunks = stats.totalChunks;
+        stats.loggedBytes = stats.totalBytes;
+      }
+    }
+    speechService.handleAudioChunkFromRenderer(buffer);
+  }
+
+  _handleBoundedRendererAudioPayload(rawBuffer) {
+    const len = rawBuffer && (rawBuffer.byteLength !== undefined
+      ? rawBuffer.byteLength
+      : (rawBuffer.length || 0));
+    if (len > 2 * 1024 * 1024) {
+      logger.warn('Oversized audio chunk rejected', { length: len });
+      speechService.recordAudioChunk?.(len, true);
+      return;
+    }
+
+    const now = Date.now();
+    if (!this._audioChunkWindow || now > this._audioChunkWindow.resetAt) {
+      this._audioChunkWindow = { count: 0, bytes: 0, resetAt: now + 1000, dropped: 0 };
+    }
+    this._audioChunkWindow.count += 1;
+    this._audioChunkWindow.bytes += len || 0;
+    if (this._audioChunkWindow.count > 200 || this._audioChunkWindow.bytes > 4 * 1024 * 1024) {
+      if (this._audioChunkWindow.dropped === 0) {
+        logger.debug('Dropping audio chunks due to rate limit');
+      }
+      this._audioChunkWindow.dropped += 1;
+      speechService.recordAudioChunk?.(len, true);
+      return;
+    }
+    this.handleRendererAudioPayload(rawBuffer);
+  }
+
+  closeAudioPorts() {
+    for (const port of this._audioPorts) {
+      try { port.close(); } catch (_) { /* best effort */ }
+    }
+    this._audioPorts.clear();
+  }
+
+  _isAllowedRenderer(event, allowedTypes) {
+    const sender = event && event.sender;
+    if (!sender || !windowManager || !windowManager.windows) return false;
+    return allowedTypes.some((type) => {
+      const candidate = windowManager.windows.get(type);
+      return candidate && !candidate.isDestroyed() && candidate.webContents === sender;
+    });
+  }
+
   setupIPCHandlers() {
   ipcMain.handle("take-screenshot", () => this.triggerScreenshotOCR());
   ipcMain.handle("list-displays", () => captureService.listDisplays());
@@ -685,22 +795,20 @@ class ApplicationController {
       return speechService.isAvailable ? speechService.isAvailable() : false;
     });
 
-    ipcMain.handle("get-speech-status", () => {
+    ipcMain.handle("get-speech-status", async () => {
       try {
-        return speechService.getHardwareStatus
-          ? speechService.getHardwareStatus({ probe: false })
-          : { ok: false, available: false, execution: { kind: 'unavailable', label: 'Indisponível' } };
+        const readStatus = speechService.getHardwareStatusAsync || speechService.getHardwareStatus;
+        return await readStatus.call(speechService, { probe: false });
       } catch (error) {
         logger.warn("Failed to read speech hardware status", { error: error.message });
         return { ok: false, available: false, error: error.message, execution: { kind: 'unavailable', label: 'Indisponível' } };
       }
     });
 
-    ipcMain.handle("diagnose-speech", (event, options = {}) => {
+    ipcMain.handle("diagnose-speech", async (event, options = {}) => {
       try {
-        return speechService.getHardwareStatus
-          ? speechService.getHardwareStatus({ probe: options.probe === true })
-          : { ok: false, available: false, execution: { kind: 'unavailable', label: 'Indisponível' } };
+        const readStatus = speechService.getHardwareStatusAsync || speechService.getHardwareStatus;
+        return await readStatus.call(speechService, { probe: options.probe === true });
       } catch (error) {
         logger.warn("Speech hardware diagnosis failed", { error: error.message });
         return { ok: false, available: false, error: error.message, execution: { kind: 'unavailable', label: 'Indisponível' } };
@@ -717,50 +825,24 @@ class ApplicationController {
       return speechService.getStatus();
     });
 
-    // Raw PCM audio captured by the renderer's Web Audio API (Windows Whisper path)
-    ipcMain.on("audio-chunk", (_event, data) => {
-      const rawBuffer = data && data.buffer;
-      if (!rawBuffer) {
-        return;
-      }
-      let buffer;
-      try {
-        if (Buffer.isBuffer(rawBuffer)) {
-          buffer = rawBuffer;
-        } else if (rawBuffer instanceof ArrayBuffer) {
-          buffer = Buffer.from(rawBuffer);
-        } else if (ArrayBuffer.isView(rawBuffer)) {
-          buffer = Buffer.from(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
-        } else {
-          buffer = Buffer.from(rawBuffer);
-        }
-      } catch (error) {
-        logger.debug("Renderer audio IPC payload rejected", { error: error.message });
-        return;
-      }
+    // Raw PCM audio captured by the renderer's Web Audio API. MessagePort is
+    // preferred because ArrayBuffers can be transferred without an extra IPC
+    // serialization copy; audio-chunk remains the compatibility fallback.
+    ipcMain.on("audio-port", (event) => {
+      const port = event.ports && event.ports[0];
+      if (!port || typeof port.on !== 'function') return;
+      this._audioPorts.add(port);
+      port.on('message', (messageEvent) => {
+        const buf = messageEvent && messageEvent.data && messageEvent.data.buffer;
+        this._handleBoundedRendererAudioPayload(buf);
+      });
+      port.on('close', () => this._audioPorts.delete(port));
+      if (typeof port.start === 'function') port.start();
+    });
 
-      const stats = this._audioIpcStats;
-      if (stats) {
-        const now = Date.now();
-        stats.totalChunks += 1;
-        stats.totalBytes += buffer.length;
-        if (now - stats.lastLogAt >= 1000) {
-          const intervalMs = Math.max(1, now - stats.lastLogAt);
-          const intervalChunks = stats.totalChunks - stats.loggedChunks;
-          const intervalBytes = stats.totalBytes - stats.loggedBytes;
-          logger.debug("Renderer audio IPC heartbeat", {
-            totalChunks: stats.totalChunks,
-            totalBytes: stats.totalBytes,
-            intervalChunks,
-            intervalBytes,
-            chunksPerSecond: Number((intervalChunks * 1000 / intervalMs).toFixed(1))
-          });
-          stats.lastLogAt = now;
-          stats.loggedChunks = stats.totalChunks;
-          stats.loggedBytes = stats.totalBytes;
-        }
-      }
-      speechService.handleAudioChunkFromRenderer(buffer);
+    ipcMain.on("audio-chunk", (_event, data) => {
+      const buf = data && data.buffer;
+      this._handleBoundedRendererAudioPayload(buf);
     });
 
     ipcMain.on("speech-capture-drained", () => {
@@ -786,6 +868,7 @@ class ApplicationController {
     });
 
     ipcMain.on("main-window-ready", () => {
+      performanceTracker.mark("main-window-ready");
       // Re-check availability whenever the main overlay finishes loading;
       // this covers first-run where the window was hidden during onboarding.
       this.speechAvailable = speechService.isAvailable
@@ -838,18 +921,20 @@ class ApplicationController {
     ipcMain.handle("resize-window", (event, { width, height }) => {
       const mainWindow = windowManager.getWindow("main");
       if (mainWindow) {
-        // Enforce horizontal constraints: min ~one icon, max original width
-        const minW = 60;
-        const maxW = windowManager.windowConfigs?.main?.width || 520;
-        const clampedWidth = Math.max(minW, Math.min(maxW, Math.round(width || minW)));
+        // The renderer reports the intrinsic content size; never compress it
+        // down to an arbitrary icon-sized minimum or the old fixed max width.
+        const contentWidth = Math.max(1, Math.round(Number(width) || 1));
+        const contentHeight = Math.max(1, Math.round(Number(height) || 1));
         try {
-          // Match content size to the DOM so no extra transparent area remains
-          mainWindow.setContentSize(Math.max(1, clampedWidth), Math.max(1, Math.round(height)));
+          mainWindow.setContentSize(contentWidth, contentHeight);
         } catch (e) {
           // Fallback in case setContentSize isn’t available on some platform
-          mainWindow.setSize(Math.max(1, clampedWidth), Math.max(1, Math.round(height)));
+          mainWindow.setSize(contentWidth, contentHeight);
         }
-        logger.debug("Main window resized (content)", { width: clampedWidth, height });
+        logger.debug("Main window resized (content)", {
+          width: contentWidth,
+          height: contentHeight
+        });
       }
       return { success: true };
     });
@@ -871,7 +956,12 @@ class ApplicationController {
       return { success: true };
     });
 
-    ipcMain.handle("get-session-history", () => {
+    ipcMain.handle("get-performance-snapshot", () => performanceTracker.snapshot());
+
+    ipcMain.handle("get-session-history", (event) => {
+      if (!this._isAllowedRenderer(event, ['main', 'chat'])) {
+        throw new Error('Unauthorized session history request');
+      }
       return sessionManager.getOptimizedHistory();
     });
 
@@ -986,11 +1076,10 @@ class ApplicationController {
     });
 
     // Settings handlers
-    ipcMain.handle("show-settings", () => {
-      windowManager.showSettings();
+    ipcMain.handle("show-settings", async () => {
+      const settingsWindow = await windowManager.showSettings();
 
       // Send current settings to the settings window
-      const settingsWindow = windowManager.getWindow("settings");
       if (settingsWindow) {
         const currentSettings = this.getSettings();
         setTimeout(() => {
@@ -1111,9 +1200,7 @@ class ApplicationController {
     });
 
     ipcMain.handle("update-active-skill", (event, skill) => {
-      this.activeSkill = skill;
-      windowManager.broadcastToAllWindows("skill-changed", { skill });
-      return { success: true };
+      return this.setActiveSkill(skill, "renderer");
     });
 
     ipcMain.handle("restart-app-for-stealth", () => {
@@ -1186,8 +1273,7 @@ class ApplicationController {
 
     // Handle update skill
     ipcMain.on("update-skill", (event, skill) => {
-      this.activeSkill = skill;
-      windowManager.broadcastToAllWindows("skill-updated", { skill });
+      this.setActiveSkill(skill, "settings");
     });
 
     // Handle quit app (alternative method)
@@ -1290,10 +1376,7 @@ class ApplicationController {
   }
 
   navigateSkill(direction) {
-    const availableSkills = [
-      "dsa",
-      "general",
-    ];
+    const availableSkills = AVAILABLE_SKILLS;
 
     const currentIndex = availableSkills.indexOf(this.activeSkill);
     if (currentIndex === -1) {
@@ -1313,10 +1396,7 @@ class ApplicationController {
     }
 
     const newSkill = availableSkills[newIndex];
-    this.activeSkill = newSkill;
-
-    // Update session manager with the new skill
-    sessionManager.setActiveSkill(newSkill);
+    this.setActiveSkill(newSkill, "keyboard");
 
     logger.info("Skill navigated via global shortcut", {
       from: availableSkills[currentIndex],
@@ -1324,8 +1404,6 @@ class ApplicationController {
       direction: direction > 0 ? "down" : "up",
     });
 
-    // Broadcast the skill change to all windows
-    windowManager.broadcastToAllWindows("skill-updated", { skill: newSkill });
   }
 
   async triggerScreenshotOCR() {
@@ -1335,6 +1413,7 @@ class ApplicationController {
     }
 
     const startTime = Date.now();
+    let messageId = null;
 
     try {
       windowManager.showLLMLoading();
@@ -1354,28 +1433,23 @@ class ApplicationController {
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
       this._responseSeq = (this._responseSeq || 0) + 1;
-      const messageId = `img-${Date.now()}-${this._responseSeq}`;
-      windowManager.broadcastToAllWindows("transcription-llm-response-start", {
-        messageId,
-        skill: this.activeSkill
-      });
+      messageId = `img-${Date.now()}-${this._responseSeq}`;
+      this.startResponseStream(messageId, this.activeSkill);
       this.publishMobileResponseStart({ messageId, skill: this.activeSkill });
 
       const llmResult = await llmService.processImageWithSkillStream(
         capture.imageBuffer,
         capture.mimeType || 'image/png',
         this.activeSkill,
-        sessionHistory.recent,
+        sessionHistory,
         needsProgrammingLanguage ? this.codingLanguage : null,
         (delta) => {
-          windowManager.broadcastToAllWindows("transcription-llm-response-chunk", {
-            messageId,
-            delta
-          });
+          this.appendResponseStream(messageId, delta);
           this.publishMobileResponseChunk({ messageId, delta });
         }
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
+      this.endResponseStream(messageId, { response: llmResult.response });
 
       sessionManager.addModelResponse(llmResult.response, {
         skill: this.activeSkill,
@@ -1399,6 +1473,7 @@ class ApplicationController {
       });
 
       windowManager.hideLLMResponse();
+      if (messageId) this.endResponseStream(messageId, { error: error.message });
       this.broadcastOCRError(error.message);
       
       sessionManager.addConversationEvent({
@@ -1413,6 +1488,7 @@ class ApplicationController {
   }
 
   async processWithLLM(text, sessionHistory) {
+    let messageId = null;
     try {
       // Add user input to session memory
       sessionManager.addUserInput(text, 'llm_input');
@@ -1422,35 +1498,29 @@ class ApplicationController {
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
       this._responseSeq = (this._responseSeq || 0) + 1;
-      const messageId = `chat-${Date.now()}-${this._responseSeq}`;
-      windowManager.broadcastToAllWindows("transcription-llm-response-start", {
-        messageId,
-        skill: this.activeSkill
-      });
+      messageId = `chat-${Date.now()}-${this._responseSeq}`;
+      this.startResponseStream(messageId, this.activeSkill);
       this.publishMobileResponseStart({ messageId, skill: this.activeSkill });
       windowManager.showLLMLoading();
 
       const llmResult = await llmService.processTextWithSkillStream(
         text,
         this.activeSkill,
-        sessionHistory.recent,
+        sessionHistory,
         needsProgrammingLanguage ? this.codingLanguage : null,
         (delta) => {
-          windowManager.broadcastToAllWindows("transcription-llm-response-chunk", {
-            messageId,
-            delta
-          });
+          this.appendResponseStream(messageId, delta);
           this.publishMobileResponseChunk({ messageId, delta });
         }
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
+      this.endResponseStream(messageId, { response: llmResult.response });
 
-      logger.info("LLM processing completed, showing response", {
+      logger.debug("LLM processing completed, showing response", {
         responseLength: llmResult.response.length,
         skill: this.activeSkill,
         programmingLanguage: needsProgrammingLanguage ? this.codingLanguage : 'not applicable',
         processingTime: llmResult.metadata.processingTime,
-        responsePreview: llmResult.response.substring(0, 200) + "...",
       });
 
       // Add LLM response to session memory
@@ -1474,6 +1544,7 @@ class ApplicationController {
       });
 
       windowManager.hideLLMResponse();
+      if (messageId) this.endResponseStream(messageId, { error: error.message });
       sessionManager.addConversationEvent({
         role: 'system',
         content: `LLM processing failed: ${error.message}`,
@@ -1587,10 +1658,9 @@ class ApplicationController {
         return;
       }
 
-      logger.info("Processing transcription with intelligent LLM response", {
+      logger.debug("Processing transcription with intelligent LLM response", {
         skill: this.activeSkill,
-        textLength: cleanText.length,
-        textPreview: cleanText.substring(0, 100) + "..."
+        textLength: cleanText.length
       });
 
       // Check if current skill needs programming language context
@@ -1606,6 +1676,7 @@ class ApplicationController {
         messageId,
         skill: this.activeSkill
       });
+      this.startResponseStream(messageId, this.activeSkill);
       this.publishMobileResponseStart({ messageId, skill: this.activeSkill });
       // Surface the overlay immediately so streamed tokens are visible there
       // too, instead of the overlay only appearing once the full answer lands.
@@ -1613,17 +1684,19 @@ class ApplicationController {
       const llmResult = await llmService.processTranscriptionWithIntelligentResponseStream(
         cleanText,
         this.activeSkill,
-        sessionHistory.recent,
+        sessionHistory,
         needsProgrammingLanguage ? this.codingLanguage : null,
         (delta) => {
           this.sendToVoiceResponseWindows("transcription-llm-response-chunk", {
             messageId,
             delta
           });
+          this.appendResponseStream(messageId, delta);
           this.publishMobileResponseChunk({ messageId, delta });
         }
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
+      this.endResponseStream(messageId, { response: llmResult.response });
 
       // Add LLM response to session memory
       sessionManager.addModelResponse(llmResult.response, {
@@ -1684,15 +1757,17 @@ class ApplicationController {
             isTranscriptionResponse: true
           });
         }
+        this.endResponseStream(messageId, { response: fallbackResult.response });
         logger.info("Used fallback response for transcription", {
           skill: this.activeSkill,
-          fallbackResponse: fallbackResult.response
+          responseLength: fallbackResult.response.length
         });
         
       } catch (fallbackError) {
         logger.error("Fallback response also failed", {
           fallbackError: fallbackError.message
         });
+        this.endResponseStream(messageId, { error: fallbackError.message });
 
         sessionManager.addConversationEvent({
           role: 'system',
@@ -1728,11 +1803,10 @@ class ApplicationController {
       skill: this.activeSkill, // Add the current active skill to the top level
     };
 
-    logger.info("Broadcasting LLM success to all windows", {
+    logger.debug("Broadcasting LLM success to all windows", {
       responseLength: llmResult.response.length,
       skill: this.activeSkill,
-      dataKeys: Object.keys(broadcastData),
-      responsePreview: llmResult.response.substring(0, 100) + "...",
+      dataKeys: Object.keys(broadcastData)
     });
 
     windowManager.broadcastToAllWindows("llm-response", broadcastData);
@@ -1745,6 +1819,42 @@ class ApplicationController {
     });
   }
 
+  startResponseStream(messageId, skill) {
+    performanceTracker.mark("response-stream-start", { messageId, skill });
+    this.responseStream.start({
+      messageId,
+      sessionId: this._speechSessionId || null,
+      skill,
+      emit: (type, data) => this.publishResponseEvent(type, data)
+    });
+  }
+
+  appendResponseStream(messageId, delta) {
+    this.responseStream.append(messageId, delta);
+  }
+
+  endResponseStream(messageId, options = {}) {
+    this.responseStream.end(messageId, options);
+    performanceTracker.mark("response-stream-end", { messageId, responseLength: options.response ? options.response.length : 0, hasError: Boolean(options.error) });
+  }
+
+  publishResponseEvent(type, data) {
+    const channels = {
+      start: 'response-start',
+      delta: 'response-delta',
+      end: 'response-end',
+      error: 'response-error'
+    };
+    const channel = channels[type];
+    if (!channel) return;
+
+    for (const windowType of ['chat', 'llmResponse']) {
+      const target = windowManager.getWindow(windowType);
+      if (!target || target.isDestroyed() || !target.isVisible()) continue;
+      target.webContents.send(channel, data);
+    }
+  }
+
   broadcastTranscriptionLLMResponse(llmResult) {
     const broadcastData = {
       response: llmResult.response,
@@ -1754,10 +1864,9 @@ class ApplicationController {
       isTranscriptionResponse: true
     };
 
-    logger.info("Broadcasting transcription LLM response to all windows", {
+    logger.debug("Broadcasting transcription LLM response to all windows", {
       responseLength: llmResult.response.length,
-      skill: this.activeSkill,
-      responsePreview: llmResult.response.substring(0, 100) + "..."
+      skill: this.activeSkill
     });
 
     windowManager.broadcastToAllWindows("transcription-llm-response", broadcastData);
@@ -1855,6 +1964,7 @@ class ApplicationController {
       clearTimeout(this._speechInitializationTimer);
       this._speechInitializationTimer = null;
     }
+    this.closeAudioPorts();
     this._observeAudioSession(AUDIO_SESSION_EVENTS.RESET, {
       reasonCode: "app_shutdown",
       source: "main"
@@ -1887,11 +1997,60 @@ class ApplicationController {
     return this._whisperInstaller;
   }
 
+  setActiveSkill(skill, source = "unknown") {
+    const normalizedSkill = String(skill || "").trim().toLowerCase();
+    if (!AVAILABLE_SKILLS.includes(normalizedSkill)) {
+      logger.warn("Rejected unsupported skill", {
+        skill,
+        source,
+        availableSkills: AVAILABLE_SKILLS,
+      });
+      return {
+        success: false,
+        error: "Unsupported skill",
+        skill: this.activeSkill,
+      };
+    }
+
+    const previousSkill = this.activeSkill || "general";
+    if (previousSkill === normalizedSkill) {
+      return {
+        success: true,
+        changed: false,
+        skill: normalizedSkill,
+      };
+    }
+
+    this.activeSkill = normalizedSkill;
+    sessionManager.setActiveSkill(normalizedSkill);
+
+    windowManager.broadcastToAllWindows("skill-changed", {
+      skill: normalizedSkill,
+      previousSkill,
+      source,
+    });
+    windowManager.broadcastToAllWindows("skill-updated", {
+      skill: normalizedSkill,
+      previousSkill,
+      source,
+    });
+
+    logger.info("Active skill synchronized", {
+      from: previousSkill,
+      to: normalizedSkill,
+      source,
+    });
+
+    return {
+      success: true,
+      changed: previousSkill !== normalizedSkill,
+      skill: normalizedSkill,
+    };
+  }
   getSettings() {
-    // Surface every value the settings UI can edit, reading the live source
-    // of truth (process.env) so the UI shows exactly what the running app is
-    // using. Empty strings are returned rather than skipped so the UI can
-    // distinguish "unset" from "stale value from a previous load".
+    // Surface editable settings from the live source of truth. Secret values
+    // are represented by a marker so the settings UI can preserve them without
+    // handing plaintext credentials to every renderer.
     return {
       codingLanguage: this.codingLanguage || "cpp",
       activeSkill: this.activeSkill || "general",
@@ -1903,7 +2062,7 @@ class ApplicationController {
         ((process.env.AZURE_SPEECH_KEY && process.env.AZURE_SPEECH_REGION)
           ? "azure"
           : (speechService.provider !== "disabled" ? speechService.provider : "whisper")),
-      azureKey: process.env.AZURE_SPEECH_KEY || "",
+      azureKey: (process.env.AZURE_SPEECH_KEY ? "[CONFIGURED]" : ""),
       azureRegion: process.env.AZURE_SPEECH_REGION || "",
       whisperEngine: process.env.WHISPER_ENGINE || "whisper-cpp",
       whisperCommand: process.env.WHISPER_COMMAND || "",
@@ -1914,18 +2073,29 @@ class ApplicationController {
         (process.env.WHISPER_MANUAL_CAPTURE === "true" ? "manual" : "vad"),
       whisperResponseTarget: process.env.WHISPER_RESPONSE_TARGET || "both",
       whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
+      whisperPeriodicFlushMs: process.env.WHISPER_PERIODIC_FLUSH_MS || "3000",
+      whisperSilenceHangoverMs: process.env.WHISPER_SILENCE_HANGOVER_MS || "600",
+      whisperCaptureChunkSamples: process.env.WHISPER_CAPTURE_CHUNK_SAMPLES || "2048",
       whisperFasterDevice: process.env.WHISPER_FASTER_DEVICE || "cpu",
       whisperFasterComputeType: process.env.WHISPER_FASTER_COMPUTE_TYPE || "int8",
       whisperCppCommand: process.env.WHISPER_CPP_COMMAND || "",
+      whisperCppServerCommand: process.env.WHISPER_CPP_SERVER_COMMAND || "",
       whisperCppPython: process.env.WHISPER_CPP_PYTHON || "",
       whisperCppThreads: process.env.WHISPER_CPP_THREADS || "",
       whisperCppBlas: process.env.WHISPER_CPP_BLAS || "auto",
       whisperCppBackend: process.env.WHISPER_CPP_BACKEND || "vulkan",
+      whisperCppDevice: process.env.WHISPER_CPP_DEVICE || "auto",
+      whisperCppBeamSize: process.env.WHISPER_CPP_BEAM_SIZE || "1",
+      whisperCppBestOf: process.env.WHISPER_CPP_BEST_OF || "1",
+      whisperCppNoFallback: process.env.WHISPER_CPP_NO_FALLBACK || "true",
+      whisperCppFlashAttention: process.env.WHISPER_CPP_FLASH_ATTENTION || "true",
       whisperBatchSize: process.env.WHISPER_BATCH_SIZE || "4",
       whisperBatchTimeoutMs: process.env.WHISPER_BATCH_TIMEOUT_MS || "2000",
       whisperMaxConcurrent: process.env.WHISPER_MAX_CONCURRENT || "4",
       whisperBeamSize: process.env.WHISPER_BEAM_SIZE || "5",
-      geminiKey: process.env.GEMINI_API_KEY || "",
+      geminiKey: (process.env.GEMINI_API_KEY ? "[CONFIGURED]" : ""),
+      geminiModel: config.get("llm.gemini.model") || "gemini-3.6-flash",
+      geminiThinkingLevel: config.get("llm.gemini.generation.thinkingConfig.thinkingLevel") || "medium",
 
       azureConfigured: !!process.env.AZURE_SPEECH_KEY && !!process.env.AZURE_SPEECH_REGION,
       speechAvailable: this.speechAvailable
@@ -1942,10 +2112,7 @@ class ApplicationController {
         });
       }
       if (settings.activeSkill) {
-        this.activeSkill = settings.activeSkill;
-        windowManager.broadcastToAllWindows("skill-updated", {
-          skill: settings.activeSkill,
-        });
+        this.setActiveSkill(settings.activeSkill, "settings");
       }
       if (settings.appIcon) {
         this.appIcon = settings.appIcon;
@@ -1964,13 +2131,34 @@ class ApplicationController {
       // Writing to .env ensures they survive app restarts and are picked
       // up the next time the app boots.
       const envUpdates = {};
+      const supportedGeminiModels = ["gemini-3.6-flash", "gemini-3.5-flash-lite"];
+      const supportedThinkingLevels = ["minimal", "low", "medium", "high"];
+      const previousGeminiModel = config.get("llm.gemini.model");
+      const previousGeminiThinkingLevel = config.get("llm.gemini.generation.thinkingConfig.thinkingLevel");
+      const nextGeminiModel = supportedGeminiModels.includes(settings.geminiModel)
+        ? settings.geminiModel
+        : previousGeminiModel;
+      const nextGeminiThinkingLevel = supportedThinkingLevels.includes(settings.geminiThinkingLevel)
+        ? settings.geminiThinkingLevel
+        : previousGeminiThinkingLevel;
+      if (settings.geminiModel !== undefined && nextGeminiModel) {
+        config.set("llm.gemini.model", nextGeminiModel);
+        config.set("llm.gemini.fallbackModels", supportedGeminiModels.filter((model) => model !== nextGeminiModel));
+        envUpdates.GEMINI_MODEL = nextGeminiModel;
+      }
+      if (settings.geminiThinkingLevel !== undefined && nextGeminiThinkingLevel) {
+        config.set("llm.gemini.generation.thinkingConfig", {
+          thinkingLevel: nextGeminiThinkingLevel
+        });
+        envUpdates.GEMINI_THINKING_LEVEL = nextGeminiThinkingLevel;
+      }
       if (settings.speechProvider === "azure" || settings.speechProvider === "whisper") {
         envUpdates.SPEECH_PROVIDER = settings.speechProvider;
       }
       if (settings.whisperEngine !== undefined) {
         envUpdates.WHISPER_ENGINE = settings.whisperEngine || "whisper-cpp";
       }
-      if (settings.azureKey !== undefined) {
+      if (settings.azureKey !== undefined && settings.azureKey !== "[CONFIGURED]") {
         envUpdates.AZURE_SPEECH_KEY = settings.azureKey;
       }
       if (settings.azureRegion !== undefined) {
@@ -1988,6 +2176,9 @@ class ApplicationController {
       if (settings.whisperCppCommand !== undefined) {
         envUpdates.WHISPER_CPP_COMMAND = settings.whisperCppCommand;
       }
+      if (settings.whisperCppServerCommand !== undefined) {
+        envUpdates.WHISPER_CPP_SERVER_COMMAND = settings.whisperCppServerCommand;
+      }
       if (settings.whisperCppPython !== undefined) {
         envUpdates.WHISPER_CPP_PYTHON = settings.whisperCppPython;
       }
@@ -1999,6 +2190,9 @@ class ApplicationController {
       }
       if (settings.whisperCppBackend !== undefined) {
         envUpdates.WHISPER_CPP_BACKEND = String(settings.whisperCppBackend || "vulkan");
+      }
+      if (settings.whisperCppDevice !== undefined) {
+        envUpdates.WHISPER_CPP_DEVICE = String(settings.whisperCppDevice || "auto");
       }
       if (settings.whisperBatchSize !== undefined) {
         envUpdates.WHISPER_BATCH_SIZE = String(settings.whisperBatchSize || "4");
@@ -2030,7 +2224,7 @@ class ApplicationController {
       if (settings.whisperSegmentMs !== undefined) {
         envUpdates.WHISPER_SEGMENT_MS = String(settings.whisperSegmentMs);
       }
-      if (settings.geminiKey !== undefined) {
+      if (settings.geminiKey !== undefined && settings.geminiKey !== "[CONFIGURED]") {
         envUpdates.GEMINI_API_KEY = settings.geminiKey;
       }
 
@@ -2055,10 +2249,16 @@ class ApplicationController {
       // connection button in the onboarding wizard fails with
       // "Service not initialized" because the client was first created
       // at app startup, before any key was set.
-      if (settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) {
+      const geminiModelChanged = settings.geminiModel !== undefined && nextGeminiModel !== previousGeminiModel;
+      const geminiThinkingLevelChanged = settings.geminiThinkingLevel !== undefined && nextGeminiThinkingLevel !== previousGeminiThinkingLevel;
+      if ((settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) || geminiModelChanged || geminiThinkingLevelChanged) {
         try {
           llmService.initializeClient();
-          logger.info("LLM service reinitialized after Gemini key update");
+          logger.info("LLM service reinitialized after Gemini settings update", {
+            geminiModelChanged,
+            geminiThinkingLevelChanged,
+            geminiKeyChanged: settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined
+          });
         } catch (e) {
           logger.warn("Failed to reinitialize LLM service after Gemini key update", {
             error: e.message
@@ -2204,9 +2404,10 @@ class ApplicationController {
       const tmpPath = envPath + ".tmp";
       fs.writeFileSync(tmpPath, newContent, "utf8");
       fs.renameSync(tmpPath, envPath);
+      try { fs.chmodSync(envPath, 0o600); } catch (_) { /* best effort, may not apply on Windows */ }
     } catch (e) {
-      logger.error("Failed to persist .env updates", {
-        error: e.message,
+        logger.error("Failed to persist .env updates", {
+          error: e.message,
         keys
       });
       return [];

@@ -11,6 +11,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startSpeechRecognition: () => ipcRenderer.invoke('start-speech-recognition'),
   stopSpeechRecognition: () => ipcRenderer.invoke('stop-speech-recognition'),
   sendAudioChunk: (buffer) => ipcRenderer.send('audio-chunk', { buffer }),
+  openAudioTransport: () => {
+    try {
+      if (typeof MessageChannel === 'undefined' || typeof ipcRenderer.postMessage !== 'function') return null;
+      const channel = new MessageChannel();
+      ipcRenderer.postMessage('audio-port', null, [channel.port2]);
+      return channel.port1;
+    } catch (error) {
+      console.warn('Audio MessagePort unavailable; using legacy IPC', error.message);
+      return null;
+    }
+  },
   confirmAudioCaptureStopped: () => ipcRenderer.send('speech-capture-drained'),
   getSpeechAvailability: () => ipcRenderer.invoke('get-speech-availability'),
   getSpeechStatus: () => ipcRenderer.invoke('get-speech-status'),
@@ -26,6 +37,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   resizeWindow: (width, height) => ipcRenderer.invoke('resize-window', { width, height }),
   moveWindow: (deltaX, deltaY) => ipcRenderer.invoke('move-window', { deltaX, deltaY }),
   getWindowStats: () => ipcRenderer.invoke('get-window-stats'),
+  getPerformanceSnapshot: () => ipcRenderer.invoke('get-performance-snapshot'),
   
   // Session memory
   getSessionHistory: () => ipcRenderer.invoke('get-session-history'),
@@ -113,6 +125,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onTranscriptionLlmResponse: (callback) => ipcRenderer.on('transcription-llm-response', callback),
   onTranscriptionLlmResponseStart: (callback) => ipcRenderer.on('transcription-llm-response-start', callback),
   onTranscriptionLlmResponseChunk: (callback) => ipcRenderer.on('transcription-llm-response-chunk', callback),
+  onResponseStart: (callback) => ipcRenderer.on('response-start', callback),
+  onResponseDelta: (callback) => ipcRenderer.on('response-delta', callback),
+  onResponseEnd: (callback) => ipcRenderer.on('response-end', callback),
+  onResponseError: (callback) => ipcRenderer.on('response-error', callback),
   onOpenGeminiConfig: (callback) => ipcRenderer.on('open-gemini-config', callback),
   onDisplayLlmResponse: (callback) => ipcRenderer.on('display-llm-response', callback),
   onShowLoading: (callback) => ipcRenderer.on('show-loading', callback),

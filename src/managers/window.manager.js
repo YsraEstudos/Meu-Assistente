@@ -14,6 +14,11 @@ class WindowManager {
     this.desktopWatcher = null;
     this.lastActiveSpace = null;
     this.screenCaptureAvailabilityWatcher = null;
+    this._stealthWatchdog = null;
+    this._responsePrewarmTimer = null;
+    this._windowCreationPromises = new Map();
+    this._windowEventBindings = new WeakSet();
+    this._permissionHandlerInstalled = false;
     this.isScreenBeingShared = false;
     this.wasVisibleBeforeSharing = false;
     this.screenCaptureStatus = {
@@ -114,9 +119,6 @@ class WindowManager {
       // Pass autoShow so the main window doesn't flash visible during
       // first-run onboarding before the user has configured API keys.
       await this.createMainWindow({ autoShow: showMainWindow });
-      await this.createChatWindow();
-      await this.createLLMResponseWindow();
-      await this.createSettingsWindow();
       
       this.setupWindowEventHandlers();
       this.setupScreenTracking();
@@ -132,6 +134,7 @@ class WindowManager {
       
       this.isInitialized = true;
       this.isInitializing = false;
+      this.scheduleResponseWindowPrewarm();
       logger.info('All windows initialized successfully');
     } catch (error) {
       this.isInitializing = false;
@@ -227,31 +230,67 @@ class WindowManager {
   }
 
   async createChatWindow() {
-    if (this.windows.has('chat')) {
-      return this.windows.get('chat');
-    }
-    const window = await this.createWindow('chat');
-    this.windows.set('chat', window);
-    window.hide();
-    return window;
+    return this._ensureWindow('chat', async () => {
+      const window = await this.createWindow('chat');
+      this.windows.set('chat', window);
+      window.hide();
+      this.setupWindowEventHandlers();
+      return window;
+    });
   }
 
   async createLLMResponseWindow() {
-    if (this.windows.has('llmResponse')) {
-      return this.windows.get('llmResponse');
-    }
-    const window = await this.createWindow('llmResponse');
-    this.windows.set('llmResponse', window);
-    
-    // Add console message listener to see renderer logs in main process
-    window.webContents.on('console-message', (event, level, message, line, sourceId) => {
-      if (message.includes('LLM-RESPONSE')) {
-        logger.info(`[RENDERER] ${message}`);
-      }
+    return this._ensureWindow('llmResponse', async () => {
+      const window = await this.createWindow('llmResponse');
+      this.windows.set('llmResponse', window);
+
+      // Add console message listener to see renderer logs in main process
+      window.webContents.on('console-message', (event, level, message, line, sourceId) => {
+        if (message.includes('LLM-RESPONSE')) {
+          logger.debug('[RENDERER] LLM response event', { line, sourceId });
+        }
+      });
+
+      window.hide();
+      this.setupWindowEventHandlers();
+      return window;
     });
-    
-    window.hide();
-    return window;
+  }
+
+  async _ensureWindow(type, factory) {
+    const existing = this.windows.get(type);
+    if (existing && !existing.isDestroyed()) return existing;
+
+    const inFlight = this._windowCreationPromises.get(type);
+    if (inFlight) return inFlight;
+
+    const promise = Promise.resolve().then(factory);
+    this._windowCreationPromises.set(type, promise);
+    try {
+      return await promise;
+    } finally {
+      if (this._windowCreationPromises.get(type) === promise) {
+        this._windowCreationPromises.delete(type);
+      }
+    }
+  }
+
+  async ensureChatWindow() {
+    return this.createChatWindow();
+  }
+
+  async ensureLLMResponseWindow() {
+    return this.createLLMResponseWindow();
+  }
+
+  scheduleResponseWindowPrewarm() {
+    if (this._responsePrewarmTimer || this.windows.has('llmResponse')) return;
+    this._responsePrewarmTimer = setTimeout(() => {
+      this._responsePrewarmTimer = null;
+      this.createLLMResponseWindow().catch((error) => {
+        logger.debug('Idle response-window prewarm failed', { error: error.message });
+      });
+    }, 2000);
   }
 
   async createSettingsWindow() {
@@ -347,11 +386,7 @@ class WindowManager {
         titleBarOverlay: false,
         transparent: true,
         backgroundColor: '#00000000',
-  // Allow resizing so users can adjust width; we will lock height in handlers
-  resizable: true,
-    // Keep the original max width as cap; allow small min width so it can collapse to one icon
-    minWidth: 60,
-    maxWidth: this.windowConfigs.main.width,
+        resizable: false,
         minimizable: false,
         maximizable: false,
         closable: false,
@@ -457,11 +492,65 @@ class WindowManager {
       return { action: 'deny' };
     });
     window.webContents.on('will-navigate', (event, url) => {
-      if (/^https?:\/\//i.test(url) && url !== window.webContents.getURL()) {
+      try {
+        const currentUrl = window.webContents.getURL();
+        const target = new URL(url);
+
+        // Electron reports the origin of file:// URLs as "null". Comparing
+        // origins alone would therefore allow navigation to any local file.
+        if (target.href === currentUrl) {
+          return;
+        }
+
+        if (target.protocol === 'http:' || target.protocol === 'https:') {
+          event.preventDefault();
+          shell.openExternal(url);
+          return;
+        }
+
         event.preventDefault();
-        shell.openExternal(url);
+        logger.warn('Blocked navigation to non-http scheme: ' + url);
+      } catch (error) {
+        event.preventDefault();
+        logger.warn('Blocked navigation due to URL parse failure', { url, error: error.message });
       }
     });
+
+    if (!this._permissionHandlerInstalled) {
+      this._permissionHandlerInstalled = true;
+      // Harden the default session for all windows: only app-origin windows can
+      // request sensitive permissions, which supersedes the broader global handler.
+      window.webContents.session.setPermissionRequestHandler((webContents, permission, callback) => {
+        try {
+          const origin = new URL(webContents.getURL()).origin;
+          const appOrigin = new URL(window.webContents.getURL()).origin;
+
+          if (origin !== appOrigin) {
+            logger.warn('Denied permission for non-app origin', { origin, permission });
+            return callback(false);
+          }
+
+          const allowed = ['media', 'microphone', 'camera', 'display-capture'].includes(permission);
+          return callback(allowed);
+        } catch (error) {
+          return callback(false);
+        }
+      });
+      window.webContents.session.setPermissionCheckHandler((webContents, permission, origin, details) => {
+        try {
+          const currentOrigin = new URL(webContents.getURL()).origin;
+          const appOrigin = new URL(window.webContents.getURL()).origin;
+          const requestedOrigin = String(origin || '');
+          const originMatches = requestedOrigin === appOrigin ||
+            (appOrigin === 'null' && /^file:\/\//i.test(requestedOrigin));
+          if (currentOrigin !== appOrigin || !originMatches) return false;
+          if (permission === 'media') return !details?.mediaType || details.mediaType === 'audio';
+          return ['microphone', 'camera', 'display-capture'].includes(permission);
+        } catch (_) {
+          return false;
+        }
+      });
+    }
 
   // Load the HTML file
     await window.loadFile(windowConfig.file);
@@ -479,47 +568,13 @@ class WindowManager {
       window.setIgnoreMouseEvents(true, { forward: true });
     }
 
-    // Horizontal-only resize behavior for main overlay window
+    // Keep bound windows aligned after the main overlay is resized to its content.
     if (type === 'main') {
-      try {
-        // Small practical minimum width so it can collapse to roughly one icon width
-        // Height is managed dynamically; don't lock here to allow programmatic changes
-        if (typeof window.setMinimumSize === 'function') {
-          // Set a conservative minimum width; height will be adjusted via IPC as needed
-          window.setMinimumSize(60, windowConfig.height);
+      window.on('resize', () => {
+        if (this.bindWindows) {
+          this.positionBoundWindows();
         }
-
-        // Intercept user-initiated resizes to lock height and allow width changes only
-        window.on('will-resize', (event, newBounds) => {
-          try {
-            // Keep current content height; only apply the new width
-            const [_, currentContentHeight] = window.getContentSize();
-            event.preventDefault();
-            // Enforce width within min/max bounds
-            const minW = 60;
-            const maxW = this.windowConfigs.main.width;
-            const desiredW = Math.max(minW, Math.min(maxW, Math.round(newBounds.width || minW)));
-            window.setContentSize(desiredW, Math.max(1, currentContentHeight));
-          } catch (e) {
-            // Fallback: lock window height using window size
-            try {
-              const [__w, currentWindowHeight] = window.getSize();
-              event.preventDefault();
-              const minW = 60;
-              const maxW = this.windowConfigs.main.width;
-              const desiredW = Math.max(minW, Math.min(maxW, Math.round(newBounds.width || minW)));
-              window.setSize(desiredW, Math.max(1, currentWindowHeight));
-            } catch { /* noop */ }
-          }
-        });
-
-        // When resized (by user or programmatically), keep bound windows aligned at top
-        window.on('resize', () => {
-          if (this.bindWindows) {
-            this.positionBoundWindows();
-          }
-        });
-      } catch { /* ignore */ }
+      });
     }
     
     // Show window on current desktop if requested
@@ -537,154 +592,70 @@ class WindowManager {
     return window;
   }
 
-  applyStealthMeasures(window, type) {
-    // Enhanced always-on-top enforcement for all platforms
-    if (process.platform === 'darwin') {
-      // macOS: Use native window level constants for maximum effectiveness
+  enforceStealthForAllWindows() {
+    this.windows.forEach((window, type) => {
+      if (!window || window.isDestroyed()) return;
       try {
-        // Try the most aggressive levels first
-        const levels = [
-          'screen-saver',    // Highest level
-          'pop-up-menu',     // Menu level
-          'modal-panel',     // Modal panel level
-          'floating',        // Floating level
-          'normal'           // Fallback to normal with alwaysOnTop
-        ];
-        
-        let levelSet = false;
-        for (const level of levels) {
-          try {
-            window.setAlwaysOnTop(true, level, 1);
-            levelSet = true;
-            logger.debug(`Successfully set always-on-top with level: ${level}`, { type });
-            break;
-          } catch (levelError) {
-            logger.debug(`Failed to set level: ${level}`, { error: levelError.message });
-          }
-        }
-        
-        if (!levelSet) {
-          // Final fallback
+        if (process.platform === 'darwin') {
+          window.setAlwaysOnTop(true, 'floating', 1);
+        } else {
           window.setAlwaysOnTop(true);
         }
-        
-        // Additional macOS-specific enforcement
-        setTimeout(() => {
-          if (!window.isDestroyed()) {
-            try {
-              // Force re-application of always-on-top
-              window.setAlwaysOnTop(false);
-              setTimeout(() => {
-                if (!window.isDestroyed()) {
-                  window.setAlwaysOnTop(true, 'floating', 1);
-                }
-              }, 50);
-            } catch (error) {
-              logger.warn('Error in macOS re-enforcement', { error: error.message });
-            }
-          }
-        }, 200);
-        
       } catch (error) {
-        logger.warn('Error setting always-on-top for macOS', { error: error.message });
-        // Absolute fallback
-        window.setAlwaysOnTop(true);
+        logger.debug('Stealth watchdog could not enforce always-on-top', { type, error: error.message });
       }
-    } else if (process.platform === 'win32') {
-      // Windows: Multiple enforcement attempts
-      window.setAlwaysOnTop(true);
-      
-      setTimeout(() => {
-        if (!window.isDestroyed()) {
-          window.setAlwaysOnTop(true);
-        }
-      }, 100);
-      
-      setTimeout(() => {
-        if (!window.isDestroyed()) {
-          window.setAlwaysOnTop(true);
-        }
-      }, 500);
-      
-    } else {
-      // Linux and other platforms
-      window.setAlwaysOnTop(true);
-      
-      setTimeout(() => {
-        if (!window.isDestroyed()) {
-          window.setAlwaysOnTop(true);
-        }
-      }, 100);
-    }
+    });
+  }
 
-    // Ensure window appears on all workspaces/desktops initially
-    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-    
-    // Hide from taskbar to maintain stealth
-    window.setSkipTaskbar(true);
-    
-    // Make window undetectable by screen capture (if supported)
+  applyStealthMeasures(window, type) {
+    const enforceAlwaysOnTop = () => {
+      if (!window || window.isDestroyed()) return;
+      try {
+        if (process.platform === 'darwin') {
+          window.setAlwaysOnTop(true, 'floating', 1);
+        } else {
+          window.setAlwaysOnTop(true);
+        }
+      } catch (error) {
+        logger.debug('Error enforcing always-on-top', { type, error: error.message });
+      }
+    };
+
+    enforceAlwaysOnTop();
+
     try {
+      window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      window.setSkipTaskbar(true);
       window.setContentProtection(true);
       if (process.platform === 'linux' && !this._warnedNoContentProtection) {
         this._warnedNoContentProtection = true;
-        logger.warn('Screen-capture protection is unavailable on Linux (Electron limitation). The overlay WILL be visible in screen shares. This stealth feature only works on macOS and Windows.');
+        logger.warn('Screen-capture protection is unavailable on Linux (Electron limitation).');
       }
     } catch (error) {
-      logger.debug('Content protection not supported on this platform');
+      logger.debug('Some stealth measures are not supported', { type, error: error.message });
     }
-    
-    // More aggressive event listeners to maintain always-on-top behavior
-    const enforceAlwaysOnTop = () => {
-      if (!window.isDestroyed()) {
-        try {
-          if (process.platform === 'darwin') {
-            // Try multiple levels on macOS
-            window.setAlwaysOnTop(true, 'floating', 1);
-            setTimeout(() => {
-              if (!window.isDestroyed()) {
-                window.setAlwaysOnTop(true, 'screen-saver', 1);
-              }
-            }, 50);
-          } else {
-            window.setAlwaysOnTop(true);
-          }
-        } catch (error) {
-          logger.debug('Error in enforceAlwaysOnTop', { error: error.message });
-        }
-      }
+
+    let reapplyTimer = null;
+    const scheduleStealthReapply = () => {
+      if (reapplyTimer) clearTimeout(reapplyTimer);
+      reapplyTimer = setTimeout(() => {
+        reapplyTimer = null;
+        enforceAlwaysOnTop();
+      }, 50);
     };
-    
-    // Event-based enforcement
-    window.on('blur', () => {
-      setTimeout(enforceAlwaysOnTop, 50);
-      setTimeout(enforceAlwaysOnTop, 200);
-      setTimeout(enforceAlwaysOnTop, 500);
+
+    ['blur', 'show', 'focus', 'restore'].forEach((eventName) => {
+      window.on(eventName, scheduleStealthReapply);
     });
-    
-    window.on('show', () => {
-      setTimeout(enforceAlwaysOnTop, 50);
-      setTimeout(enforceAlwaysOnTop, 200);
-    });
-    
-    window.on('focus', () => {
-      setTimeout(enforceAlwaysOnTop, 50);
-    });
-    
-    window.on('restore', () => {
-      setTimeout(enforceAlwaysOnTop, 50);
-    });
-    
-    // Periodic enforcement every 3 seconds (more frequent)
-    const periodicEnforcement = setInterval(() => {
-      if (window.isDestroyed()) {
-        clearInterval(periodicEnforcement);
-        return;
-      }
-      enforceAlwaysOnTop();
-    }, 3000);
-    
-    logger.debug('Applied enhanced stealth measures with aggressive always-on-top', {
+
+    if (!this._stealthWatchdog) {
+      const watchdogMs = Number(config.get('performance.stealthWatchdogMs')) || 15000;
+      this._stealthWatchdog = setInterval(() => {
+        this.enforceStealthForAllWindows();
+      }, Math.max(5000, watchdogMs));
+    }
+
+    logger.debug('Applied stealth measures', {
       type,
       platform: process.platform,
       alwaysOnTop: true,
@@ -692,7 +663,6 @@ class WindowManager {
       skipTaskbar: true
     });
   }
-
   positionWindow(window, type) {
     const display = this.currentDisplay || screen.getPrimaryDisplay();
     const { x: displayX, y: displayY, width: screenWidth, height: screenHeight } = display.workArea || display.workAreaSize;
@@ -715,6 +685,10 @@ class WindowManager {
     };
 
     const position = positions[type] || { x: displayX + 100, y: displayY + topMargin };
+    const [currentX, currentY] = window.getPosition();
+    if (currentX === position.x && currentY === position.y) {
+      return;
+    }
     window.setPosition(position.x, position.y);
     
     logger.debug('Positioned window at top', {
@@ -755,11 +729,18 @@ class WindowManager {
     // Position main window (top)
     const mainX = adjustedMainX;
     const mainY = startY;
-    mainWindow.setPosition(mainX, mainY);
     
     // Position LLM response window below with gap
     const llmX = adjustedLlmX;
     const llmY = startY + mainHeight + this.windowGap;
+
+    const [currentMainX, currentMainY] = mainWindow.getPosition();
+    const [currentLlmX, currentLlmY] = llmWindow.getPosition();
+    const unchanged = currentMainX === mainX && currentMainY === mainY &&
+      currentLlmX === llmX && currentLlmY === llmY;
+    if (unchanged) return;
+
+    mainWindow.setPosition(mainX, mainY);
     llmWindow.setPosition(llmX, llmY);
     
     // Update stored position (use main window position as reference)
@@ -828,64 +809,55 @@ class WindowManager {
 
     const llmWin = this.windows.get('llmResponse');
     const isLLM = llmWin && !llmWin.isDestroyed() && win.id === llmWin.id;
+    const setAlwaysOnTop = () => {
+      if (win.isDestroyed()) return;
+      try {
+        if (process.platform === 'darwin') {
+          win.setAlwaysOnTop(true, 'floating', 1);
+        } else {
+          win.setAlwaysOnTop(true);
+        }
+      } catch (_) {
+        try { win.setAlwaysOnTop(true); } catch (__) { /* best effort */ }
+      }
+    };
+    const finalizeShow = () => {
+      if (win.isDestroyed()) return;
+      win.show();
+      win.focus();
+      setAlwaysOnTop();
+      if (!isLLM) {
+        try { win.setVisibleOnAllWorkspaces(false); } catch (_) { /* best effort */ }
+      }
+    };
 
     if (process.platform === 'darwin') {
-      // macOS: prevent space switching and keep visibility stable
       win.hide();
       win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-
-      const setMacOSAlwaysOnTop = () => {
-        if (win.isDestroyed()) return;
-        try {
-          win.setAlwaysOnTop(true, 'screen-saver', 2);
-        } catch {
-          try { win.setAlwaysOnTop(true, 'pop-up-menu', 2); }
-          catch { try { win.setAlwaysOnTop(true, 'floating', 2); }
-          catch { win.setAlwaysOnTop(true); }}
-        }
-      };
-
-      setMacOSAlwaysOnTop();
-
-      setTimeout(() => {
-        if (win.isDestroyed()) return;
-        win.show();
-        win.focus();
-        setMacOSAlwaysOnTop();
-        setTimeout(() => { if (!win.isDestroyed()) setMacOSAlwaysOnTop(); }, 100);
-        // Keep LLM window visible across workspaces; others revert
-        setTimeout(() => {
-          if (win.isDestroyed()) return;
-          if (!isLLM) {
-            win.setVisibleOnAllWorkspaces(false);
-          }
-          setMacOSAlwaysOnTop();
-        }, 300);
-      }, 50);
+      setAlwaysOnTop();
+      setTimeout(finalizeShow, 50);
     } else {
-      // Linux/Windows
       win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-      win.setAlwaysOnTop(true);
+      setAlwaysOnTop();
       win.show();
       win.focus();
       setTimeout(() => {
-        if (win.isDestroyed()) return;
-        if (!isLLM) {
-          win.setVisibleOnAllWorkspaces(false);
+        if (!win.isDestroyed() && !isLLM) {
+          try { win.setVisibleOnAllWorkspaces(false); } catch (_) { /* best effort */ }
         }
-        win.setAlwaysOnTop(true);
       }, 500);
     }
 
-    logger.debug('Showing window on current desktop with enhanced always-on-top', {
+    logger.debug('Showing window on current desktop', {
       platform: process.platform,
       windowId: win.id,
       isDestroyed: win.isDestroyed()
     });
   }
-  
   setupWindowEventHandlers() {
     this.windows.forEach((window, type) => {
+      if (this._windowEventBindings.has(window)) return;
+      this._windowEventBindings.add(window);
       window.on('closed', () => {
         logger.debug('Window closed', { type });
         this.windows.delete(type);
@@ -1025,7 +997,7 @@ class WindowManager {
     }
   }
 
-  switchToWindow(windowType) {
+  async switchToWindow(windowType) {
     if (windowType === 'chat' && this.windows.has('chat') && this.windows.get('chat').isVisible()) {
       this.hideChatWindow();
       return;
@@ -1044,7 +1016,12 @@ class WindowManager {
       this._ensureMainWindowVisible();
     }
 
-    const targetWindow = this.windows.get(windowType);
+    let targetWindow = this.windows.get(windowType);
+    if (!targetWindow && windowType === 'chat') {
+      targetWindow = await this.ensureChatWindow();
+    } else if (!targetWindow && windowType === 'llmResponse') {
+      targetWindow = await this.ensureLLMResponseWindow();
+    }
     if (targetWindow) {
       this.showOnCurrentDesktop(targetWindow);
 
@@ -1260,7 +1237,7 @@ class WindowManager {
     return results;
   }
 
-  showLLMResponse(content, metadata = {}) {
+  async showLLMResponse(content, metadata = {}) {
     logger.debug('showLLMResponse called', {
       isScreenBeingShared: this.isScreenBeingShared,
       contentLength: content.length,
@@ -1272,7 +1249,7 @@ class WindowManager {
       return;
     }
 
-    const llmWindow = this.windows.get('llmResponse');
+    const llmWindow = this.windows.get('llmResponse') || await this.ensureLLMResponseWindow();
     if (!llmWindow) {
       logger.error('LLM response window not available');
       return;
@@ -1307,13 +1284,13 @@ class WindowManager {
     });
   }
 
-  showLLMLoading() {
+  async showLLMLoading() {
     if (this.isScreenBeingShared) {
       logger.warn('LLM loading blocked due to screen sharing mode');
       return;
     }
 
-    const llmWindow = this.windows.get('llmResponse');
+    const llmWindow = this.windows.get('llmResponse') || await this.ensureLLMResponseWindow();
     if (llmWindow) {
       logger.debug('Showing LLM loading state');
       llmWindow.webContents.send('show-loading');
@@ -1337,21 +1314,22 @@ class WindowManager {
     }
   }
 
-  showSettings() {
+  async showSettings() {
     if (this.isScreenBeingShared) return;
 
-    const settingsWindow = this.windows.get('settings');
-    if (settingsWindow) {
-      this.showOnCurrentDesktop(settingsWindow);
-      this.centerWindow(settingsWindow); // This now positions at top-center
-      
-      // Notify that settings window is shown
-      setTimeout(() => {
-        settingsWindow.webContents.send('settings-window-shown');
-      }, 50);
-      
-      logger.info('Settings window displayed at top');
-    }
+    const settingsWindow = this.windows.get('settings') || await this.createSettingsWindow();
+    if (!settingsWindow || settingsWindow.isDestroyed()) return null;
+
+    // Settings is a tall panel; keep it centered in the work area instead of
+    // opening directly over or directly below the compact command bar.
+    this.centerWindow(settingsWindow, { verticalCenter: true });
+    this.showOnCurrentDesktop(settingsWindow);
+    setTimeout(() => {
+      if (!settingsWindow.isDestroyed()) settingsWindow.webContents.send('settings-window-shown');
+    }, 50);
+
+    logger.info('Settings window displayed centered');
+    return settingsWindow;
   }
 
   hideSettings() {
@@ -1445,49 +1423,42 @@ class WindowManager {
     };
   }
 
-  centerWindow(window) {
+  centerWindow(window, options = {}) {
     const display = this.currentDisplay || screen.getPrimaryDisplay();
     const { x: displayX, y: displayY, width: screenWidth, height: screenHeight } = display.workArea || display.workAreaSize;
     const [windowWidth, windowHeight] = window.getSize();
-    
-    // Center horizontally but position at top
+
+    // Center horizontally. Tall panels such as Settings can opt into a true
+    // vertical center so they do not collide with the compact command bar.
     const topMargin = 20;
     const x = displayX + Math.round((screenWidth - windowWidth) / 2);
-    const y = displayY + topMargin;
+    const y = options.verticalCenter
+      ? displayY + Math.max(topMargin, Math.round((screenHeight - windowHeight) / 2))
+      : displayY + topMargin;
     
     window.setPosition(x, y);
     
     logger.debug('Positioned window at top-center', {
       position: `${x},${y}`,
       topMargin,
+      verticalCenter: !!options.verticalCenter,
       display: display.id || 'primary'
     });
   }
 
   broadcastToAllWindows(channel, data) {
-    const windowStates = {};
-    
+    let windowCount = 0;
     this.windows.forEach((window, type) => {
       if (!window.isDestroyed()) {
         window.webContents.send(channel, data);
-        windowStates[type] = {
-          isVisible: window.isVisible(),
-          isDestroyed: window.isDestroyed(),
-          hasWebContents: !!window.webContents
-        };
-      } else {
-        windowStates[type] = { isDestroyed: true };
+        windowCount += 1;
       }
     });
     
-    logger.info('Broadcast sent to all windows', { 
+    logger.debug('Broadcast sent to windows', {
       channel, 
-      windowCount: this.windows.size,
-      windowStates,
-      dataKeys: data ? Object.keys(data) : [],
-      // Fixed: Check for 'content' instead of 'response' to match actual data structure
-      dataPreview: data && data.content ? data.content.substring(0, 50) + '...' : 
-                   data && data.response ? data.response.substring(0, 50) + '...' : 'No response'
+      windowCount,
+      dataKeys: data ? Object.keys(data) : []
     });
   }
 
@@ -1545,6 +1516,11 @@ class WindowManager {
     if (this.screenCaptureAvailabilityWatcher) {
       clearInterval(this.screenCaptureAvailabilityWatcher);
       this.screenCaptureAvailabilityWatcher = null;
+    }
+
+    if (this._stealthWatchdog) {
+      clearInterval(this._stealthWatchdog);
+      this._stealthWatchdog = null;
     }
     
     logger.info('All windows destroyed');

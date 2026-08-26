@@ -5,9 +5,11 @@ const os = require('os');
 const path = require('path');
 
 class MobileSyncService {
-  constructor({ logger, port = 4317 } = {}) {
+  constructor({ logger, port = 4317, bindHost = '127.0.0.1', maxSseClients = 4 } = {}) {
     this.logger = logger;
     this.port = port;
+    this.bindHost = bindHost === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1';
+    this.maxSseClients = Number.isInteger(maxSseClients) && maxSseClients > 0 ? maxSseClients : 4;
     this.server = null;
     this.token = null;
     this.clients = new Set();
@@ -34,12 +36,14 @@ class MobileSyncService {
       const onListening = () => {
         server.removeListener('error', onError);
         this.server = server;
-        this.port = port;
+        const address = server.address();
+        this.port = address && typeof address === 'object' && address.port ? address.port : port;
         resolve();
       };
       server.once('error', onError);
       server.once('listening', onListening);
-      server.listen(port, '0.0.0.0');
+      // 0.0.0.0 is opt-in and should be paired with TLS by the caller.
+      server.listen(port, this.bindHost);
     });
 
     try {
@@ -61,6 +65,11 @@ class MobileSyncService {
   }
 
   getConnectionInfo() {
+    if (this.bindHost !== '0.0.0.0') {
+      const url = `http://127.0.0.1:${this.port}/?token=${this.token}`;
+      return { port: this.port, urls: [url], url };
+    }
+
     const addresses = [];
     for (const interfaces of Object.values(os.networkInterfaces())) {
       for (const address of interfaces || []) {
@@ -141,6 +150,11 @@ class MobileSyncService {
     }
 
     if (pathname === '/events') {
+      if (this.clients.size >= this.maxSseClients) {
+        response.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' });
+        response.end('Too many SSE clients');
+        return;
+      }
       response.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-store, must-revalidate',
