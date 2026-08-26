@@ -148,13 +148,30 @@
     try { return new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }); }
     catch (e) { return ''; }
   }
+  function escapeHtml(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, function (char) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char];
+    });
+  }
+  function safeReleaseUrl(value) {
+    try {
+      var parsed = new URL(String(value || ''), window.location.href);
+      var trustedPath = '/TechyCSR/OpenCluely/releases/download/';
+      if (parsed.protocol !== 'https:' || parsed.hostname !== 'github.com' ||
+          parsed.port || parsed.username || parsed.password ||
+          parsed.pathname.indexOf(trustedPath) !== 0) return '#';
+      return parsed.href;
+    } catch (e) {
+      return '#';
+    }
+  }
   function icon(id) { return '<svg class="ic"><use href="#' + id + '"/></svg>'; }
 
   function assetRow(a) {
-    return '<a class="asset" href="' + a.browser_download_url + '" target="_blank" rel="noopener" download>' +
+    return '<a class="asset" href="' + escapeHtml(safeReleaseUrl(a.browser_download_url)) + '" target="_blank" rel="noopener" download>' +
       icon('i-download') +
-      '<span class="meta"><span class="fname">' + a.name + '</span>' +
-      '<span class="fsize">' + fmtBytes(a.size) + '</span></span>' +
+      '<span class="meta"><span class="fname">' + escapeHtml(a.name) + '</span>' +
+      '<span class="fsize">' + escapeHtml(fmtBytes(a.size)) + '</span></span>' +
       '<span class="go">' + '<svg class="ic"><use href="#i-arrow"/></svg>' + '</span>' +
       '</a>';
   }
@@ -167,8 +184,8 @@
 
     // Version banner
     el('dl-version').innerHTML =
-      '<span class="tag"><span class="dot"></span>' + rel.tag_name +
-      '<span class="when">released ' + fmtDate(rel.published_at) + '</span></span>';
+      '<span class="tag"><span class="dot"></span>' + escapeHtml(rel.tag_name) +
+      '<span class="when">released ' + escapeHtml(fmtDate(rel.published_at)) + '</span></span>';
 
     // Per-platform matched assets
     var byPlatform = PLATFORMS.map(function (p) {
@@ -195,8 +212,8 @@
         ? g.assets.map(assetRow).join('')
         : '<span class="asset empty">Not in this release</span>';
       return '<div class="platform">' +
-        '<div class="platform-head">' + icon(g.p.icon) + '<h4>' + g.p.label + '</h4></div>' +
-        '<p class="pnote">' + g.p.note + '</p>' +
+        '<div class="platform-head">' + icon(g.p.icon) + '<h4>' + escapeHtml(g.p.label) + '</h4></div>' +
+        '<p class="pnote">' + escapeHtml(g.p.note) + '</p>' +
         '<div class="dl-links">' + links + '</div>' +
         '</div>';
     }).join('') + macCard;
@@ -230,11 +247,11 @@
             '<span class="rec-ic">' + icon(rec.p.icon) + '</span>' +
             '<span class="rec-text">' +
               '<span class="rec-label">Recommended for you</span>' +
-              '<span class="rec-title">' + rec.p.label + '</span>' +
-              '<span class="rec-file">' + a.name + ' &middot; ' + fmtBytes(a.size) + '</span>' +
+              '<span class="rec-title">' + escapeHtml(rec.p.label) + '</span>' +
+              '<span class="rec-file">' + escapeHtml(a.name) + ' &middot; ' + escapeHtml(fmtBytes(a.size)) + '</span>' +
             '</span>' +
           '</div>' +
-          '<a class="btn btn-solid" href="' + a.browser_download_url + '" target="_blank" rel="noopener" download>' +
+          '<a class="btn btn-solid" href="' + escapeHtml(safeReleaseUrl(a.browser_download_url)) + '" target="_blank" rel="noopener" download>' +
             icon('i-download') + 'Download</a>';
         el('dl-recommend').classList.remove('hidden');
         var heroLbl = el('hero-dl-label');
