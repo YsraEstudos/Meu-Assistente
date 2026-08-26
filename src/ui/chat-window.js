@@ -19,6 +19,9 @@ class ChatWindowUI {
         this.micTogglePending = false;
         this.isInteractive = true; // Start in interactive mode
         this.elements = {};
+        this._streamStates = new Map();
+        this._canonicalStreamIds = new Set();
+        this._completedCanonicalIds = new Set();
         
         this.init();
     }
@@ -165,7 +168,9 @@ class ChatWindowUI {
             });
             
             window.electronAPI.onTranscriptionLlmResponse((event, data) => {
-                if (data && data.response) {
+                if (data && data.response && (!data.messageId ||
+                    (!this._canonicalStreamIds.has(data.messageId) &&
+                     !this._completedCanonicalIds.has(data.messageId)))) {
                     // Hide thinking indicator
                     this.hideThinkingIndicator();
                     // Finalize the streaming bubble (if any) with fully formatted
@@ -174,18 +179,55 @@ class ChatWindowUI {
                 }
             });
 
+            if (window.electronAPI.onResponseStart) {
+                window.electronAPI.onResponseStart((_event, data) => {
+                    if (data && data.messageId) {
+                        this._canonicalStreamIds.add(data.messageId);
+                        this.beginStreamingResponse(data.messageId);
+                    }
+                });
+            }
+            if (window.electronAPI.onResponseDelta) {
+                window.electronAPI.onResponseDelta((_event, data) => {
+                    if (data && data.messageId) this.appendStreamingChunk(data.messageId, data.delta || '');
+                });
+            }
+            if (window.electronAPI.onResponseEnd) {
+                window.electronAPI.onResponseEnd((_event, data) => {
+                    if (!data || !data.messageId) return;
+                    this._completedCanonicalIds.add(data.messageId);
+                    this.hideThinkingIndicator();
+                    this.finalizeStreamingResponse(data.messageId, data.response || '');
+                    setTimeout(() => {
+                        this._completedCanonicalIds.delete(data.messageId);
+                        this._canonicalStreamIds.delete(data.messageId);
+                    }, 10000);
+                });
+            }
+            if (window.electronAPI.onResponseError) {
+                window.electronAPI.onResponseError((_event, data) => {
+                    if (!data || !data.messageId) return;
+                    this._completedCanonicalIds.add(data.messageId);
+                    this.finalizeStreamingResponse(data.messageId, '');
+                    this.addMessage(`LLM Error: ${data.error || 'stream failed'}`, 'error');
+                    setTimeout(() => {
+                        this._completedCanonicalIds.delete(data.messageId);
+                        this._canonicalStreamIds.delete(data.messageId);
+                    }, 10000);
+                });
+            }
             // Streaming response lifecycle: a bubble is created on start, grows
             // as chunks arrive, then is replaced with the formatted final render.
             if (window.electronAPI.onTranscriptionLlmResponseStart) {
                 window.electronAPI.onTranscriptionLlmResponseStart((event, data) => {
-                    if (data && data.messageId) {
+                    if (data && data.messageId && !this._canonicalStreamIds.has(data.messageId)) {
                         this.beginStreamingResponse(data.messageId);
                     }
                 });
             }
             if (window.electronAPI.onTranscriptionLlmResponseChunk) {
                 window.electronAPI.onTranscriptionLlmResponseChunk((event, data) => {
-                    if (data && data.messageId) {
+                    if (data && data.messageId && !this._canonicalStreamIds.has(data.messageId)) {
                         this.appendStreamingChunk(data.messageId, data.delta || '');
                     }
                 });
@@ -419,11 +461,9 @@ class ChatWindowUI {
     // Create a live, growing assistant bubble for a streaming response.
     beginStreamingResponse(messageId) {
         this.hideThinkingIndicator();
-        if (!this.elements.chatMessages) return;
-        // Guard against a duplicate start for the same id.
-        if (this.elements.chatMessages.querySelector(`[data-stream-id="${messageId}"]`)) {
-            return;
-        }
+        if (!this.elements.chatMessages || !messageId) return;
+        if (this._streamStates.has(messageId)) return;
+
         const messageDiv = document.createElement('div');
         messageDiv.className = 'message assistant streaming';
         messageDiv.setAttribute('data-stream-id', messageId);
@@ -439,48 +479,54 @@ class ChatWindowUI {
         messageDiv.appendChild(timeDiv);
         messageDiv.appendChild(textDiv);
         this.elements.chatMessages.appendChild(messageDiv);
-        this._streamBuffers = this._streamBuffers || {};
-        this._streamBuffers[messageId] = '';
+        this._streamStates.set(messageId, {
+            messageDiv,
+            textDiv,
+            buffer: '',
+            frame: null,
+            shouldAutoScroll: this.isChatAtBottom()
+        });
         this.elements.chatMessages.scrollTop = this.elements.chatMessages.scrollHeight;
     }
 
     appendStreamingChunk(messageId, delta) {
         if (!delta) return;
-        const messageDiv = this.elements.chatMessages &&
-            this.elements.chatMessages.querySelector(`[data-stream-id="${messageId}"]`);
-        if (!messageDiv) {
-            // No start seen (e.g. very fast final) — create the bubble lazily.
-            this.beginStreamingResponse(messageId);
-            return this.appendStreamingChunk(messageId, delta);
-        }
-        this._streamBuffers = this._streamBuffers || {};
-        this._streamBuffers[messageId] = (this._streamBuffers[messageId] || '') + delta;
-        const textDiv = messageDiv.querySelector('.message-text');
-        if (textDiv) {
-            // Plain text while streaming keeps it fast and avoids half-parsed
-            // markdown flicker; the final render formats it properly.
-            textDiv.textContent = this._streamBuffers[messageId];
-        }
-        const atBottom = true;
-        if (atBottom) {
-            this.elements.chatMessages.scrollTop = this.elements.chatMessages.scrollHeight;
-        }
+        if (!this._streamStates.has(messageId)) this.beginStreamingResponse(messageId);
+        const state = this._streamStates.get(messageId);
+        if (!state) return;
+        state.buffer += String(delta);
+        state.shouldAutoScroll = this.isChatAtBottom();
+        if (state.frame != null) return;
+
+        const render = () => {
+            state.frame = null;
+            if (!this._streamStates.has(messageId)) return;
+            state.textDiv.textContent = state.buffer;
+            if (state.shouldAutoScroll) {
+                this.elements.chatMessages.scrollTop = this.elements.chatMessages.scrollHeight;
+            }
+        };
+        state.frame = typeof requestAnimationFrame === 'function'
+            ? requestAnimationFrame(render)
+            : setTimeout(render, 16);
     }
 
-    // Replace the streaming bubble with the formatted final response (markdown
-    // text + extracted code snippets), matching non-streaming rendering.
+    isChatAtBottom() {
+        const element = this.elements.chatMessages;
+        if (!element) return true;
+        return element.scrollHeight - element.scrollTop - element.clientHeight < 32;
+    }
+
+    // Replace the streaming bubble with the formatted final response.
     finalizeStreamingResponse(messageId, response) {
-        const messageDiv = messageId && this.elements.chatMessages &&
-            this.elements.chatMessages.querySelector(`[data-stream-id="${messageId}"]`);
-        if (messageDiv) {
-            messageDiv.remove();
+        const state = messageId && this._streamStates.get(messageId);
+        if (state) {
+            if (state.frame != null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(state.frame);
+            state.messageDiv.remove();
+            this._streamStates.delete(messageId);
         }
-        if (this._streamBuffers && messageId) {
-            delete this._streamBuffers[messageId];
-        }
-        this.renderAssistantResponse(response);
+        if (response) this.renderAssistantResponse(response);
     }
-
     // Split AI response into plain text and code snippets and append to chat
     renderAssistantResponse(response) {
         if (!response || typeof response !== 'string') return;
@@ -563,18 +609,12 @@ class ChatWindowUI {
             if (markdownLib && markdownLib.toHTML) {
                 return markdownLib.toHTML(text);
             } else {
-                logger.warn('Markdown library not available, falling back to basic formatting');
-                // Fallback to basic formatting
-                return text
-                    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-                    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-                    .replace(/`(.+?)`/g, '<code>$1</code>')
-                    .replace(/\n/g, '<br>');
+                logger.warn('Markdown library not available, falling back to escaped text');
+                return this.escapeHtmlForSnippet(text).replace(/\n/g, '<br>');
             }
         } catch (error) {
             logger.warn('Failed to parse markdown, falling back to plain text', { error: error.message });
-            // Fallback to basic formatting
-            return text.replace(/\n/g, '<br>');
+            return this.escapeHtmlForSnippet(text).replace(/\n/g, '<br>');
         }
     }
 

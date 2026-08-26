@@ -10,6 +10,8 @@ class SessionManager {
     this.compressionThreshold = config.get('session.compressionThreshold');
     this.currentSkill = 'general'; // Default skill accepts any topic
     this.isInitialized = false;
+    this._contextVersion = 0;
+    this._contextSnapshotCache = null;
     
     this.initializeWithSkillPrompts();
   }
@@ -43,6 +45,7 @@ class SessionManager {
         }
       }
       
+      this._invalidateContextCache();
       this.isInitialized = true;
       logger.info('Session memory initialized with skill prompts', {
         skillCount: availableSkills.length,
@@ -92,6 +95,7 @@ class SessionManager {
     });
     
     this.sessionMemory.push(event);
+    this._invalidateContextCache();
     
     logger.debug('Conversation event added', {
       role,
@@ -262,6 +266,7 @@ class SessionManager {
   addEvent(action, details = {}) {
     const event = this.createEvent(action, details);
     this.sessionMemory.push(event);
+    this._invalidateContextCache();
     
     logger.debug('Session event added', {
       action,
@@ -488,16 +493,36 @@ class SessionManager {
   }
 
   getOptimizedHistory() {
-    const recent = this.getRecentEvents(10);
-    const important = this.getImportantEvents(5);
-    const summary = this.generateSessionSummary();
-    
+    const snapshot = this.getContextSnapshot(15);
     return {
-      recent,
-      important,
-      summary,
-      totalEvents: this.sessionMemory.length
+      recent: this.getRecentEvents(10),
+      important: snapshot.important,
+      summary: snapshot.summary,
+      conversation: snapshot.conversation,
+      totalEvents: snapshot.totalEvents
     };
+  }
+
+  getContextSnapshot(maxEntries = 15) {
+    const limit = Math.max(1, Number(maxEntries) || 15);
+    if (this._contextSnapshotCache && this._contextSnapshotCache.version === this._contextVersion && this._contextSnapshotCache.limit === limit) {
+      return this._contextSnapshotCache.value;
+    }
+
+    const value = {
+      conversation: this.getConversationHistory(limit),
+      important: this.getImportantEvents(5),
+      summary: this.generateSessionSummary(),
+      totalEvents: this.sessionMemory.length,
+      version: this._contextVersion
+    };
+    this._contextSnapshotCache = { version: this._contextVersion, limit, value };
+    return value;
+  }
+
+  _invalidateContextCache() {
+    this._contextVersion += 1;
+    this._contextSnapshotCache = null;
   }
 
   getRecentEvents(count = 10) {
@@ -579,6 +604,7 @@ class SessionManager {
   clear() {
     const eventCount = this.sessionMemory.length;
     this.sessionMemory = [];
+    this._invalidateContextCache();
     this.isInitialized = false;
     
     logger.info('Session memory cleared', { eventCount });
