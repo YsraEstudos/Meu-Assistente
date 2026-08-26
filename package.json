@@ -13,6 +13,7 @@
     "test:audio-runtime": "node scripts/test-audio-runtime.js",
     "test:transcription-context": "node scripts/test-transcription-context.js",
     "perf:smoke": "node scripts/perf-smoke.js",
+    "test:ui-config": "node scripts/test-ui-config.js",
     "test:audio-meter": "node scripts/test-audio-meter.js",
     "test:gpu": "node scripts/test-gpu-regression.js",
     "test:gpu:build": "node scripts/test-gpu-regression.js --target build",
