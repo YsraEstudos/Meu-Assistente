@@ -167,6 +167,38 @@ body {
     box-shadow: 0 0 15px rgba(255, 71, 87, 0.4);
 }
 
+/* Renderer-only microphone VU meter. It never carries audio data. */
+.mic-meter {
+    display: inline-flex;
+    width: 24px;
+    height: 6px;
+    margin-left: 5px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.24);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    vertical-align: middle;
+}
+
+.mic-meter-fill {
+    display: block;
+    width: 100%;
+    height: 100%;
+    transform: scaleX(0);
+    transform-origin: left center;
+    background: #34d399;
+    transition: background-color 120ms ease;
+}
+
+.mic-meter[data-state="degraded"] .mic-meter-fill {
+    background: #fbbf24;
+}
+
+.mic-meter[data-state="error"] .mic-meter-fill,
+.mic-meter-fill.clipping {
+    background: #fb7185;
+}
+
 /* Input styles */
 .input-field {
     background: rgba(255, 255, 255, 0.1);
