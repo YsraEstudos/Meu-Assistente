@@ -108,6 +108,24 @@ assert.strictEqual(
   'Authorization: Bearer [REDACTED]',
   'Bearer credentials with padding must be fully redacted'
 );
+const urlMetadata = { url: new URL('https://example.com/download?token=url-secret') };
+const redactedUrlMetadata = logger.redactMeta(urlMetadata);
+assert.strictEqual(
+  redactedUrlMetadata.url,
+  'https://example.com/download?token=[REDACTED]',
+  'native URL metadata must preserve its serialized value while redacting credentials'
+);
+const urlInfo = { level: 'info', message: 'URL metadata', ...urlMetadata };
+urlInfo[Symbol.for('level')] = 'info';
+let formattedUrlInfo;
+assert.doesNotThrow(() => {
+  formattedUrlInfo = logger.logger.format.transform(urlInfo);
+}, 'Winston formatting must tolerate native URL metadata');
+assert.match(
+  formattedUrlInfo[Symbol.for('message')],
+  /https:\/\/example\.com\/download\?token=\[REDACTED\]/,
+  'formatted logs must retain redacted native URL metadata'
+);
 const circularInfo = { level: 'info', message: 'circular metadata' };
 circularInfo.details = { secret: 'cycle-secret' };
 circularInfo.details.self = circularInfo.details;

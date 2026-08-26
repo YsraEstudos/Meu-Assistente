@@ -45,6 +45,7 @@ function createRedactedContainer(meta) {
 function redactMeta(meta, seen = new WeakMap()) {
   if (typeof meta === 'string') return redactString(meta);
   if (!meta || typeof meta !== 'object') return meta;
+  if (typeof URL !== 'undefined' && meta instanceof URL) return redactString(meta.toJSON());
   if (seen.has(meta)) return seen.get(meta);
 
   const redacted = createRedactedContainer(meta);
