@@ -1,5 +1,6 @@
 const assert = require('assert');
 const fs = require('fs');
+const path = require('path');
 const { spawnSync } = require('child_process');
 const speechService = require('../src/services/speech.service');
 
@@ -24,6 +25,7 @@ function resetService() {
   speechService.provider = 'whisper';
   speechService._whisperSegmentSequence = 0;
   speechService._transcriptionProgress = null;
+  speechService._latencySession = null;
   speechService._resetTranscriptionProgress();
 }
 
@@ -275,13 +277,14 @@ async function testWhisperCppLaunchConfiguration() {
   };
   const originalResolveBinary = speechService._resolveWhisperCppBinary;
   const originalResolvePython = speechService._resolveWhisperCppPython;
-  speechService._resolveWhisperCppBinary = () => 'configured-whisper-cli';
+   const trustedBinary = path.join(process.cwd(), 'scripts', 'whisper-cpp-worker.py');
+   speechService._resolveWhisperCppBinary = () => trustedBinary;
   speechService._resolveWhisperCppPython = () => ({ command: 'python', baseArgs: [] });
   try {
     const launch = speechService._resolveWhisperCppLaunch();
     assert(launch, 'whisper.cpp launch should be constructed');
     assert.equal(launch.source, 'whisper-cpp');
-    assert(launch.args.includes('--binary') && launch.args.includes('configured-whisper-cli'));
+     assert(launch.args.includes('--binary') && launch.args.includes(trustedBinary));
     assert(launch.args.includes('--threads') && launch.args.includes('6'));
     assert(!launch.args.includes('--blas'), 'disabled BLAS must not be passed to the worker');
     assert(speechService._getWhisperWorkerPath('whisper-cpp').endsWith('whisper-cpp-worker.py'));

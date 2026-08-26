@@ -1,6 +1,13 @@
 const path = require('path');
 const os = require('os');
 
+const DUAL_AUDIO_MODES = new Set(['legacy', 'shadow', 'active']);
+
+function resolveDualAudioMode(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return DUAL_AUDIO_MODES.has(normalized) ? normalized : 'legacy';
+}
+
 class ConfigManager {
   constructor() {
     this.env = process.env.NODE_ENV || 'development';
@@ -9,7 +16,23 @@ class ConfigManager {
   }
 
   loadConfiguration() {
+    const supportedGeminiModels = ['gemini-3.6-flash', 'gemini-3.5-flash-lite'];
+    const supportedThinkingLevels = ['minimal', 'low', 'medium', 'high'];
+    const configuredGeminiModel = supportedGeminiModels.includes(process.env.GEMINI_MODEL)
+      ? process.env.GEMINI_MODEL
+      : 'gemini-3.6-flash';
+    const defaultThinkingLevel = configuredGeminiModel === 'gemini-3.5-flash-lite'
+      ? 'minimal'
+      : 'medium';
+    const configuredThinkingLevel = supportedThinkingLevels.includes(process.env.GEMINI_THINKING_LEVEL)
+      ? process.env.GEMINI_THINKING_LEVEL
+      : defaultThinkingLevel;
+
     this.config = {
+      features: {
+        dualAudioMode: resolveDualAudioMode(process.env.OPENCLUEY_DUAL_AUDIO_MODE)
+      },
+
       app: {
         name: 'OpenCluely',
         version: '1.0.0',
@@ -40,8 +63,8 @@ class ConfigManager {
 
       llm: {
         gemini: {
-          model: 'gemini-3.1-flash-lite',
-          fallbackModels: ['gemini-2.5-flash-lite', 'gemini-3.5-flash'],
+          model: configuredGeminiModel,
+          fallbackModels: supportedGeminiModels.filter((model) => model !== configuredGeminiModel),
           maxRetries: 3,
           timeout: 30000,
           fallbackEnabled: true,
@@ -51,7 +74,7 @@ class ConfigManager {
             topK: 32,
             topP: 0.9,
             maxOutputTokens: 4096,
-            thinkingConfig: { thinkingBudget: 0 }
+            thinkingConfig: { thinkingLevel: configuredThinkingLevel }
           }
         }
       },
@@ -66,19 +89,19 @@ class ConfigManager {
         },
         whisper: {
           model: 'turbo',
-          language: 'en',
+          language: 'pt',
           // segmentMs is the legacy fixed-window size used when VAD is disabled.
           segmentMs: 4000,
           // Backstop for long uninterrupted speech when VAD is enabled. The
           // audio capture continues while each completed block is transcribed.
-          periodicFlushMs: 5000,
+          periodicFlushMs: 3000,
           // Voice-activity-detection driven segmentation. Instead of cutting
           // audio on a blind timer (which splits sentences mid-word), we flush
           // a segment when the speaker pauses. This makes transcription align
           // with natural utterance boundaries.
           vadEnabled: true,
           // Trailing silence (ms) that ends an utterance and triggers a flush.
-          silenceHangoverMs: 1200,
+          silenceHangoverMs: 600,
           // Minimum accumulated speech (ms) before a pause counts as an
           // utterance — guards against coughs/clicks producing empty flushes.
           minUtteranceMs: 350,
@@ -87,6 +110,7 @@ class ConfigManager {
           // Pre-roll (ms) of audio kept before speech onset so the first
           // syllable isn't clipped when we start capturing.
           preRollMs: 300,
+          captureChunkSamples: 2048,
           // Absolute RMS energy floor (normalized 0..1). Energy below this is
           // always treated as silence regardless of the adaptive noise floor.
           vadEnergyFloor: 0.008,
@@ -94,6 +118,10 @@ class ConfigManager {
           batchTimeoutMs: 2000,
           maxConcurrent: 4,
           beamSize: 5,
+          cppBeamSize: 1,
+          cppBestOf: 1,
+          cppNoFallback: true,
+          cppFlashAttention: true,
           cppThreads: os.cpus().length || 4,
           cppBlas: true,
           cppBackend: 'vulkan'
@@ -104,6 +132,16 @@ class ConfigManager {
         maxMemorySize: 1000,
         compressionThreshold: 500,
         clearOnRestart: false
+      },
+
+      performance: {
+        enabled: process.env.OPENCLUEY_PERF === '1',
+        streamBatchMs: 40,
+        contextMaxTokens: 8192,
+        audioTransport: 'message-port',
+        audioBatchMs: 256,
+        stealthWatchdogMs: 15000,
+        screenshotMaxDimension: 2560
       },
 
       stealth: {

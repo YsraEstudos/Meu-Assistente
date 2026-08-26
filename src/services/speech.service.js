@@ -380,14 +380,16 @@ if (typeof window === 'undefined') {
 }
 
 const fs = require('fs');
+const fsPromises = fs.promises;
 const os = require('os');
 const path = require('path');
-const { spawn, spawnSync } = require('child_process');
+const { spawn, spawnSync, execFile } = require('child_process');
 const { EventEmitter } = require('events');
 const logger = require('../core/logger').createServiceLogger('SPEECH');
 const config = require('../core/config');
 const { normalizeWhisperEngine } = require('../core/whisper-engine');
 const WHISPER_WORKER_REQUEST_TIMEOUT_MS = 210000;
+const performanceTracker = require('../core/performance');
 
 let sdk = null;
 try {
@@ -459,6 +461,7 @@ class SpeechService extends EventEmitter {
     this.fasterWhisperLaunch = null;
     this.whisperCppLaunch = null;
     this._lastWhisperRuntime = null;
+    this._latencySession = null;
     this._resetVadState();
 
     // Client probing can spawn Python/Whisper synchronously. The main process
@@ -607,6 +610,7 @@ class SpeechService extends EventEmitter {
 
       this.sessionStartTime = Date.now();
       this.retryCount = 0;
+      performanceTracker.mark('speech-start', { provider: this.provider });
 
       if (this.provider === 'azure') {
         this._startAzureRecording();
@@ -729,6 +733,7 @@ class SpeechService extends EventEmitter {
     this._cleanup();
     this.isRecording = true;
     this.isFinalizing = false;
+    this._startLatencySession(this.recordingSessionId, Date.now());
     this.segmentBuffers = [];
     this.segmentBytes = 0;
     this._whisperFlushQueue = Promise.resolve();
@@ -880,6 +885,7 @@ class SpeechService extends EventEmitter {
       return;
     }
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    this.recordAudioChunk(buffer.length);
     this._recordRendererAudioChunk(buffer);
     this._ingestWhisperAudio(buffer);
   }
@@ -890,10 +896,15 @@ class SpeechService extends EventEmitter {
       return;
     }
     const now = Date.now();
+    this._markLatencyEvent('firstAudioAt', now);
     const gapMs = stats.lastChunkAt ? now - stats.lastChunkAt : null;
+    const isFirstChunk = stats.totalChunks === 0;
     stats.lastChunkAt = now;
     stats.totalChunks += 1;
     stats.totalBytes += buffer.length;
+    if (isFirstChunk) {
+      performanceTracker.mark('speech-first-audio', { bytes: buffer.length, sessionId: stats.sessionId });
+    }
     if (now - stats.lastLogAt < 1000) {
       return;
     }
@@ -1100,6 +1111,7 @@ class SpeechService extends EventEmitter {
     }
 
     this.isRecording = false;
+    this._markLatencyEvent('captureStoppedAt');
     const sessionDuration = this.sessionStartTime ? Date.now() - this.sessionStartTime : 0;
     logger.info('Stopping speech recognition session', {
       provider: this.provider,
@@ -1244,6 +1256,7 @@ class SpeechService extends EventEmitter {
     } finally {
       if (sessionId === this.recordingSessionId && !this.isRecording) {
         this.isFinalizing = false;
+        this._markLatencyEvent('finalTranscriptionAt');
         this._emitTranscriptionProgress({
           state: 'complete',
           phase: 'complete',
@@ -1419,6 +1432,56 @@ class SpeechService extends EventEmitter {
     return Number.isFinite(parsed) ? Math.max(1, Math.min(20, Math.floor(parsed))) : 5;
   }
 
+  _getWhisperCppBeamSize() {
+    const configured = this._getSetting('whisperCppBeamSize') ||
+      process.env.WHISPER_CPP_BEAM_SIZE ||
+      config.get('speech.whisper.cppBeamSize') || 1;
+    const parsed = Number(configured);
+    return Number.isFinite(parsed) ? Math.max(1, Math.min(20, Math.floor(parsed))) : 1;
+  }
+
+  _getWhisperCppBestOf() {
+    const configured = this._getSetting('whisperCppBestOf') ||
+      process.env.WHISPER_CPP_BEST_OF ||
+      config.get('speech.whisper.cppBestOf') || 1;
+    const parsed = Number(configured);
+    return Number.isFinite(parsed) ? Math.max(1, Math.min(20, Math.floor(parsed))) : 1;
+  }
+
+  _getWhisperCppNoFallback() {
+    const configured = this._getSetting('whisperCppNoFallback');
+    if (configured !== null && configured !== undefined) {
+      return !['false', 'off', '0', 'no'].includes(String(configured).trim().toLowerCase());
+    }
+    const envValue = process.env.WHISPER_CPP_NO_FALLBACK;
+    if (envValue !== undefined) {
+      return !['false', 'off', '0', 'no'].includes(String(envValue).trim().toLowerCase());
+    }
+    const configuredDefault = config.get('speech.whisper.cppNoFallback');
+    return configuredDefault === undefined ? true : configuredDefault === true;
+  }
+
+  _getWhisperCppFlashAttention() {
+    const configured = this._getSetting('whisperCppFlashAttention');
+    if (configured !== null && configured !== undefined) {
+      return !['false', 'off', '0', 'no'].includes(String(configured).trim().toLowerCase());
+    }
+    const envValue = process.env.WHISPER_CPP_FLASH_ATTENTION;
+    if (envValue !== undefined) {
+      return !['false', 'off', '0', 'no'].includes(String(envValue).trim().toLowerCase());
+    }
+    const configuredDefault = config.get('speech.whisper.cppFlashAttention');
+    return configuredDefault === undefined ? true : configuredDefault === true;
+  }
+
+  _getAudioChunkSamples() {
+    const configured = this._getSetting('whisperCaptureChunkSamples') ||
+      process.env.WHISPER_CAPTURE_CHUNK_SAMPLES ||
+      config.get('speech.whisper.captureChunkSamples') || 2048;
+    const parsed = Number(configured);
+    return Number.isFinite(parsed) ? Math.max(512, Math.min(8192, Math.floor(parsed))) : 2048;
+  }
+
   _createWhisperTailBatches(segments) {
     const maxBytes = this._getWhisperFinalBatchMs() * 32;
     const batches = [];
@@ -1489,8 +1552,9 @@ class SpeechService extends EventEmitter {
 
   _finalizeStop(statusMessage) {
     const sessionId = this.recordingSessionId;
+    const latency = this._getLatencyMetrics();
     this._cleanup();
-    this.emit('recording-stopped', { sessionId });
+    this.emit('recording-stopped', { sessionId, latency });
     this.emit('status', statusMessage);
     if (global.windowManager) {
       global.windowManager.handleRecordingStopped();
@@ -1583,6 +1647,76 @@ class SpeechService extends EventEmitter {
     this._emitTranscriptionProgress();
   }
 
+  _startLatencySession(sessionId, startedAt = Date.now()) {
+    this._latencySession = {
+      sessionId,
+      startedAt,
+      firstAudioAt: null,
+      firstPartialAt: null,
+      captureStoppedAt: null,
+      finalTranscriptionAt: null,
+      dispatchAt: null,
+      audioChunks: 0,
+      audioBytes: 0,
+      droppedChunks: 0
+    };
+  }
+
+  _markLatencyEvent(eventName, at = Date.now()) {
+    if (!this._latencySession || !Object.prototype.hasOwnProperty.call(this._latencySession, eventName)) {
+      return;
+    }
+    if (this._latencySession[eventName] === null) {
+      this._latencySession[eventName] = at;
+    }
+  }
+
+  markLatencyEvent(eventName, at = Date.now()) {
+    this._markLatencyEvent(eventName, at);
+    return this._getLatencyMetrics();
+  }
+
+  recordAudioChunk(bytes, dropped = false) {
+    if (!this._latencySession) return;
+    if (dropped) {
+      this._latencySession.droppedChunks += 1;
+      return;
+    }
+    this._latencySession.audioChunks += 1;
+    this._latencySession.audioBytes += Math.max(0, Number(bytes) || 0);
+  }
+
+  _latencyDelta(eventName, baseName = 'startedAt') {
+    const session = this._latencySession;
+    if (!session || session[eventName] === null || session[baseName] === null) {
+      return null;
+    }
+    return Math.max(0, session[eventName] - session[baseName]);
+  }
+
+  _getLatencyMetrics() {
+    const session = this._latencySession;
+    if (!session) {
+      return null;
+    }
+    return {
+      sessionId: session.sessionId,
+      startedAt: session.startedAt,
+      firstAudioMs: this._latencyDelta('firstAudioAt'),
+      firstPartialMs: this._latencyDelta('firstPartialAt'),
+      captureToFinalMs: this._latencyDelta('finalTranscriptionAt', 'captureStoppedAt'),
+      finalTranscriptionMs: this._latencyDelta('finalTranscriptionAt'),
+      dispatchMs: this._latencyDelta('dispatchAt'),
+      audioChunks: session.audioChunks,
+      audioBytes: session.audioBytes,
+      droppedChunks: session.droppedChunks
+    };
+  }
+
+  getLatencyMetrics() {
+    return this._getLatencyMetrics();
+  }
+
   _emitTranscriptionProgress(overrides = {}) {
     const progress = this._transcriptionProgress;
     if (!progress || progress.sessionId !== this.recordingSessionId) {
@@ -1603,7 +1737,8 @@ class SpeechService extends EventEmitter {
       tailBatchTotal: progress.tailBatchTotal || 0,
       currentLabel: progress.currentLabel || '',
       sessionId: progress.sessionId,
-      finalizing: !!progress.finalizing
+      finalizing: !!progress.finalizing,
+      latency: this._getLatencyMetrics()
     });
   }
 
@@ -1713,7 +1848,7 @@ class SpeechService extends EventEmitter {
       const probe = spawnSync(
         this.whisperCommand.command,
         [...this.whisperCommand.baseArgs, '--help'],
-        { encoding: 'utf8', timeout: 10000 }
+        { encoding: 'utf8', timeout: 10000, env: this._buildChildEnv() }
       );
       if (probe.error || probe.status !== 0) {
         const err = probe.error ? probe.error.message : `exit code ${probe.status}`;
@@ -1745,12 +1880,13 @@ class SpeechService extends EventEmitter {
         speechProvider: this.provider,
         whisperEngine: this._getWhisperEngine(),
         whisperEffectiveEngine: this._getEffectiveWhisperEngine(),
-        azureKey: this._getSetting('azureKey') || '',
+        azureKey: (this._getSetting('azureKey') ? '[REDACTED]' : ''),
         azureRegion: this._getSetting('azureRegion') || process.env.AZURE_SPEECH_REGION || '',
         whisperCommand: this._getSetting('whisperCommand') || process.env.WHISPER_COMMAND || '',
         whisperFasterDevice: this._getWhisperFasterDevice(),
         whisperFasterComputeType: this._getWhisperFasterComputeType(),
         whisperCppCommand: this._getWhisperCppCommand(),
+        whisperCppServerCommand: this.whisperCppLaunch?.serverBinary || this._getSetting('whisperCppServerCommand') || process.env.WHISPER_CPP_SERVER_COMMAND || '',
         whisperCppPython: this._getWhisperCppPython(),
         whisperCppThreads: this._getWhisperCppThreads(),
         whisperCppBlas: this._getWhisperCppBlas(),
@@ -1761,10 +1897,16 @@ class SpeechService extends EventEmitter {
         whisperLanguage: this._getWhisperLanguage(),
         whisperSegmentMs: String(this._getWhisperSegmentMs()),
         whisperPeriodicFlushMs: String(this._getPeriodicFlushMs()),
+        whisperSilenceHangoverMs: String(this._getSilenceHangoverMs()),
+        whisperCaptureChunkSamples: this._getAudioChunkSamples(),
         whisperBatchSize: this._getWhisperBatchSize(),
         whisperBatchTimeoutMs: this._getWhisperBatchTimeoutMs(),
         whisperMaxConcurrent: this._getWhisperMaxConcurrent(),
-        whisperBeamSize: this._getWhisperBeamSize()
+        whisperBeamSize: this._getWhisperBeamSize(),
+        whisperCppBeamSize: this._getWhisperCppBeamSize(),
+        whisperCppBestOf: this._getWhisperCppBestOf(),
+        whisperCppNoFallback: this._getWhisperCppNoFallback(),
+        whisperCppFlashAttention: this._getWhisperCppFlashAttention()
       },
       config: {
         azure: config.get('speech.azure') || {},
@@ -1797,11 +1939,13 @@ class SpeechService extends EventEmitter {
     if (process.platform === 'win32') candidates.push({ command: 'py', args: ['-3'] });
 
     for (const candidate of candidates) {
+      if (!this._validateWhisperCommand(candidate.command)) continue;
       try {
         const result = spawnSync(candidate.command, [...candidate.args, scriptPath], {
           encoding: 'utf8',
           timeout: 10000,
-          windowsHide: true
+          windowsHide: true,
+          env: this._buildChildEnv()
         });
         if (!result.error && result.status === 0) {
           return JSON.parse(String(result.stdout || '').trim());
@@ -1813,6 +1957,59 @@ class SpeechService extends EventEmitter {
     return null;
   }
 
+  _runHardwareScriptJsonAsync(filename) {
+    const scriptPath = this._getHardwareScriptPath(filename);
+    if (!scriptPath) return Promise.resolve(null);
+
+    const candidates = [];
+    const configured = filename === 'detect-cpu.py'
+      ? (this._getWhisperCppPython() || this._getSetting('whisperPython') || process.env.WHISPER_PYTHON || '')
+      : (this._getWhisperCppPython() || process.env.PYTHON || '');
+    if (configured) candidates.push({ command: configured, args: [] });
+    candidates.push({ command: process.platform === 'win32' ? 'python' : 'python3', args: [] });
+    candidates.push({ command: 'python', args: [] });
+    if (process.platform === 'win32') candidates.push({ command: 'py', args: ['-3'] });
+
+    return new Promise((resolve) => {
+      let index = 0;
+      const tried = new Set();
+      const tryNext = () => {
+        if (index >= candidates.length) {
+          resolve(null);
+          return;
+        }
+        const candidate = candidates[index++];
+        const key = `${candidate.command}\u0000${candidate.args.join('\u0000')}`;
+        if (tried.has(key)) {
+          tryNext();
+          return;
+        }
+        tried.add(key);
+        if (!this._validateWhisperCommand(candidate.command)) {
+          tryNext();
+          return;
+        }
+        execFile(candidate.command, [...candidate.args, scriptPath], {
+          encoding: 'utf8',
+          timeout: 10000,
+          windowsHide: true,
+          maxBuffer: 1024 * 1024,
+          env: this._buildChildEnv()
+        }, (error, stdout) => {
+          if (!error) {
+            try {
+              resolve(JSON.parse(String(stdout || '').trim()));
+              return;
+            } catch (_) {
+              // Try the next interpreter when the output is not valid JSON.
+            }
+          }
+          tryNext();
+        });
+      };
+      tryNext();
+    });
+  }
   _writeSilentProbeWav(filePath) {
     const sampleRate = 16000;
     const sampleCount = Math.floor(sampleRate * 0.35);
@@ -1838,7 +2035,8 @@ class SpeechService extends EventEmitter {
     const result = spawnSync('vulkaninfo', ['--summary'], {
       encoding: 'utf8',
       timeout: 10000,
-      windowsHide: true
+      windowsHide: true,
+      env: this._buildChildEnv()
     });
     if (result.error || result.status !== 0) return null;
 
@@ -1863,6 +2061,64 @@ class SpeechService extends EventEmitter {
     return selected ? selected.index : null;
   }
 
+  _probeWhisperCppRuntimeAsync(launch) {
+    if (!launch || !launch.binary || !launch.model || !fs.existsSync(launch.binary) || !this._isTrustedWhisperPath(launch.binary)) {
+      return Promise.resolve({ success: false, usedGpu: false, backend: 'unavailable', gpuName: '', message: 'whisper-cli ou modelo não encontrado' });
+    }
+    if (!fs.existsSync(launch.model)) {
+      return Promise.resolve({ success: false, usedGpu: false, backend: 'unavailable', gpuName: '', message: 'modelo whisper.cpp não encontrado' });
+    }
+
+    let tempDir;
+    try {
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-gpu-probe-'));
+      const audioPath = path.join(tempDir, 'probe.wav');
+      const outputPrefix = path.join(tempDir, 'result');
+      this._writeSilentProbeWav(audioPath);
+      const args = [
+        '-m', launch.model,
+        '-f', audioPath,
+        '-l', this._getWhisperLanguage(),
+        '-t', '1',
+        '-nt',
+        '-np',
+        '-otxt',
+        '-of', outputPrefix
+      ];
+      if (launch.backend === 'cpu') args.push('-ng');
+
+      return new Promise((resolve) => {
+        execFile(launch.binary, args, {
+          encoding: 'utf8',
+          timeout: 90000,
+          windowsHide: true,
+          maxBuffer: 1024 * 1024,
+          env: this._buildChildEnv()
+        }, (error, stdout, stderr) => {
+          const diagnostics = `${stdout || ''}\n${stderr || ''}`.trim();
+          const usedGpu = /ggml_vulkan|vulkan device/i.test(diagnostics);
+          const backend = usedGpu ? 'vulkan' : 'cpu';
+          resolve({
+            success: !error,
+            usedGpu,
+            backend,
+            device: null,
+            gpuName: '',
+            message: error
+              ? (error.killed ? 'Teste do whisper.cpp excedeu o tempo limite' : (error.message || 'whisper.cpp encerrou com erro'))
+              : (usedGpu ? 'whisper.cpp inicializou o backend Vulkan' : 'whisper.cpp respondeu sem inicializar Vulkan'),
+            output: diagnostics.slice(-3000)
+          });
+          try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+        });
+      });
+    } catch (error) {
+      if (tempDir) {
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+      }
+      return Promise.resolve({ success: false, usedGpu: false, backend: 'error', gpuName: '', message: error.message });
+    }
+  }
   _probeWhisperCppRuntime(launch) {
     if (!launch || !launch.binary || !launch.model || !fs.existsSync(launch.binary)) {
       return { success: false, usedGpu: false, backend: 'unavailable', gpuName: '', message: 'whisper-cli ou modelo não encontrado' };
@@ -1892,7 +2148,8 @@ class SpeechService extends EventEmitter {
       const result = spawnSync(launch.binary, args, {
         encoding: 'utf8',
         timeout: 90000,
-        windowsHide: true
+        windowsHide: true,
+        env: this._buildChildEnv()
       });
       const diagnostics = ((result.stdout || '') + '\n' + (result.stderr || '')).trim();
       const selectedVulkanMatch = selectedDevice !== null
@@ -1921,9 +2178,6 @@ class SpeechService extends EventEmitter {
   }
 
   getHardwareStatus({ probe = false } = {}) {
-    const status = this.getStatus();
-    const configuredEngine = this._getConfiguredWhisperEngine();
-    const effectiveEngine = this._getEffectiveWhisperEngine();
     const gpu = this._runHardwareScriptJson('detect-gpu.py') || {
       device: 'cpu',
       cuda: false,
@@ -1933,6 +2187,78 @@ class SpeechService extends EventEmitter {
       vulkanGpuName: ''
     };
     const cpu = this._runHardwareScriptJson('detect-cpu.py') || {
+      vendor: 'unknown',
+      cpuName: '',
+      has_avx2: false,
+      has_avx512: false,
+      blas_available: false,
+      logical_cpus: os.cpus().length || 1
+    };
+    return this._buildHardwareStatus({ probe, gpu, cpu, allowResolve: true });
+  }
+
+  /**
+   * Read hardware status without blocking Electron's main event loop.
+   * The old path used spawnSync for Python/GPU probes, so opening the chip
+   * popover could freeze every window while a probe waited or timed out.
+   */
+  getHardwareStatusAsync({ probe = false } = {}) {
+    if (this._hardwareStatusPromise && !probe) {
+      return this._hardwareStatusPromise;
+    }
+
+    const shouldProbe = this.provider === 'whisper';
+    const request = Promise.all([
+      shouldProbe ? this._runHardwareScriptJsonAsync('detect-gpu.py') : Promise.resolve(null),
+      shouldProbe ? this._runHardwareScriptJsonAsync('detect-cpu.py') : Promise.resolve(null)
+    ]).then(([gpu, cpu]) => {
+      const result = this._buildHardwareStatus({ probe: false, gpu, cpu, allowResolve: false });
+      if (!probe || this._getEffectiveWhisperEngine() !== 'whisper-cpp' ||
+          !result.engine.binary || !result.engine.modelExists) {
+        return result;
+      }
+
+      return this._probeWhisperCppRuntimeAsync(this.whisperCppLaunch).then((probeResult) => {
+        result.probe = probeResult;
+        result.execution = {
+          kind: probeResult.usedGpu ? 'gpu' : 'cpu',
+          backend: probeResult.backend,
+          label: probeResult.usedGpu ? 'GPU (Vulkan)' : 'CPU',
+          gpuName: probeResult.gpuName || result.gpu.name
+        };
+        result.checks.push({ ok: probeResult.success, label: probeResult.message });
+        result.ok = !!result.engine.binary && result.engine.modelExists && probeResult.success === true;
+        return result;
+      });
+    }).catch((error) => {
+      const result = this._buildHardwareStatus({ probe: false, gpu: null, cpu: null, allowResolve: false });
+      result.error = error.message || String(error);
+      result.checks.push({ ok: false, label: 'Falha ao consultar o hardware' });
+      return result;
+    }).finally(() => {
+      if (!probe && this._hardwareStatusPromise === request) {
+        this._hardwareStatusPromise = null;
+      }
+    });
+
+    if (!probe) {
+      this._hardwareStatusPromise = request;
+    }
+    return request;
+  }
+
+  _buildHardwareStatus({ probe = false, gpu, cpu, allowResolve = true } = {}) {
+    const configuredEngine = this._getConfiguredWhisperEngine();
+    const effectiveEngine = this._getEffectiveWhisperEngine();
+    gpu = gpu || {
+      device: 'cpu',
+      cuda: false,
+      rocm: false,
+      gpuName: '',
+      vulkan: false,
+      vulkanGpuName: ''
+    };
+    cpu = cpu || {
       vendor: 'unknown',
       cpuName: '',
       has_avx2: false,
@@ -1991,7 +2317,9 @@ class SpeechService extends EventEmitter {
     }
 
     if (effectiveEngine === 'whisper-cpp') {
-      const launch = this.whisperCppLaunch || this._resolveWhisperCppLaunch();
+      const launch = allowResolve
+        ? (this.whisperCppLaunch || this._resolveWhisperCppLaunch())
+        : this.whisperCppLaunch;
       result.engine.binary = launch ? launch.binary || '' : '';
       result.engine.model = launch ? launch.model || '' : '';
       result.engine.modelExists = !!result.engine.model && fs.existsSync(result.engine.model);
@@ -2066,7 +2394,7 @@ class SpeechService extends EventEmitter {
   }
 
   updateSettings(settings = {}) {
-    const speechKeys = ['speechProvider', 'whisperEngine', 'azureKey', 'azureRegion', 'whisperCommand', 'whisperPython', 'whisperModelDir', 'whisperModel', 'whisperLanguage', 'whisperSegmentMs', 'whisperPeriodicFlushMs', 'whisperFasterDevice', 'whisperFasterComputeType', 'whisperCppCommand', 'whisperCppPython', 'whisperCppThreads', 'whisperCppBlas', 'whisperCppBackend', 'whisperCppDevice', 'whisperCppModel', 'whisperCppModelDir', 'whisperBatchSize', 'whisperBatchTimeoutMs', 'whisperMaxConcurrent', 'whisperBeamSize'];
+    const speechKeys = ['speechProvider', 'whisperEngine', 'azureKey', 'azureRegion', 'whisperCommand', 'whisperPython', 'whisperModelDir', 'whisperModel', 'whisperLanguage', 'whisperSegmentMs', 'whisperPeriodicFlushMs', 'whisperSilenceHangoverMs', 'whisperCaptureChunkSamples', 'whisperCppBeamSize', 'whisperCppBestOf', 'whisperCppNoFallback', 'whisperCppFlashAttention', 'whisperFasterDevice', 'whisperFasterComputeType', 'whisperCppCommand', 'whisperCppServerCommand', 'whisperCppPython', 'whisperCppThreads', 'whisperCppBlas', 'whisperCppBackend', 'whisperCppDevice', 'whisperCppModel', 'whisperCppModelDir', 'whisperBatchSize', 'whisperBatchTimeoutMs', 'whisperMaxConcurrent', 'whisperBeamSize'];
     let changed = false;
 
     for (const key of speechKeys) {
@@ -2166,18 +2494,35 @@ class SpeechService extends EventEmitter {
     return Number.isInteger(parsed) && parsed >= 0 && parsed <= 32 ? String(parsed) : 'auto';
   }
   _normaliseWhisperCppModelName(modelName) {
-    const raw = String(modelName || 'turbo').trim().toLowerCase().replace(/^ggml-/, '').replace(/\.bin$/, '');
+    const raw = this._sanitizeWhisperModelName(modelName) || 'turbo';
     return { turbo: 'large-v3-turbo', large: 'large-v3' }[raw] || raw;
+  }
+
+  _sanitizeWhisperModelName(modelName) {
+    const value = String(modelName || '').trim().toLowerCase().replace(/^ggml-/, '').replace(/\.bin$/, '');
+    if (!value || value.length > 64 || value.includes('..') || !/^[a-z0-9._-]+$/.test(value)) return null;
+    return value;
   }
 
   _getWhisperCppModelPath() {
     const configured = this._getSetting('whisperCppModel') || process.env.WHISPER_CPP_MODEL || '';
     if (configured && path.isAbsolute(configured)) {
-      return configured;
+      const resolved = path.resolve(configured);
+      const modelDir = path.resolve(this._getWhisperModelDir('whisper-cpp'));
+      const rel = path.relative(modelDir, resolved);
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+        logger.warn('Ignoring whisper.cpp model outside the managed model directory', { modelPath: configured });
+      } else {
+        return resolved;
+      }
     }
     if (configured && fs.existsSync(configured)) {
-      return path.resolve(configured);
-    }    const modelName = configured || this._getWhisperModel();
+      const resolved = path.resolve(configured);
+      const modelDir = path.resolve(this._getWhisperModelDir('whisper-cpp'));
+      const rel = path.relative(modelDir, resolved);
+      if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return resolved;
+    }
+    const modelName = this._sanitizeWhisperModelName(configured) || this._sanitizeWhisperModelName(this._getWhisperModel()) || 'turbo';
     return path.join(this._getWhisperModelDir('whisper-cpp'), `ggml-${this._normaliseWhisperCppModelName(modelName)}.bin`);
   }
 
@@ -2198,9 +2543,10 @@ class SpeechService extends EventEmitter {
     }
     if (process.platform === 'win32') candidates.push({ command: 'py', baseArgs: ['-3'] });
     for (const candidate of candidates) {
+      if (!this._validateWhisperCommand(candidate.command)) continue;
       try {
         const probe = spawnSync(candidate.command, [...candidate.baseArgs, '-c', 'import sys; print(sys.version_info[0])'], {
-          encoding: 'utf8', timeout: 10000, windowsHide: true,
+          encoding: 'utf8', timeout: 10000, windowsHide: true, env: this._buildChildEnv(),
         });
         if (!probe.error && probe.status === 0) return candidate;
       } catch (_) { /* try the next candidate */ }
@@ -2228,7 +2574,7 @@ class SpeechService extends EventEmitter {
       if (!path.isAbsolute(candidate)) {
         try {
           const locator = process.platform === 'win32' ? 'where' : 'which';
-          const result = spawnSync(locator, [candidate], { encoding: 'utf8', windowsHide: true });
+           const result = spawnSync(locator, [candidate], { encoding: 'utf8', windowsHide: true, env: this._buildChildEnv() });
           if (!result.error && result.status === 0) {
             const resolved = String(result.stdout || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean);
             if (resolved) return resolved;
@@ -2239,12 +2585,52 @@ class SpeechService extends EventEmitter {
     return null;
   }
 
+  _resolveWhisperCppServerBinary(binary) {
+    const configured = this._getSetting('whisperCppServerCommand') || process.env.WHISPER_CPP_SERVER_COMMAND || '';
+    const extension = process.platform === 'win32' ? '.exe' : '';
+    const candidates = [];
+    if (configured) candidates.push(configured);
+    if (binary && path.isAbsolute(binary)) {
+      candidates.push(path.join(path.dirname(binary), `whisper-server${extension}`));
+    }
+    try {
+      const { app } = require('electron');
+      candidates.push(path.join(app.getPath('userData'), '.whisper.cpp', 'build', 'bin', `whisper-server${extension}`));
+      candidates.push(path.join(app.getPath('userData'), '.whisper.cpp', 'build', 'bin', 'Release', `whisper-server${extension}`));
+    } catch (_) { /* electron is unavailable in isolated tests */ }
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate) && this._isTrustedWhisperPath(candidate)) {
+        return candidate;
+      }
+      if (!path.isAbsolute(candidate) && ['whisper-server', 'whisper-server.exe'].includes(path.basename(candidate).toLowerCase())) {
+        const locator = process.platform === 'win32' ? 'where' : 'which';
+        const probe = spawnSync(locator, [candidate], { encoding: 'utf8', windowsHide: true, env: this._buildChildEnv() });
+        const located = !probe.error && probe.status === 0
+          ? String(probe.stdout || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean)
+          : null;
+        if (located && this._isTrustedWhisperPath(located)) return located;
+      }
+    }
+    return null;
+  }
+
   _resolveWhisperCppLaunch() {
     const workerPath = this._getWhisperWorkerPath('whisper-cpp');
     const python = this._resolveWhisperCppPython();
     const binary = this._resolveWhisperCppBinary();
     if (!workerPath || !python || !binary) return null;
+    const configuredBinary = this._getWhisperCppCommand();
+    const allowedNames = new Set(['whisper-cli', 'whisper-cli.exe', 'main', 'main.exe']);
+    const binaryIsPath = path.isAbsolute(configuredBinary) || configuredBinary.includes(path.sep) || configuredBinary.includes('/');
+    if (
+      (binaryIsPath && !this._isTrustedWhisperPath(binary)) ||
+      (!this._isTrustedWhisperPath(binary) && !allowedNames.has(path.basename(binary).toLowerCase()))
+    ) {
+      logger.warn('Ignoring untrusted whisper.cpp binary', { binary });
+      return null;
+    }
     const model = this._getWhisperCppModelPath();
+    const serverBinary = this._resolveWhisperCppServerBinary(binary);
     const args = [
       ...python.baseArgs,
       workerPath,
@@ -2252,11 +2638,16 @@ class SpeechService extends EventEmitter {
       '--model', model,
       '--language', this._getWhisperLanguage(),
       '--threads', String(this._getWhisperCppThreads()),
+      '--beam-size', String(this._getWhisperCppBeamSize()),
+      '--best-of', String(this._getWhisperCppBestOf()),
     ];
+    if (this._getWhisperCppNoFallback()) args.push('--no-fallback');
+    args.push(this._getWhisperCppFlashAttention() ? '--flash-attn' : '--no-flash-attn');
     if (this._getWhisperCppBlas()) args.push('--blas');
     args.push('--backend', this._getWhisperCppBackend());
     args.push('--device', this._getWhisperCppDevice());
-    return { command: python.command, args, binary, model, backend: this._getWhisperCppBackend(), device: this._getWhisperCppDevice(), source: 'whisper-cpp' };
+    if (serverBinary) args.push('--server-binary', serverBinary);
+    return { command: python.command, args, binary, serverBinary, model, backend: this._getWhisperCppBackend(), device: this._getWhisperCppDevice(), source: 'whisper-cpp' };
   }
 
   _resolveFasterWhisperLaunch() {
@@ -2289,9 +2680,10 @@ class SpeechService extends EventEmitter {
     if (process.platform === 'win32') candidates.push({ command: 'py', baseArgs: ['-3'] });
     const probeScript = 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("faster_whisper") else 1)';
     for (const candidate of candidates) {
+      if (!this._validateWhisperCommand(candidate.command)) continue;
       try {
         const probe = spawnSync(candidate.command, [...candidate.baseArgs, '-c', probeScript], {
-          encoding: 'utf8', timeout: 10000, windowsHide: true,
+          encoding: 'utf8', timeout: 10000, windowsHide: true, env: this._buildChildEnv(),
         });
         if (!probe.error && probe.status === 0) return candidate;
       } catch (_) {
@@ -2333,6 +2725,99 @@ class SpeechService extends EventEmitter {
     return { command: this.whisperCommand.command, args };
   }
 
+  _validateWhisperCommand(command) {
+    if (!command || typeof command !== 'string') {
+      return false;
+    }
+    if (/[;&|`]/.test(command) || /\$\([^)]*\)/.test(command)) {
+      return false;
+    }
+
+    const normalizedCommand = command.trim();
+    const trustedRoots = this._getTrustedWhisperRoots();
+    const allowedPathNames = new Set([
+      'python', 'python3', 'python.exe', 'python3.exe', 'py',
+      'whisper', 'whisper.exe', 'whisper-cli', 'whisper-cli.exe', 'main', 'main.exe'
+    ]);
+
+    const isInsideTrustedRoot = (candidate) => trustedRoots.some((root) => {
+      const rel = path.relative(root, candidate);
+      return rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+    });
+
+    const candidates = [];
+    const commandIsPath = path.isAbsolute(normalizedCommand) || normalizedCommand.includes(path.sep) || normalizedCommand.includes('/');
+    if (path.isAbsolute(normalizedCommand)) {
+      candidates.push(path.normalize(normalizedCommand));
+    } else {
+      candidates.push(path.resolve(normalizedCommand));
+    }
+
+    const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+    try {
+      const probe = spawnSync(whichCmd, [normalizedCommand], { encoding: 'utf8', windowsHide: true, timeout: 5000, env: this._buildChildEnv() });
+      if (!probe.error && probe.status === 0 && probe.stdout) {
+        probe.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).forEach((line) => candidates.push({
+          path: path.resolve(line),
+          fromPath: true
+        }));
+      }
+    } catch (_) {}
+
+    return candidates.some((entry) => {
+      const candidate = typeof entry === 'string' ? entry : entry.path;
+      const fromPath = typeof entry === 'object' && entry.fromPath === true;
+      if (!fs.existsSync(candidate)) return false;
+      let real;
+      try { real = fs.realpathSync(candidate); } catch (_) { return false; }
+      if (isInsideTrustedRoot(real)) return true;
+      // A bare system command is accepted only after PATH resolution and only
+      // for the fixed interpreter/Whisper executable names above. Arbitrary
+      // absolute paths supplied by a renderer are never trusted.
+      return !commandIsPath && fromPath && allowedPathNames.has(path.basename(real).toLowerCase());
+    });
+  }
+
+  _getTrustedWhisperRoots() {
+    const roots = [];
+    if (this.dataDir) roots.push(path.resolve(this.dataDir));
+    if (process.resourcesPath) roots.push(path.resolve(process.resourcesPath));
+    roots.push(path.resolve(__dirname, '..', '..'));
+    try {
+      const { app } = require('electron');
+      roots.push(path.resolve(app.getPath('userData')));
+    } catch (_) { /* electron is unavailable in isolated tests */ }
+    return roots;
+  }
+
+  _isTrustedWhisperPath(filePath) {
+    if (!filePath || typeof filePath !== 'string' || !fs.existsSync(filePath)) return false;
+    let real;
+    try { real = fs.realpathSync(filePath); } catch (_) { return false; }
+    return this._getTrustedWhisperRoots().some((root) => {
+      const rel = path.relative(root, real);
+      return rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+    });
+  }
+
+  _validateWhisperWorkerLaunch(launch) {
+    if (!launch || !this._validateWhisperCommand(launch.command)) return false;
+    const args = Array.isArray(launch.args) ? launch.args : [];
+    if (args.some((arg) => ['-c', '--command', '-e', '--eval'].includes(String(arg)))) return false;
+    const workerPath = args.find((arg) => /(?:^|[\\/])(?:whisper|faster-whisper|whisper-cpp)-worker\.py$/i.test(String(arg)));
+    return Boolean(workerPath && this._isTrustedWhisperPath(String(workerPath)));
+  }
+
+  _buildChildEnv() {
+    const env = { ...process.env };
+    for (const key of Object.keys(env)) {
+      if (key === 'GEMINI_API_KEY' || key === 'AZURE_SPEECH_KEY' || key === 'AZURE_SPEECH_REGION' || key === 'AZURE_SPEECH_SUBSCRIPTION_KEY' || /TOKEN/i.test(key) || /SECRET/i.test(key)) {
+        delete env[key];
+      }
+    }
+    return env;
+  }
+
   _ensureWhisperWorker() {
     if (this._whisperWorkerReady && this._whisperWorker && !this._whisperWorker.killed) {
       return Promise.resolve(true);
@@ -2351,11 +2836,14 @@ class SpeechService extends EventEmitter {
 
     let worker;
     try {
+      if (!this._validateWhisperWorkerLaunch(launch)) {
+        return Promise.reject(new Error('Refusing to spawn untrusted Whisper command: ' + launch.command));
+      }
       worker = spawn(launch.command, launch.args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
         env: {
-          ...process.env,
+          ...this._buildChildEnv(),
           PYTHONIOENCODING: 'utf-8',
           PYTHONUTF8: '1'
         },
@@ -2451,6 +2939,13 @@ class SpeechService extends EventEmitter {
         computeType: message.computeType || this._getWhisperFasterComputeType(),
         model: message.model || this._getWhisperModel(),
         modelLoadMs: Number(message.modelLoadMs) || null,
+        backendRequested: message.backendRequested || message.backend || null,
+        backendUsed: message.backendUsed || message.backend || null,
+        executionMode: message.executionMode || 'cli',
+        gpuName: message.gpuName || '',
+        beamSize: Number(message.beamSize) || null,
+        bestOf: Number(message.bestOf) || null,
+        flashAttention: message.flashAttention === true,
       });
       return;
     }
@@ -2493,17 +2988,25 @@ class SpeechService extends EventEmitter {
     }
     this._settleWhisperWorkerRequest(message.id, (pending) => {
       if (message.ok) {
-        if (message.backend) {
+        const backendUsed = message.backendUsed || message.backend || null;
+        if (backendUsed) {
           this._lastWhisperRuntime = {
-            backend: String(message.backend),
+            backend: String(backendUsed),
+            backendRequested: String(message.backendRequested || this._getWhisperCppBackend()),
+            executionMode: String(message.executionMode || 'cli'),
             gpuName: String(message.gpuName || ''),
+            device: String(message.device || ''),
             at: Date.now()
           };
         }
         pending.resolve({
           text: typeof message.text === 'string' ? message.text : '',
           transcribeMs: Number(message.transcribeMs) || null,
-          backend: message.backend || null,
+          backend: backendUsed,
+          backendRequested: message.backendRequested || this._getWhisperCppBackend(),
+          backendUsed,
+          executionMode: message.executionMode || 'cli',
+          device: message.device || '',
           gpuName: message.gpuName || ''
         });
       } else {
@@ -2682,7 +3185,7 @@ class SpeechService extends EventEmitter {
   }
 
   _getWhisperLanguage() {
-    return this._getSetting('whisperLanguage') || process.env.WHISPER_LANGUAGE || config.get('speech.whisper.language') || 'en';
+    return this._getSetting('whisperLanguage') || process.env.WHISPER_LANGUAGE || config.get('speech.whisper.language') || 'pt';
   }
 
   _getWhisperSegmentMs() {
@@ -2692,9 +3195,9 @@ class SpeechService extends EventEmitter {
   }
 
   _getPeriodicFlushMs() {
-    const rawValue = this._getSetting('whisperPeriodicFlushMs') || process.env.WHISPER_PERIODIC_FLUSH_MS || config.get('speech.whisper.periodicFlushMs') || 5000;
+    const rawValue = this._getSetting('whisperPeriodicFlushMs') || process.env.WHISPER_PERIODIC_FLUSH_MS || config.get('speech.whisper.periodicFlushMs') || 3000;
     const parsed = Number(rawValue);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 3000;
   }
 
   _vadNumber(settingKey, envKey, configPath, fallback, min) {
@@ -2714,7 +3217,7 @@ class SpeechService extends EventEmitter {
   }
 
   _getSilenceHangoverMs() {
-    return this._vadNumber('whisperSilenceHangoverMs', 'WHISPER_SILENCE_HANGOVER_MS', 'speech.whisper.silenceHangoverMs', 700, 200);
+    return this._vadNumber('whisperSilenceHangoverMs', 'WHISPER_SILENCE_HANGOVER_MS', 'speech.whisper.silenceHangoverMs', 600, 200);
   }
 
   _getMinUtteranceMs() {
@@ -2786,6 +3289,10 @@ class SpeechService extends EventEmitter {
       if (!candidate || !candidate.command) {
         continue;
       }
+      if (!this._validateWhisperCandidate(candidate)) {
+        logger.warn('Skipping untrusted Whisper candidate', { command: candidate.command });
+        continue;
+      }
 
       const resolved = this._probeWhisperCandidate(candidate);
       if (resolved) {
@@ -2827,6 +3334,7 @@ class SpeechService extends EventEmitter {
         encoding: 'utf8',
         timeout: 8000,
         windowsHide: true,
+        env: this._buildChildEnv(),
       });
       if (!probe.error && probe.status === 0) {
         return candidate;
@@ -2876,6 +3384,7 @@ class SpeechService extends EventEmitter {
         // First `import whisper` (torch/numba) can be slow on a cold cache.
         timeout: 30000,
         windowsHide: true,
+        env: this._buildChildEnv(),
         // No shell — see _probeWhisperModuleFast: shell:true on Windows splits
         // spaced paths (e.g. "C:\Users\CANDAN SINGH\...") and breaks the probe.
       });
@@ -2992,6 +3501,14 @@ class SpeechService extends EventEmitter {
     };
   }
 
+  _validateWhisperCandidate(candidate) {
+    if (!candidate || !this._validateWhisperCommand(candidate.command)) return false;
+    const args = Array.isArray(candidate.baseArgs) ? candidate.baseArgs.map(String) : [];
+    if (args.some((arg) => ['-c', '--command', '-e', '--eval'].includes(arg))) return false;
+    const moduleIndex = args.indexOf('-m');
+    return moduleIndex < 0 || args[moduleIndex + 1] === 'whisper';
+  }
+
   _startMicrophoneCapture() {
     if (!recorder || typeof recorder.record !== 'function') {
       this.emit('error', 'Local microphone capture dependency is missing. Run npm install to restore speech recording support.');
@@ -3022,7 +3539,7 @@ class SpeechService extends EventEmitter {
       const r = spawnSync(
         process.platform === 'win32' ? 'where' : 'which',
         [bin],
-        { windowsHide: true, timeout: 4000 }
+        { windowsHide: true, timeout: 4000, env: this._buildChildEnv() }
       );
       return r.status === 0;
     } catch (_) {
@@ -3132,6 +3649,8 @@ class SpeechService extends EventEmitter {
     }
 
     if (this.provider === 'whisper') {
+      this.recordAudioChunk(chunk.length);
+      this._markLatencyEvent('firstAudioAt');
       this._ingestWhisperAudio(Buffer.from(chunk));
     }
   }
@@ -3348,13 +3867,23 @@ class SpeechService extends EventEmitter {
       const clean = transcript ? transcript.trim() : '';
       const isHallucination = clean && this._isHallucinatedTranscript(clean);
       if (clean && !isHallucination) {
+        const partial = !this.isFinalizing && tracked.reason !== 'final' && tracked.reason !== 'final-batch' && tracked.reason !== 'final-retry';
+        if (partial) {
+          this._markLatencyEvent('firstPartialAt');
+        } else {
+          this._markLatencyEvent('finalTranscriptionAt');
+        }
         this.emit('transcription', clean, {
-          partial: !this.isFinalizing && tracked.reason !== 'final' && tracked.reason !== 'final-batch' && tracked.reason !== 'final-retry',
+          partial,
           reason: tracked.reason,
           sessionId: tracked.sessionId,
           segmentSequence: tracked.sequence,
           consolidated: tracked.sourceSegmentCount > 1,
           sourceSegmentCount: tracked.sourceSegmentCount,
+          backendRequested: this._lastWhisperRuntime?.backendRequested || this._getWhisperCppBackend(),
+          backendUsed: this._lastWhisperRuntime?.backend || null,
+          gpuName: this._lastWhisperRuntime?.gpuName || '',
+          latency: this._getLatencyMetrics(),
         });
       } else if (isHallucination) {
         logger.debug('Dropped likely Whisper silence hallucination', {
@@ -3456,13 +3985,23 @@ class SpeechService extends EventEmitter {
         const clean = transcript ? transcript.trim() : '';
         const isHallucination = clean && this._isHallucinatedTranscript(clean);
         if (clean && !isHallucination) {
+          const partial = !this.isFinalizing && tracked.reason !== 'final' && tracked.reason !== 'final-batch' && tracked.reason !== 'final-retry';
+          if (partial) {
+            this._markLatencyEvent('firstPartialAt');
+          } else {
+            this._markLatencyEvent('finalTranscriptionAt');
+          }
           this.emit('transcription', clean, {
-            partial: !this.isFinalizing && tracked.reason !== 'final' && tracked.reason !== 'final-batch' && tracked.reason !== 'final-retry',
+            partial,
             reason: tracked.reason,
             sessionId,
             segmentSequence: tracked.sequence,
-            consolidated: tracked.sourceSegmentCount > 1,
-            sourceSegmentCount: tracked.sourceSegmentCount
+          consolidated: tracked.sourceSegmentCount > 1,
+          sourceSegmentCount: tracked.sourceSegmentCount,
+          backendRequested: this._lastWhisperRuntime?.backendRequested || this._getWhisperCppBackend(),
+          backendUsed: this._lastWhisperRuntime?.backend || null,
+          gpuName: this._lastWhisperRuntime?.gpuName || '',
+          latency: this._getLatencyMetrics()
           });
         } else if (isHallucination) {
           logger.debug('Dropped likely Whisper silence hallucination', {
@@ -3561,19 +4100,19 @@ class SpeechService extends EventEmitter {
   }
 
   async _transcribeWhisperBuffer(audioBuffer) {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-whisper-'));
+    const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'opencluely-whisper-'));
     const audioFilePath = path.join(tempDir, 'segment.wav');
     const startedAt = Date.now();
 
     try {
-      fs.writeFileSync(audioFilePath, this._createWavBuffer(audioBuffer));
+      await fsPromises.writeFile(audioFilePath, this._createWavBuffer(audioBuffer));
       logger.debug('Whisper segment WAV prepared', {
         durationMs: Math.round(audioBuffer.length / 32),
         wavWriteMs: Date.now() - startedAt,
       });
       return await this._transcribeWhisperFile(audioFilePath);
     } finally {
-      this._removeTempDir(tempDir);
+      await this._removeTempDir(tempDir);
     }
   }
 
@@ -3586,16 +4125,16 @@ class SpeechService extends EventEmitter {
     const audioPaths = [];
     try {
       for (const tracked of trackedBatch) {
-        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-whisper-batch-'));
+        const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'opencluely-whisper-batch-'));
         const audioFilePath = path.join(tempDir, 'segment.wav');
         tempDirs.push(tempDir);
-        fs.writeFileSync(audioFilePath, this._createWavBuffer(tracked.audioBuffer));
+        await fsPromises.writeFile(audioFilePath, this._createWavBuffer(tracked.audioBuffer));
         audioPaths.push(audioFilePath);
       }
       return await this._transcribeWithPersistentWorkerBatch(audioPaths);
     } finally {
       for (const tempDir of tempDirs) {
-        this._removeTempDir(tempDir);
+        await this._removeTempDir(tempDir);
       }
     }
   }
@@ -3635,7 +4174,7 @@ class SpeechService extends EventEmitter {
 
   async _transcribeWhisperFileWithCli(audioFilePath) {
     const startedAt = Date.now();
-    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-whisper-out-'));
+    const outputDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'opencluely-whisper-out-'));
     const args = [
       ...this.whisperCommand.baseArgs,
       audioFilePath,
@@ -3654,9 +4193,14 @@ class SpeechService extends EventEmitter {
 
     try {
       await new Promise((resolve, reject) => {
+        if (!this._validateWhisperCommand(this.whisperCommand.command)) {
+          reject(new Error('Refusing to spawn untrusted Whisper command: ' + this.whisperCommand.command));
+          return;
+        }
         const child = spawn(this.whisperCommand.command, args, {
           stdio: ['ignore', 'pipe', 'pipe'],
           windowsHide: true,
+          env: this._buildChildEnv(),
         });
 
         let stderr = '';
@@ -3679,15 +4223,18 @@ class SpeechService extends EventEmitter {
       });
 
       const transcriptPath = path.join(outputDir, path.parse(audioFilePath).name + '.txt');
-      const transcript = fs.existsSync(transcriptPath)
-        ? fs.readFileSync(transcriptPath, 'utf8').trim()
-        : '';
+      let transcript = '';
+      try {
+        transcript = (await fsPromises.readFile(transcriptPath, 'utf8')).trim();
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
       logger.debug('Whisper CLI transcription completed', {
         wallClockMs: Date.now() - startedAt,
       });
       return transcript;
     } finally {
-      this._removeTempDir(outputDir);
+      await this._removeTempDir(outputDir);
     }
   }
 
@@ -3716,9 +4263,9 @@ class SpeechService extends EventEmitter {
     return Buffer.concat([header, rawPcmBuffer]);
   }
 
-  _removeTempDir(tempDir) {
+  async _removeTempDir(tempDir) {
     try {
-      fs.rmSync(tempDir, { recursive: true, force: true });
+      await fsPromises.rm(tempDir, { recursive: true, force: true });
     } catch (error) {
       logger.error('Failed to remove Whisper temp directory', {
         tempDir,

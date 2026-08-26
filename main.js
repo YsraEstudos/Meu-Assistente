@@ -352,6 +352,11 @@ class ApplicationController {
           speechAvailable: this.speechAvailable,
           provider: speechService.provider,
         });
+        if (speechService.provider === 'whisper' && typeof speechService.prewarmWhisper === 'function') {
+          speechService.prewarmWhisper().catch((error) => {
+            logger.warn('Deferred Whisper prewarm failed', { error: error.message });
+          });
+        }
       } catch (error) {
         logger.warn("Deferred speech initialization failed", {
           error: error.message,
@@ -685,10 +690,11 @@ class ApplicationController {
       return speechService.isAvailable ? speechService.isAvailable() : false;
     });
 
-    ipcMain.handle("get-speech-status", () => {
+    ipcMain.handle("get-speech-status", async () => {
       try {
-        return speechService.getHardwareStatus
-          ? speechService.getHardwareStatus({ probe: false })
+        const readStatus = speechService.getHardwareStatusAsync || speechService.getHardwareStatus;
+        return readStatus
+          ? await readStatus.call(speechService, { probe: false })
           : { ok: false, available: false, execution: { kind: 'unavailable', label: 'Indisponível' } };
       } catch (error) {
         logger.warn("Failed to read speech hardware status", { error: error.message });
@@ -696,10 +702,11 @@ class ApplicationController {
       }
     });
 
-    ipcMain.handle("diagnose-speech", (event, options = {}) => {
+    ipcMain.handle("diagnose-speech", async (event, options = {}) => {
       try {
-        return speechService.getHardwareStatus
-          ? speechService.getHardwareStatus({ probe: options.probe === true })
+        const readStatus = speechService.getHardwareStatusAsync || speechService.getHardwareStatus;
+        return readStatus
+          ? await readStatus.call(speechService, { probe: options.probe === true })
           : { ok: false, available: false, execution: { kind: 'unavailable', label: 'Indisponível' } };
       } catch (error) {
         logger.warn("Speech hardware diagnosis failed", { error: error.message });
