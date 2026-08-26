@@ -939,16 +939,12 @@
           if (typeof markdown !== 'undefined' && markdown.toHTML) {
             return markdown.toHTML(text);
           } else {
-            console.warn('Markdown library not loaded, falling back to basic formatting');
-            return text
-              .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-              .replace(/\*(.+?)\*/g, '<em>$1</em>')
-              .replace(/`(.+?)`/g, '<code>$1</code>')
-              .replace(/\n/g, '<br>');
+            console.warn('Markdown library not loaded, falling back to escaped text');
+            return escapeHtml(text).replace(/\n/g, '<br>');
           }
         } catch (error) {
           console.error('Markdown parsing failed:', error);
-          return text.replace(/\n/g, '<br>');
+          return escapeHtml(text).replace(/\n/g, '<br>');
         }
       }
 

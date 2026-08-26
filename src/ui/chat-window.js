@@ -517,7 +517,7 @@ class ChatWindowUI {
         timeDiv.textContent = new Date().toLocaleTimeString();
         const textDiv = document.createElement('div');
         textDiv.className = 'message-text';
-        const escapedLang = (language || 'text').toUpperCase();
+        const escapedLang = this.escapeHtmlForSnippet((language || 'text').toUpperCase());
         const escapedCode = this.escapeHtmlForSnippet(code || '');
         textDiv.innerHTML = `
             <div style="font-size:12px;color:rgba(255,255,255,0.85);margin-bottom:6px;">Snippet: ${escapedLang}</div>
@@ -563,18 +563,12 @@ class ChatWindowUI {
             if (markdownLib && markdownLib.toHTML) {
                 return markdownLib.toHTML(text);
             } else {
-                logger.warn('Markdown library not available, falling back to basic formatting');
-                // Fallback to basic formatting
-                return text
-                    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-                    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-                    .replace(/`(.+?)`/g, '<code>$1</code>')
-                    .replace(/\n/g, '<br>');
+                logger.warn('Markdown library not available, falling back to escaped text');
+                return this.escapeHtmlForSnippet(text).replace(/\n/g, '<br>');
             }
         } catch (error) {
             logger.warn('Failed to parse markdown, falling back to plain text', { error: error.message });
-            // Fallback to basic formatting
-            return text.replace(/\n/g, '<br>');
+            return this.escapeHtmlForSnippet(text).replace(/\n/g, '<br>');
         }
     }
 

@@ -848,9 +848,9 @@
                     const codeBlock = document.createElement('div');
                     codeBlock.className = 'code-block';
                     codeBlock.innerHTML = `
-                        <div class="code-header">${block.language.toUpperCase()}</div>
+                        <div class="code-header">${escapeHtml(block.language.toUpperCase())}</div>
                         <div class="code-content">
-                            <pre><code class="language-${block.language}">${escapeHtml(block.code)}</code></pre>
+                            <pre><code class="language-${escapeHtml(block.language)}">${escapeHtml(block.code)}</code></pre>
                         </div>
                     `;
                     const pre = codeBlock.querySelector('pre');
