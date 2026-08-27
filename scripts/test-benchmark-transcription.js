@@ -47,7 +47,10 @@ function testBenchmarkOptionsAcceptSpaceSeparatedValues() {
 }
 
 function testAcceptanceDoesNotOverclaimHardwareOrMissingVariants() {
-  const originalReport = { summary: { qualityPass: true, allRunsSucceeded: true, rtfMedian: 0.2, wall: { medianMs: 100 } } };
+  const originalReport = {
+    measurements: [{ ok: true, backendUsed: 'vulkan', backendConfirmed: true }],
+    summary: { qualityPass: true, allRunsSucceeded: true, rtfMedian: 0.2, wall: { medianMs: 100 } }
+  };
   const noVariants = benchmark.buildAcceptance({
     ready: { backendUsed: 'vulkan', backendConfirmed: true, gpuName: 'AMD Radeon 7900' },
     originalReport,
@@ -60,7 +63,10 @@ function testAcceptanceDoesNotOverclaimHardwareOrMissingVariants() {
 
   const cpu = benchmark.buildAcceptance({
     ready: { backendUsed: 'cpu', gpuName: 'AMD Radeon RX 6600' },
-    originalReport,
+    originalReport: {
+      ...originalReport,
+      measurements: [{ ok: true, backendUsed: 'cpu', backendConfirmed: true }]
+    },
     variantReports: { faster: { summary: { qualityPass: true, allRunsSucceeded: true } } },
     baselineMs: null,
     originalOnly: false
@@ -70,7 +76,10 @@ function testAcceptanceDoesNotOverclaimHardwareOrMissingVariants() {
 }
 
 function testAcceptanceRequiresRuntimeBackendConfirmation() {
-  const originalReport = { summary: { qualityPass: true, allRunsSucceeded: true, rtfMedian: 0.2, wall: { medianMs: 100 } } };
+  const originalReport = {
+    measurements: [{ ok: true, backendUsed: 'vulkan', backendConfirmed: true }],
+    summary: { qualityPass: true, allRunsSucceeded: true, rtfMedian: 0.2, wall: { medianMs: 100 } }
+  };
   const unconfirmed = benchmark.buildAcceptance({
     ready: { backendUsed: 'vulkan', backendConfirmed: false },
     originalReport,
@@ -88,6 +97,23 @@ function testAcceptanceRequiresRuntimeBackendConfirmation() {
     originalOnly: true
   });
   assert.equal(confirmed.vulkanConfirmed, true);
+}
+
+function testAcceptanceRejectsUnconfirmedMeasuredBackend() {
+  const acceptance = benchmark.buildAcceptance({
+    ready: { backendUsed: 'vulkan', backendConfirmed: true },
+    originalReport: {
+      measurements: [
+        { ok: true, backendUsed: 'vulkan', backendConfirmed: true },
+        { ok: true, backendUsed: 'cpu', backendConfirmed: false }
+      ],
+      summary: { qualityPass: true, allRunsSucceeded: true, rtfMedian: 0.2, wall: { medianMs: 100 } }
+    },
+    variantReports: {},
+    baselineMs: null,
+    originalOnly: true
+  });
+  assert.equal(acceptance.vulkanConfirmed, false);
 }
 
 function testBenchmarkUsesPlatformDataDirectory() {
@@ -158,6 +184,7 @@ async function run() {
   testBenchmarkOptionsAcceptSpaceSeparatedValues();
   testAcceptanceDoesNotOverclaimHardwareOrMissingVariants();
   testAcceptanceRequiresRuntimeBackendConfirmation();
+  testAcceptanceRejectsUnconfirmedMeasuredBackend();
   testBenchmarkUsesPlatformDataDirectory();
   testBenchmarkFindsSingleConfigWhisperBinary();
   await testBenchmarkRejectsIncompleteRuns();

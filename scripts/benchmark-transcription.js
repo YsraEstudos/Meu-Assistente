@@ -321,11 +321,25 @@ class WorkerClient {
   }
 }
 
+function allMeasuredRunsConfirmBackend(reports, expectedBackend) {
+  const measurements = reports.flatMap((report) => Array.isArray(report?.measurements) ? report.measurements : []);
+  return measurements.length > 0 && measurements.every((measurement) => (
+    measurement.ok === true &&
+    measurement.backendUsed === expectedBackend &&
+    measurement.backendConfirmed === true
+  ));
+}
+
 function buildAcceptance({ ready, originalReport, variantReports, baselineMs, originalOnly }) {
   const originalMedianMs = originalReport.summary.wall.medianMs;
   const qualityPass = (report) => report?.summary?.qualityPass === true && report.summary.allRunsSucceeded === true;
+  const measuredVulkanConfirmed = allMeasuredRunsConfirmBackend(
+    [originalReport, ...Object.values(variantReports || {})],
+    'vulkan'
+  );
   return {
-    vulkanConfirmed: (ready.backendUsed || '') === 'vulkan' && ready.backendConfirmed === true,
+    vulkanConfirmed: (ready.backendUsed || '') === 'vulkan' && ready.backendConfirmed === true && measuredVulkanConfirmed,
+    measuredVulkanConfirmed,
     originalQualityPass: qualityPass(originalReport),
     variantsQualityPass: originalOnly || Object.keys(variantReports).length === 0
       ? null
