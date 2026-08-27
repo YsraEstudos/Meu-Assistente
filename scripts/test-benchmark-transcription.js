@@ -46,7 +46,7 @@ function testBenchmarkOptionsAcceptSpaceSeparatedValues() {
 function testAcceptanceDoesNotOverclaimHardwareOrMissingVariants() {
   const originalReport = { summary: { qualityPass: true, rtfMedian: 0.2, wall: { medianMs: 100 } } };
   const noVariants = benchmark.buildAcceptance({
-    ready: { backendUsed: 'vulkan', gpuName: 'AMD Radeon 7900' },
+    ready: { backendUsed: 'vulkan', backendConfirmed: true, gpuName: 'AMD Radeon 7900' },
     originalReport,
     variantReports: {},
     baselineMs: null,
@@ -66,6 +66,27 @@ function testAcceptanceDoesNotOverclaimHardwareOrMissingVariants() {
   assert.equal(cpu.variantsQualityPass, true);
 }
 
+function testAcceptanceRequiresRuntimeBackendConfirmation() {
+  const originalReport = { summary: { qualityPass: true, rtfMedian: 0.2, wall: { medianMs: 100 } } };
+  const unconfirmed = benchmark.buildAcceptance({
+    ready: { backendUsed: 'vulkan', backendConfirmed: false },
+    originalReport,
+    variantReports: {},
+    baselineMs: null,
+    originalOnly: true
+  });
+  assert.equal(unconfirmed.vulkanConfirmed, false);
+
+  const confirmed = benchmark.buildAcceptance({
+    ready: { backendUsed: 'vulkan', backendConfirmed: true },
+    originalReport,
+    variantReports: {},
+    baselineMs: null,
+    originalOnly: true
+  });
+  assert.equal(confirmed.vulkanConfirmed, true);
+}
+
 try {
   testPercentiles();
   testVariantsAreComparable();
@@ -73,6 +94,7 @@ try {
   testBenchmarkOptionsAcceptBaseline();
   testBenchmarkOptionsAcceptSpaceSeparatedValues();
   testAcceptanceDoesNotOverclaimHardwareOrMissingVariants();
+  testAcceptanceRequiresRuntimeBackendConfirmation();
   console.log('Speech benchmark tests: passed');
 } catch (error) {
   console.error('Speech benchmark tests: failed', error);

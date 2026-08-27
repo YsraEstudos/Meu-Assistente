@@ -1485,7 +1485,9 @@ class SpeechService extends EventEmitter {
       process.env.WHISPER_CAPTURE_CHUNK_SAMPLES ||
       config.get('speech.whisper.captureChunkSamples') || 2048;
     const parsed = Number(configured);
-    return Number.isFinite(parsed) ? Math.max(512, Math.min(8192, Math.floor(parsed))) : 2048;
+    if (!Number.isFinite(parsed)) return 2048;
+    const clamped = Math.max(512, Math.min(8192, Math.floor(parsed)));
+    return 2 ** Math.floor(Math.log2(clamped));
   }
 
   _createWhisperTailBatches(segments) {
@@ -1558,9 +1560,21 @@ class SpeechService extends EventEmitter {
 
   _finalizeStop(statusMessage) {
     const sessionId = this.recordingSessionId;
+    const latencySession = this._latencySession;
     const latency = this._getLatencyMetrics();
     this._cleanup();
-    this.emit('recording-stopped', { sessionId, latency });
+    // The main-process stop listener records dispatchAt synchronously before
+    // its first await. Keep only this completed session alive for that event,
+    // then discard it so a later recording cannot inherit stale metrics.
+    if (latencySession && this._latencySession === null) {
+      this._latencySession = latencySession;
+    }
+    const stopPayload = { sessionId, latency };
+    this.emit('recording-stopped', stopPayload);
+    if (latencySession && this._latencySession === latencySession) {
+      stopPayload.latency = this._getLatencyMetrics();
+      this._latencySession = null;
+    }
     this.emit('status', statusMessage);
     if (global.windowManager) {
       global.windowManager.handleRecordingStopped();
@@ -2640,7 +2654,7 @@ class SpeechService extends EventEmitter {
       candidates.push(path.join(app.getPath('userData'), '.whisper.cpp', 'build', 'bin', 'Release', `whisper-server${extension}`));
     } catch (_) { /* electron is unavailable in isolated tests */ }
     for (const candidate of candidates) {
-      if (fs.existsSync(candidate) && this._isTrustedWhisperPath(candidate)) {
+      if (this._isWhisperServerPathAllowed(candidate)) {
         return candidate;
       }
       if (!path.isAbsolute(candidate) && ['whisper-server', 'whisper-server.exe'].includes(path.basename(candidate).toLowerCase())) {
@@ -2649,7 +2663,41 @@ class SpeechService extends EventEmitter {
         const located = !probe.error && probe.status === 0
           ? String(probe.stdout || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean)
           : null;
-        if (located && this._isTrustedWhisperPath(located)) return located;
+        if (located && this._isWhisperServerPathAllowed(located)) return located;
+      }
+    }
+    return null;
+  }
+
+  async _resolveWhisperCppServerBinaryAsync(binary) {
+    const configured = this._getSetting('whisperCppServerCommand') || process.env.WHISPER_CPP_SERVER_COMMAND || '';
+    const extension = process.platform === 'win32' ? '.exe' : '';
+    const candidates = [];
+    if (configured) candidates.push(configured);
+    if (binary && path.isAbsolute(binary)) {
+      candidates.push(path.join(path.dirname(binary), `whisper-server${extension}`));
+    }
+    try {
+      const { app } = require('electron');
+      candidates.push(path.join(app.getPath('userData'), '.whisper.cpp', 'build', 'bin', `whisper-server${extension}`));
+      candidates.push(path.join(app.getPath('userData'), '.whisper.cpp', 'build', 'bin', 'Release', `whisper-server${extension}`));
+    } catch (_) { /* electron is unavailable in isolated tests */ }
+
+    for (const candidate of candidates) {
+      if (await this._isWhisperServerPathAllowedAsync(candidate)) return candidate;
+      if (!path.isAbsolute(candidate) && ['whisper-server', 'whisper-server.exe'].includes(path.basename(candidate).toLowerCase())) {
+        const locator = process.platform === 'win32' ? 'where' : 'which';
+        try {
+          const result = await this._execFileAsync(locator, [candidate], {
+            encoding: 'utf8',
+            timeout: 5000,
+            windowsHide: true,
+            maxBuffer: 1024 * 1024,
+            env: this._buildChildEnv()
+          });
+          const located = String(result.stdout || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+          if (located && await this._isWhisperServerPathAllowedAsync(located)) return located;
+        } catch (_) { /* try next candidate */ }
       }
     }
     return null;
@@ -2765,6 +2813,7 @@ class SpeechService extends EventEmitter {
     ]);
     if (!workerPath || !python || !binary || !this._isWhisperExecutablePathAllowed(binary)) return null;
     const model = this._getWhisperCppModelPath();
+    const serverBinary = await this._resolveWhisperCppServerBinaryAsync(binary);
     const args = [
       ...python.baseArgs,
       workerPath,
@@ -2779,7 +2828,8 @@ class SpeechService extends EventEmitter {
     args.push(this._getWhisperCppFlashAttention() ? '--flash-attn' : '--no-flash-attn');
     if (this._getWhisperCppBlas()) args.push('--blas');
     args.push('--backend', this._getWhisperCppBackend(), '--device', this._getWhisperCppDevice());
-    return { command: python.command, args, binary, serverBinary: null, model, backend: this._getWhisperCppBackend(), device: this._getWhisperCppDevice(), source: 'whisper-cpp' };
+    if (serverBinary) args.push('--server-binary', serverBinary);
+    return { command: python.command, args, binary, serverBinary, model, backend: this._getWhisperCppBackend(), device: this._getWhisperCppDevice(), source: 'whisper-cpp' };
   }
 
   _resolveFasterWhisperLaunch() {
@@ -2867,11 +2917,6 @@ class SpeechService extends EventEmitter {
 
     const normalizedCommand = command.trim();
     const trustedRoots = this._getTrustedWhisperRoots();
-    const allowedPathNames = new Set([
-      'python', 'python3', 'python.exe', 'python3.exe', 'py',
-      'whisper', 'whisper.exe', 'whisper-cli', 'whisper-cli.exe', 'main', 'main.exe'
-    ]);
-
     const isInsideTrustedRoot = (candidate) => trustedRoots.some((root) => {
       const rel = path.relative(root, candidate);
       return rel && !rel.startsWith('..') && !path.isAbsolute(rel);
@@ -2912,7 +2957,7 @@ class SpeechService extends EventEmitter {
       // to an explicitly allowlisted interpreter/Whisper executable. This
       // keeps configured absolute installations usable without accepting an
       // arbitrary executable path.
-      return allowedPathNames.has(path.basename(real).toLowerCase()) &&
+      return this._isAllowedWhisperExecutableName(real) &&
         (fromPath || commandIsPath);
     });
   }
@@ -2924,6 +2969,43 @@ class SpeechService extends EventEmitter {
       const real = fs.realpathSync(filePath);
       const allowedNames = new Set(['whisper-cli', 'whisper-cli.exe', 'main', 'main.exe']);
       return this._isTrustedWhisperPath(real) || allowedNames.has(path.basename(real).toLowerCase());
+    } catch (_) {
+      return false;
+    }
+  }
+
+  _isAllowedWhisperExecutableName(value) {
+    const basename = path.basename(String(value || '')).toLowerCase();
+    const fixedNames = new Set([
+      'python', 'python3', 'python.exe', 'python3.exe', 'py',
+      'whisper', 'whisper.exe', 'whisper-cli', 'whisper-cli.exe', 'main', 'main.exe'
+    ]);
+    return fixedNames.has(basename) || /^python3\.\d+(?:\.exe)?$/.test(basename);
+  }
+
+  _isWhisperServerPathAllowed(filePath) {
+    if (!filePath || typeof filePath !== 'string' || !fs.existsSync(filePath)) return false;
+    try {
+      if (!fs.statSync(filePath).isFile()) return false;
+      const real = fs.realpathSync(filePath);
+      return this._isTrustedWhisperPath(real) ||
+        ['whisper-server', 'whisper-server.exe'].includes(path.basename(real).toLowerCase());
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async _isWhisperServerPathAllowedAsync(filePath) {
+    if (!filePath || typeof filePath !== 'string') return false;
+    try {
+      const stat = await fsPromises.stat(filePath);
+      if (!stat.isFile()) return false;
+      const real = await fsPromises.realpath(filePath);
+      const isTrusted = this._getTrustedWhisperRoots().some((root) => {
+        const relative = path.relative(root, real);
+        return relative && !relative.startsWith('..') && !path.isAbsolute(relative);
+      });
+      return isTrusted || ['whisper-server', 'whisper-server.exe'].includes(path.basename(real).toLowerCase());
     } catch (_) {
       return false;
     }
@@ -2943,10 +3025,6 @@ class SpeechService extends EventEmitter {
 
     const normalizedCommand = command.trim();
     const trustedRoots = this._getTrustedWhisperRoots();
-    const allowedPathNames = new Set([
-      'python', 'python3', 'python.exe', 'python3.exe', 'py',
-      'whisper', 'whisper.exe', 'whisper-cli', 'whisper-cli.exe', 'main', 'main.exe'
-    ]);
     const commandIsPath = path.isAbsolute(normalizedCommand) || normalizedCommand.includes(path.sep) || normalizedCommand.includes('/');
     const candidates = [];
     if (path.isAbsolute(normalizedCommand)) {
@@ -2982,7 +3060,7 @@ class SpeechService extends EventEmitter {
           const relative = path.relative(root, real);
           return relative && !relative.startsWith('..') && !path.isAbsolute(relative);
         });
-        if (rel || (allowedPathNames.has(path.basename(real).toLowerCase()) && (candidate.fromPath || commandIsPath))) {
+        if (rel || (this._isAllowedWhisperExecutableName(real) && (candidate.fromPath || commandIsPath))) {
           return true;
         }
       } catch (_) {

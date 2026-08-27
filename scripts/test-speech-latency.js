@@ -81,6 +81,12 @@ function testFastProfileDefaults() {
   });
 }
 
+function testCaptureChunkSizeUsesSupportedWebAudioValue() {
+  resetService();
+  speechService.runtimeSettings = { whisperCaptureChunkSamples: 3000 };
+  assert.equal(speechService._getAudioChunkSamples(), 2048);
+}
+
 function testAbsoluteWhisperOverridesRemainUsable() {
   resetService();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-whisper-paths-'));
@@ -124,6 +130,18 @@ async function testAsyncHardwareValidationDoesNotUseSyncValidation() {
     speechService._validateWhisperCommandAsync = originalValidateAsync;
     speechService._getHardwareScriptPath = originalPath;
     speechService._execFileAsync = originalExec;
+  }
+}
+
+async function testVersionedExternalPythonTargetsAreAllowed() {
+  resetService();
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-whisper-python-'));
+  const pythonPath = path.join(tempDir, process.platform === 'win32' ? 'python3.11.exe' : 'python3.11');
+  fs.writeFileSync(pythonPath, 'python');
+  try {
+    assert.equal(await speechService._validateWhisperCommandAsync(pythonPath), true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
   }
 }
 
@@ -237,6 +255,73 @@ async function testFailedFinalizationDoesNotClaimFinalLatency() {
   }
 }
 
+function testStopEventIncludesDispatchLatency() {
+  resetService();
+  speechService.recordingSessionId = 1;
+  speechService._startLatencySession(1, 1000);
+  speechService._markLatencyEvent('finalTranscriptionAt', 1500);
+  let stoppedPayload = null;
+  speechService.once('recording-stopped', (payload) => {
+    speechService.markLatencyEvent('dispatchAt', 2000);
+    stoppedPayload = payload;
+  });
+
+  speechService._finalizeStop('Recording stopped');
+
+  assert(stoppedPayload, 'stop event must include a latency payload');
+  assert.equal(stoppedPayload.latency.dispatchMs, 1000);
+}
+
+function testExternalWhisperServerOverridesRemainUsable() {
+  resetService();
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-whisper-server-'));
+  const suffix = process.platform === 'win32' ? '.exe' : '';
+  const serverPath = path.join(tempDir, `whisper-server${suffix}`);
+  const binaryPath = path.join(tempDir, `whisper-cli${suffix}`);
+  fs.writeFileSync(serverPath, 'server');
+  fs.writeFileSync(binaryPath, 'binary');
+  try {
+    speechService.runtimeSettings = { whisperCppServerCommand: serverPath };
+    assert.equal(speechService._resolveWhisperCppServerBinary(binaryPath), serverPath);
+
+    speechService.runtimeSettings = {};
+    assert.equal(speechService._resolveWhisperCppServerBinary(binaryPath), serverPath);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function testAsyncLaunchIncludesExternalWhisperServer() {
+  resetService();
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-whisper-async-server-'));
+  const suffix = process.platform === 'win32' ? '.exe' : '';
+  const serverPath = path.join(tempDir, `whisper-server${suffix}`);
+  const binaryPath = path.join(tempDir, `whisper-cli${suffix}`);
+  const modelPath = path.join(tempDir, 'model.bin');
+  fs.writeFileSync(serverPath, 'server');
+  fs.writeFileSync(binaryPath, 'binary');
+  fs.writeFileSync(modelPath, 'model');
+  const originalWorkerPath = speechService._getWhisperWorkerPath;
+  const originalPython = speechService._resolveWhisperCppPythonAsync;
+  const originalBinary = speechService._resolveWhisperCppBinaryAsync;
+  const originalServer = speechService._resolveWhisperCppServerBinaryAsync;
+  try {
+    speechService.runtimeSettings = { whisperCppModel: modelPath };
+    speechService._getWhisperWorkerPath = () => path.join(__dirname, 'whisper-cpp-worker.py');
+    speechService._resolveWhisperCppPythonAsync = async () => ({ command: 'python', baseArgs: [] });
+    speechService._resolveWhisperCppBinaryAsync = async () => binaryPath;
+    speechService._resolveWhisperCppServerBinaryAsync = async () => serverPath;
+    const launch = await speechService._resolveWhisperCppLaunchAsync();
+    assert.equal(launch.serverBinary, serverPath);
+  } finally {
+    speechService._getWhisperWorkerPath = originalWorkerPath;
+    speechService._resolveWhisperCppPythonAsync = originalPython;
+    speechService._resolveWhisperCppBinaryAsync = originalBinary;
+    speechService._resolveWhisperCppServerBinaryAsync = originalServer;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
 function testCleanupDoesNotLeaveLiveLatencySession() {
   resetService();
   speechService._startLatencySession(3, 1000);
@@ -342,6 +427,7 @@ function testLowLatencyContractsAreWired() {
   assert(mainSource.includes("markLatencyEvent('dispatchAt'"), 'LLM dispatch must mark dispatch latency');
   assert(mainSource.includes('whisperCaptureChunkSamples'), 'settings must expose the capture chunk size');
   assert(rendererSource.includes('settings?.whisperCaptureChunkSamples'), 'renderer must read the configured capture chunk size');
+  assert(rendererSource.includes('Math.log2'), 'renderer must quantize capture chunks to a supported Web Audio size');
 }
 
 async function run() {
@@ -350,13 +436,18 @@ async function run() {
   testWorkerDeclaresSpeedFlags();
   testForcedCpuRuntimeIsReportedAsCpu();
   testDiscreteGpuSelectionWinsOverIntegrated();
+  testCaptureChunkSizeUsesSupportedWebAudioValue();
   testLatencyMetricsAreDeterministic();
   testLowLatencyContractsAreWired();
   await testAsyncHardwareValidationDoesNotUseSyncValidation();
+  await testVersionedExternalPythonTargetsAreAllowed();
   await testFinalLatencyWaitsForFinalization();
   await testAsyncRuntimeProbePreservesConfiguredDevice();
   await testAsyncHardwareStatusResolvesColdLaunch();
   await testFailedFinalizationDoesNotClaimFinalLatency();
+  testStopEventIncludesDispatchLatency();
+  testExternalWhisperServerOverridesRemainUsable();
+  await testAsyncLaunchIncludesExternalWhisperServer();
   testCleanupDoesNotLeaveLiveLatencySession();
   console.log('Speech latency tests: passed');
 }

@@ -550,9 +550,13 @@ class ApplicationController {
       // service emits it only after the active segment and consolidated tail
       // batches have completed.
       this.dispatchCoalescedUtterance(payload.sessionId || this._speechSessionId);
+      const latency = speechService && typeof speechService.getLatencyMetrics === "function"
+        ? speechService.getLatencyMetrics()
+        : payload.latency || null;
       BrowserWindow.getAllWindows().forEach((window) => {
         window.webContents.send("recording-stopped", {
-          sessionId: payload.sessionId || this._speechSessionId
+          sessionId: payload.sessionId || this._speechSessionId,
+          latency
         });
       });
     });

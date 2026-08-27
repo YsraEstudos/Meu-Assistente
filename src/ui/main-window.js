@@ -12,6 +12,13 @@ const logger = {
 };
 const MAX_CAPTURE_RESTART_ATTEMPTS = 3;
 
+function normalizeCaptureBufferSize(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return 2048;
+    const clamped = Math.max(512, Math.min(8192, Math.floor(parsed)));
+    return 2 ** Math.floor(Math.log2(clamped));
+}
+
 class MainWindowUI {
     constructor() {
         this.isInteractive = false;
@@ -1080,10 +1087,7 @@ class MainWindowUI {
                     const settings = window.electronAPI && window.electronAPI.getSettings
                         ? await window.electronAPI.getSettings()
                         : null;
-                    const configuredBufferSize = Number(settings?.whisperCaptureChunkSamples);
-                    if (Number.isFinite(configuredBufferSize)) {
-                        bufferSize = Math.max(512, Math.min(8192, Math.floor(configuredBufferSize)));
-                    }
+                    bufferSize = normalizeCaptureBufferSize(settings?.whisperCaptureChunkSamples);
                 } catch (error) {
                     logger.debug('Using default renderer capture chunk size', {
                         component: 'MainWindowUI',

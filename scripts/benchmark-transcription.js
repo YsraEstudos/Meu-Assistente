@@ -314,7 +314,7 @@ class WorkerClient {
 function buildAcceptance({ ready, originalReport, variantReports, baselineMs, originalOnly }) {
   const originalMedianMs = originalReport.summary.wall.medianMs;
   return {
-    vulkanConfirmed: (ready.backendUsed || '') === 'vulkan',
+    vulkanConfirmed: (ready.backendUsed || '') === 'vulkan' && ready.backendConfirmed === true,
     originalQualityPass: originalReport.summary.qualityPass,
     variantsQualityPass: originalOnly || Object.keys(variantReports).length === 0
       ? null
