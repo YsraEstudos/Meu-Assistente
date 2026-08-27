@@ -389,6 +389,7 @@ const logger = require('../core/logger').createServiceLogger('SPEECH');
 const config = require('../core/config');
 const { normalizeWhisperEngine } = require('../core/whisper-engine');
 const WHISPER_WORKER_REQUEST_TIMEOUT_MS = 210000;
+const WHISPER_WORKER_SHUTDOWN_TIMEOUT_MS = 5000;
 const performanceTracker = require('../core/performance');
 
 let sdk = null;
@@ -3362,10 +3363,29 @@ class SpeechService extends EventEmitter {
         this._settleWhisperWorkerRequest(requestId, (pending) => pending.reject(shutdownError));
       }
     }
+    const forceKill = () => {
+      try {
+        if (!worker.killed) worker.kill();
+      } catch (_) {
+        // The process may already have exited.
+      }
+    };
+    const canRequestGracefulStop = worker.stdin
+      && !worker.stdin.destroyed
+      && typeof worker.stdin.write === 'function'
+      && typeof worker.once === 'function';
+    if (!canRequestGracefulStop) {
+      forceKill();
+      return;
+    }
+
+    const killTimer = setTimeout(forceKill, WHISPER_WORKER_SHUTDOWN_TIMEOUT_MS);
+    worker.once('close', () => clearTimeout(killTimer));
     try {
-      worker.kill();
+      worker.stdin.write(JSON.stringify({ type: 'stop' }) + '\n');
     } catch (_) {
-      // The process may already have exited.
+      clearTimeout(killTimer);
+      forceKill();
     }
   }
 

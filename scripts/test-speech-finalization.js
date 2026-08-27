@@ -1,4 +1,5 @@
 const assert = require('assert');
+const { EventEmitter } = require('events');
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
@@ -218,11 +219,50 @@ async function testFasterBatchFallsBackPerSegment() {
     speechService._transcribeWhisperBuffer = originalTranscribe;
   }
 }
+
+function testPythonCandidatesIncludeSetupPythonLocation() {
+  const setupPython = 'C:\\hostedtoolcache\\windows\\Python\\3.11.9\\x64';
+  const candidates = getPythonCandidates({
+    platform: 'win32',
+    env: {
+      PYTHON: 'python-from-a-stale-path',
+      pythonLocation: setupPython,
+      Python_ROOT_DIR: setupPython
+    }
+  });
+  assert(candidates.some((candidate) => candidate.command === path.win32.join(setupPython, 'python.exe')),
+    'Windows tests must use the Python installation exported by setup-python');
+}
+
+function getPythonCandidates({ platform = process.platform, env = process.env } = {}) {
+  const candidates = [];
+  const seen = new Set();
+  const add = (command, args = []) => {
+    if (!command) return;
+    const key = JSON.stringify([command, args]);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push({ command, args });
+  };
+
+  add(env.PYTHON);
+  if (platform === 'win32') {
+    const join = path.win32.join;
+    for (const root of [env.pythonLocation, env.Python_ROOT_DIR]) {
+      if (root) add(root.toLowerCase().endsWith('.exe') ? root : join(root, 'python.exe'));
+    }
+    add('python');
+    add('py', ['-3']);
+  } else {
+    add('python3');
+    add('python');
+  }
+  return candidates;
+}
+
 async function testCpuDetectionScript() {
   const scriptPath = require.resolve('../scripts/detect-cpu.py');
-  const candidates = process.platform === 'win32'
-    ? [{ command: process.env.PYTHON || 'python', args: [] }, { command: 'py', args: ['-3'] }]
-    : [{ command: process.env.PYTHON || 'python3', args: [] }, { command: 'python', args: [] }];
+  const candidates = getPythonCandidates();
   let result = null;
   let launchError = null;
   for (const candidate of candidates) {
@@ -250,6 +290,39 @@ async function testCpuDetectionScript() {
   assert.equal(typeof payload.has_avx512, 'boolean');
   assert.equal(typeof payload.blas_available, 'boolean');
   assert.equal(typeof payload.logical_cpus, 'number');
+}
+
+function testShutdownRequestsGracefulWorkerStop() {
+  resetService();
+  const worker = new EventEmitter();
+  let stopMessage = null;
+  let killed = false;
+  worker.killed = false;
+  worker.exitCode = null;
+  worker.stdin = {
+    destroyed: false,
+    write(payload) {
+      stopMessage = JSON.parse(payload);
+    }
+  };
+  worker.kill = () => {
+    killed = true;
+    worker.killed = true;
+  };
+  speechService._whisperWorker = worker;
+  speechService._whisperWorkerReady = true;
+  speechService._whisperWorkerRequests = new Map();
+  speechService._whisperWorkerStart = null;
+
+  try {
+    speechService._shutdownWhisperWorker();
+    assert.deepEqual(stopMessage, { type: 'stop' }, 'shutdown must ask Python to stop its server');
+    assert.equal(killed, false, 'shutdown must give the worker time to clean up its server');
+    worker.emit('close');
+  } finally {
+    speechService._whisperWorker = null;
+    speechService._whisperWorkerReady = false;
+  }
 }
 
 async function testWhisperCppWorkerContract() {
@@ -423,9 +496,7 @@ async function testFasterEngineSettingsPersistence() {
 
 async function testGPUDetectionScript() {
   const scriptPath = require.resolve('../scripts/detect-gpu.py');
-  const candidates = process.platform === 'win32'
-    ? [{ command: process.env.PYTHON || 'python', args: [] }, { command: 'py', args: ['-3'] }]
-    : [{ command: process.env.PYTHON || 'python3', args: [] }, { command: 'python', args: [] }];
+  const candidates = getPythonCandidates();
   let result = null;
   let launchError = null;
   for (const candidate of candidates) {
@@ -599,7 +670,9 @@ Promise.resolve()
   .then(testFasterBatchSizesAndOrder)
   .then(testFasterBatchTimeoutFlushesPartialBatch)
   .then(testFasterBatchFallsBackPerSegment)
+  .then(testPythonCandidatesIncludeSetupPythonLocation)
   .then(testCpuDetectionScript)
+  .then(testShutdownRequestsGracefulWorkerStop)
   .then(testWhisperCppWorkerContract)
   .then(testWhisperCppLaunchConfiguration)
   .then(testWhisperCppFallbackUsesOpenAiCommand)

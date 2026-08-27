@@ -44,7 +44,7 @@ function testBenchmarkOptionsAcceptSpaceSeparatedValues() {
 }
 
 function testAcceptanceDoesNotOverclaimHardwareOrMissingVariants() {
-  const originalReport = { summary: { qualityPass: true, rtfMedian: 0.2, wall: { medianMs: 100 } } };
+  const originalReport = { summary: { qualityPass: true, allRunsSucceeded: true, rtfMedian: 0.2, wall: { medianMs: 100 } } };
   const noVariants = benchmark.buildAcceptance({
     ready: { backendUsed: 'vulkan', backendConfirmed: true, gpuName: 'AMD Radeon 7900' },
     originalReport,
@@ -58,7 +58,7 @@ function testAcceptanceDoesNotOverclaimHardwareOrMissingVariants() {
   const cpu = benchmark.buildAcceptance({
     ready: { backendUsed: 'cpu', gpuName: 'AMD Radeon RX 6600' },
     originalReport,
-    variantReports: { faster: { summary: { qualityPass: true } } },
+    variantReports: { faster: { summary: { qualityPass: true, allRunsSucceeded: true } } },
     baselineMs: null,
     originalOnly: false
   });
@@ -67,7 +67,7 @@ function testAcceptanceDoesNotOverclaimHardwareOrMissingVariants() {
 }
 
 function testAcceptanceRequiresRuntimeBackendConfirmation() {
-  const originalReport = { summary: { qualityPass: true, rtfMedian: 0.2, wall: { medianMs: 100 } } };
+  const originalReport = { summary: { qualityPass: true, allRunsSucceeded: true, rtfMedian: 0.2, wall: { medianMs: 100 } } };
   const unconfirmed = benchmark.buildAcceptance({
     ready: { backendUsed: 'vulkan', backendConfirmed: false },
     originalReport,
@@ -87,7 +87,53 @@ function testAcceptanceRequiresRuntimeBackendConfirmation() {
   assert.equal(confirmed.vulkanConfirmed, true);
 }
 
-try {
+function testBenchmarkUsesPlatformDataDirectory() {
+  const home = 'C:\\Users\\runner';
+  assert.equal(
+    benchmark.appDataRoot('linux', { HOME: home }, home),
+    require('path').join(home, '.config')
+  );
+  assert.equal(
+    benchmark.appDataRoot('darwin', { HOME: home }, home),
+    require('path').join(home, 'Library', 'Application Support')
+  );
+  assert.equal(
+    benchmark.appDataRoot('win32', { APPDATA: 'C:\\Users\\runner\\AppData\\Roaming' }, home),
+    'C:\\Users\\runner\\AppData\\Roaming'
+  );
+}
+
+async function testBenchmarkRejectsIncompleteRuns() {
+  let calls = 0;
+  const report = await benchmark.measureVariant({
+    async transcribe() {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          ok: true,
+          text: 'falarei trinta segundos transcrição rápida pausada pergunta tom baixo alto',
+          transcribeMs: 100
+        };
+      }
+      throw new Error('timeout');
+    }
+  }, { label: 'original', path: 'fixture.wav', durationMs: 1000 }, 2);
+
+  assert.equal(report.summary.successfulRuns, 1);
+  assert.equal(report.summary.failedRuns, 1);
+  assert.equal(report.summary.allRunsSucceeded, false);
+  assert.equal(report.summary.qualityPass, false);
+  const acceptance = benchmark.buildAcceptance({
+    ready: { backendUsed: 'cpu', backendConfirmed: true },
+    originalReport: report,
+    variantReports: {},
+    baselineMs: null,
+    originalOnly: true
+  });
+  assert.equal(acceptance.originalQualityPass, false);
+}
+
+async function run() {
   testPercentiles();
   testVariantsAreComparable();
   testReportDoesNotExposeTranscript();
@@ -95,8 +141,12 @@ try {
   testBenchmarkOptionsAcceptSpaceSeparatedValues();
   testAcceptanceDoesNotOverclaimHardwareOrMissingVariants();
   testAcceptanceRequiresRuntimeBackendConfirmation();
+  testBenchmarkUsesPlatformDataDirectory();
+  await testBenchmarkRejectsIncompleteRuns();
   console.log('Speech benchmark tests: passed');
-} catch (error) {
+}
+
+run().catch((error) => {
   console.error('Speech benchmark tests: failed', error);
   process.exitCode = 1;
-}
+});

@@ -142,19 +142,24 @@ function findAudio(audioArgument) {
   return path.join(audioDir, candidates[0]);
 }
 
-function appDataRoot() {
-  return process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+function appDataRoot(platform = process.platform, env = process.env, homeDir = os.homedir()) {
+  const home = platform === 'win32'
+    ? (env.USERPROFILE || env.HOME || homeDir)
+    : (env.HOME || homeDir);
+  if (platform === 'win32') return env.APPDATA || path.join(home, 'AppData', 'Roaming');
+  if (platform === 'darwin') return path.join(home, 'Library', 'Application Support');
+  return env.XDG_CONFIG_HOME || path.join(home, '.config');
 }
 
-function resolveLocalPaths() {
-  const root = path.join(appDataRoot(), 'opencluely');
+function resolveLocalPaths({ platform = process.platform, env = process.env, homeDir = os.homedir() } = {}) {
+  const root = path.join(appDataRoot(platform, env, homeDir), 'opencluely');
   const release = path.join(root, '.whisper.cpp', 'build', 'bin', 'Release');
   const bin = [path.join(release, 'whisper-cli.exe'), path.join(release, 'whisper-cli')]
     .find((candidate) => fs.existsSync(candidate));
   const server = [path.join(release, 'whisper-server.exe'), path.join(release, 'whisper-server')]
     .find((candidate) => fs.existsSync(candidate));
   const model = path.join(root, '.whisper-cpp-models', 'ggml-large-v3-turbo.bin');
-  const configuredPython = process.env.WHISPER_CPP_PYTHON || process.env.PYTHON || 'python';
+  const configuredPython = env.WHISPER_CPP_PYTHON || env.PYTHON || 'python';
   return {
     bin,
     server,
@@ -314,12 +319,13 @@ class WorkerClient {
 
 function buildAcceptance({ ready, originalReport, variantReports, baselineMs, originalOnly }) {
   const originalMedianMs = originalReport.summary.wall.medianMs;
+  const qualityPass = (report) => report?.summary?.qualityPass === true && report.summary.allRunsSucceeded === true;
   return {
     vulkanConfirmed: (ready.backendUsed || '') === 'vulkan' && ready.backendConfirmed === true,
-    originalQualityPass: originalReport.summary.qualityPass,
+    originalQualityPass: qualityPass(originalReport),
     variantsQualityPass: originalOnly || Object.keys(variantReports).length === 0
       ? null
-      : Object.values(variantReports).every((variant) => variant.summary.qualityPass),
+      : Object.values(variantReports).every(qualityPass),
     rtfMedianBelow035: originalReport.summary.rtfMedian !== null && originalReport.summary.rtfMedian < 0.35,
     noDroppedChunks: null,
     droppedChunksMeasured: false,
@@ -350,6 +356,7 @@ async function measureVariant(client, variant, runs) {
     }
   }
   const successful = measurements.filter((measurement) => measurement.ok);
+  const allRunsSucceeded = measurements.length === runs && successful.length === runs;
   const wallSummary = summarizeDurations(successful.map((measurement) => measurement.wallMs));
   const transcriptionSummary = summarizeDurations(successful.map((measurement) => measurement.transcribeMs));
   return {
@@ -359,10 +366,13 @@ async function measureVariant(client, variant, runs) {
     summary: {
       wall: wallSummary,
       transcribe: transcriptionSummary,
+      successfulRuns: successful.length,
+      failedRuns: measurements.length - successful.length,
+      allRunsSucceeded,
       rtfMedian: percentile(successful.map((measurement) => measurement.rtf).filter((value) => value !== null), 0.5),
       backendUsed: successful[0]?.backendUsed || null,
       gpuName: successful[0]?.gpuName || null,
-      qualityPass: successful.length > 0 && successful.every((measurement) => measurement.quality?.pass === true)
+      qualityPass: allRunsSucceeded && successful.length > 0 && successful.every((measurement) => measurement.quality?.pass === true)
     }
   };
 }
@@ -441,6 +451,8 @@ module.exports = {
   summarizeDurations,
   parseArgs,
   buildAcceptance,
+  appDataRoot,
+  measureVariant,
   WorkerClient
 };
 
