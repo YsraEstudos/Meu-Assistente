@@ -1,4 +1,7 @@
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const benchmark = require('./benchmark-transcription');
 
 function testPercentiles() {
@@ -103,6 +106,20 @@ function testBenchmarkUsesPlatformDataDirectory() {
   );
 }
 
+function testBenchmarkFindsSingleConfigWhisperBinary() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-benchmark-'));
+  const home = path.join(tempRoot, 'home');
+  const binary = path.join(home, '.config', 'opencluely', '.whisper.cpp', 'build', 'bin', 'whisper-cli');
+  fs.mkdirSync(path.dirname(binary), { recursive: true });
+  fs.writeFileSync(binary, 'test binary');
+  try {
+    const paths = benchmark.resolveLocalPaths({ platform: 'linux', env: { HOME: home }, homeDir: home });
+    assert.equal(paths.bin, binary);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
 async function testBenchmarkRejectsIncompleteRuns() {
   let calls = 0;
   const report = await benchmark.measureVariant({
@@ -142,6 +159,7 @@ async function run() {
   testAcceptanceDoesNotOverclaimHardwareOrMissingVariants();
   testAcceptanceRequiresRuntimeBackendConfirmation();
   testBenchmarkUsesPlatformDataDirectory();
+  testBenchmarkFindsSingleConfigWhisperBinary();
   await testBenchmarkRejectsIncompleteRuns();
   console.log('Speech benchmark tests: passed');
 }
