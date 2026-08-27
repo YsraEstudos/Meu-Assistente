@@ -32,11 +32,47 @@ function testBenchmarkOptionsAcceptBaseline() {
   assert.equal(options.originalOnly, true);
 }
 
+function testBenchmarkOptionsAcceptSpaceSeparatedValues() {
+  const options = benchmark.parseArgs([
+    '--backend', 'vulkan',
+    '--device', '1',
+    '--threads', '12'
+  ]);
+  assert.equal(options.backend, 'vulkan');
+  assert.equal(options.device, '1');
+  assert.equal(options.threads, 12);
+}
+
+function testAcceptanceDoesNotOverclaimHardwareOrMissingVariants() {
+  const originalReport = { summary: { qualityPass: true, rtfMedian: 0.2, wall: { medianMs: 100 } } };
+  const noVariants = benchmark.buildAcceptance({
+    ready: { backendUsed: 'vulkan', gpuName: 'AMD Radeon 7900' },
+    originalReport,
+    variantReports: {},
+    baselineMs: null,
+    originalOnly: true
+  });
+  assert.equal(noVariants.vulkanConfirmed, true);
+  assert.equal(noVariants.variantsQualityPass, null);
+
+  const cpu = benchmark.buildAcceptance({
+    ready: { backendUsed: 'cpu', gpuName: 'AMD Radeon RX 6600' },
+    originalReport,
+    variantReports: { faster: { summary: { qualityPass: true } } },
+    baselineMs: null,
+    originalOnly: false
+  });
+  assert.equal(cpu.vulkanConfirmed, false);
+  assert.equal(cpu.variantsQualityPass, true);
+}
+
 try {
   testPercentiles();
   testVariantsAreComparable();
   testReportDoesNotExposeTranscript();
   testBenchmarkOptionsAcceptBaseline();
+  testBenchmarkOptionsAcceptSpaceSeparatedValues();
+  testAcceptanceDoesNotOverclaimHardwareOrMissingVariants();
   console.log('Speech benchmark tests: passed');
 } catch (error) {
   console.error('Speech benchmark tests: failed', error);

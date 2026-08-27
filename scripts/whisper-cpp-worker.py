@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+from collections import deque
 import http.client
 import json
 import os
@@ -15,6 +16,7 @@ import re
 import tempfile
 import time
 import socket
+import threading
 from pathlib import Path
 
 
@@ -34,6 +36,21 @@ _configure_utf8_stdio()
 _server_process: subprocess.Popen[bytes] | None = None
 _server_port: int | None = None
 _server_runtime: dict[str, object] = {}
+_server_stderr: deque[str] = deque(maxlen=80)
+_server_stdout: deque[str] = deque(maxlen=80)
+
+
+def _drain_server_stderr(stream: object) -> None:
+    try:
+        for line in stream:  # type: ignore[union-attr]
+            text = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else str(line)
+            _server_stderr.append(text)
+    except (OSError, ValueError):
+        pass
+
+
+def _server_diagnostics() -> str:
+    return ("".join(_server_stdout) + "".join(_server_stderr))[-3000:].strip()
 
 def emit(payload: dict[str, object]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -198,94 +215,100 @@ def _start_server(args: argparse.Namespace) -> dict[str, object]:
         return {"mode": "cli", "reason": "whisper-server binary unavailable"}
 
     selected_device = None
-    gpu_name = ""
-    probe_backend = "cpu"
-    if args.backend != "cpu":
-        selected_device = _select_vulkan_device(args.device, server_binary)
-        # whisper.cpp's default Vulkan device is 0. Make that choice explicit
-        # when vulkaninfo is unavailable, while still preferring a named RX GPU.
-        selected_device = selected_device or "0"
+    use_gpu = args.backend != "cpu"
+    if use_gpu:
+        # Do not infer the runtime backend from `--help`: that output does not
+        # initialize Vulkan and caused the persistent server to be started with
+        # `-ng` even when Vulkan was explicitly requested.
+        selected_device = _select_vulkan_device(args.device, server_binary) or "0"
+
+    for attempt in range(3):
+        port_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            probe = subprocess.run(
-                [server_binary, "--help"],
-                capture_output=True,
+            port_socket.bind(("127.0.0.1", 0))
+            port = int(port_socket.getsockname()[1])
+        finally:
+            port_socket.close()
+
+        command = [
+            server_binary,
+            "-m", args.model,
+            "--host", "127.0.0.1",
+            "--port", str(port),
+            "-l", args.language,
+            "-t", str(max(1, args.threads)),
+            "-bs", str(args.beam_size),
+            "-bo", str(args.best_of),
+            "-nf" if args.no_fallback else "",
+            "-fa" if args.flash_attn else "-nfa",
+        ]
+        command = [value for value in command if value]
+        if use_gpu:
+            command.extend(["-dev", selected_device or "0"])
+        else:
+            command.append("-ng")
+
+        _server_stderr.clear()
+        _server_stdout.clear()
+        started = time.monotonic()
+        try:
+            _server_process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=12,
-                check=False,
             )
-            probe_backend, gpu_name = _runtime_backend(
-                (probe.stdout or "") + "\n" + (probe.stderr or ""),
-                args.backend,
-                selected_device,
-            )
-        except (OSError, subprocess.SubprocessError):
-            pass
+            threading.Thread(target=_drain_server_stderr, args=(_server_process.stdout,), daemon=True).start()
+            threading.Thread(target=_drain_server_stderr, args=(_server_process.stderr,), daemon=True).start()
+        except OSError as exc:
+            _stop_server()
+            return {"mode": "cli", "reason": str(exc)}
 
-    port_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        port_socket.bind(("127.0.0.1", 0))
-        port = int(port_socket.getsockname()[1])
-    finally:
-        port_socket.close()
-
-    command = [
-        server_binary,
-        "-m", args.model,
-        "--host", "127.0.0.1",
-        "--port", str(port),
-        "-l", args.language,
-        "-t", str(max(1, args.threads)),
-        "-bs", str(args.beam_size),
-        "-bo", str(args.best_of),
-        "-nf" if args.no_fallback else "",
-        "-fa" if args.flash_attn else "-nfa",
-    ]
-    command = [value for value in command if value]
-    use_gpu = args.backend != "cpu" and probe_backend == "vulkan"
-    if not use_gpu:
-        command.append("-ng")
-    else:
-        command.extend(["-dev", selected_device or "0"])
-
-    started = time.monotonic()
-    try:
-        _server_process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except OSError as exc:
-        return {"mode": "cli", "reason": str(exc)}
-
-    deadline = time.monotonic() + min(60.0, max(10.0, args.timeout_seconds))
-    ready = False
-    while time.monotonic() < deadline:
-        if _server_process.poll() is not None:
-            break
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                ready = True
+        deadline = time.monotonic() + min(180.0, max(10.0, args.timeout_seconds))
+        ready = False
+        while time.monotonic() < deadline:
+            if _server_process.poll() is not None:
                 break
-        except OSError:
-            time.sleep(0.1)
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    ready = True
+                    break
+            except OSError:
+                time.sleep(0.1)
 
-    if not ready:
+        if ready:
+            diagnostics = _server_diagnostics()
+            runtime_backend, gpu_name = _runtime_backend(diagnostics, args.backend, selected_device)
+            _server_port = port
+            _server_runtime = {
+                "mode": "server",
+                # The command reflects the requested backend even if this
+                # build does not print a Vulkan line during startup. The
+                # separate confirmation field prevents the benchmark from
+                # treating an unverified adapter name as proof.
+                "backend": "vulkan" if use_gpu else "cpu",
+                "backendRequested": args.backend,
+                "backendConfirmed": runtime_backend == "vulkan" if use_gpu else runtime_backend == "cpu",
+                "device": (selected_device or "0") if use_gpu else "cpu",
+                "gpuName": gpu_name if use_gpu else "",
+                "modelLoadMs": int((time.monotonic() - started) * 1000),
+                "diagnostics": diagnostics,
+            }
+            return dict(_server_runtime)
+
+        reason = "whisper-server did not become ready"
+        diagnostics = _server_diagnostics()
+        if diagnostics:
+            reason += f": {diagnostics[-1000:]}"
         _stop_server()
-        return {"mode": "cli", "reason": "whisper-server did not become ready"}
+        if attempt < 2:
+            continue
+        return {"mode": "cli", "reason": reason}
 
-    _server_port = port
-    _server_runtime = {
-        "mode": "server",
-        "backend": "vulkan" if use_gpu else "cpu",
-        "backendRequested": args.backend,
-        "device": (selected_device or "0") if use_gpu else "cpu",
-        "gpuName": gpu_name if use_gpu else "",
-        "modelLoadMs": int((time.monotonic() - started) * 1000),
-    }
-    return dict(_server_runtime)
+    return {"mode": "cli", "reason": "whisper-server startup retries exhausted"}
 
 
 def _multipart_body(audio_path: str) -> tuple[bytes, str]:
@@ -459,10 +482,12 @@ def main() -> int:
         "backend": args.backend,
         "backendRequested": args.backend,
         "backendUsed": server_info.get("backend", "unknown"),
+        "backendConfirmed": server_info.get("backendConfirmed", False),
         "device": server_info.get("device", args.device),
         "gpuName": server_info.get("gpuName", ""),
         "executionMode": server_info.get("mode", "cli"),
         "modelLoadMs": server_info.get("modelLoadMs"),
+        "diagnostics": server_info.get("diagnostics", ""),
         "beamSize": args.beam_size,
         "bestOf": args.best_of,
         "noFallback": bool(args.no_fallback),

@@ -3,6 +3,8 @@ const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 
+const WORKER_REQUEST_TIMEOUT_MS = 210000;
+
 const REFERENCE_ALTERNATIVES = [
   ['falarei'],
   ['trinta', '30'],
@@ -111,10 +113,16 @@ function parseArgs(argv = process.argv.slice(2)) {
       result.runs = Number(argv[++index]);
     } else if (arg.startsWith('--backend=')) {
       result.backend = arg.slice('--backend='.length);
+    } else if (arg === '--backend') {
+      result.backend = argv[++index];
     } else if (arg.startsWith('--device=')) {
       result.device = arg.slice('--device='.length);
+    } else if (arg === '--device') {
+      result.device = argv[++index];
     } else if (arg.startsWith('--threads=')) {
       result.threads = Number(arg.slice('--threads='.length));
+    } else if (arg === '--threads') {
+      result.threads = Number(argv[++index]);
     }
   }
   result.runs = Number.isFinite(result.runs) ? Math.max(1, Math.min(20, Math.floor(result.runs))) : 5;
@@ -209,6 +217,9 @@ class WorkerClient {
       env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
     });
     this.pending = new Map();
+    this.requestTimeoutMs = Number(options.requestTimeoutMs) > 0
+      ? Number(options.requestTimeoutMs)
+      : WORKER_REQUEST_TIMEOUT_MS;
     this.sequence = 0;
     this.stdoutBuffer = '';
     this.stderr = '';
@@ -220,6 +231,7 @@ class WorkerClient {
     this.child.stderr.setEncoding('utf8');
     this.child.stdout.on('data', (chunk) => this.consume(chunk));
     this.child.stderr.on('data', (chunk) => { this.stderr = (this.stderr + chunk).slice(-2000); });
+    this.child.stdin.on('error', (error) => this.fail(error));
     this.child.once('error', (error) => this.fail(error));
     this.child.once('close', (code) => this.fail(new Error(`worker exited with code ${code}`)));
   }
@@ -239,10 +251,18 @@ class WorkerClient {
       }
       const pending = this.pending.get(message.id);
       if (!pending) continue;
-      this.pending.delete(message.id);
-      if (message.ok) pending.resolve(message);
-      else pending.reject(new Error(message.error || 'worker transcription failed'));
+      if (message.ok) this.settle(message.id, null, message);
+      else this.settle(message.id, new Error(message.error || 'worker transcription failed'));
     }
+  }
+
+  settle(id, error, result) {
+    const pending = this.pending.get(id);
+    if (!pending) return;
+    this.pending.delete(id);
+    clearTimeout(pending.timer);
+    if (error) pending.reject(error);
+    else pending.resolve(result);
   }
 
   fail(error) {
@@ -250,15 +270,31 @@ class WorkerClient {
       this.rejectReady(error);
       this.resolveReady = null;
     }
-    for (const pending of this.pending.values()) pending.reject(error);
-    this.pending.clear();
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      this.pending.delete(id);
+      pending.reject(error);
+    }
   }
 
   transcribe(audioPath) {
     const id = String(++this.sequence);
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.child.stdin.write(JSON.stringify({ type: 'transcribe', id, audioPath }) + '\n');
+      const timer = setTimeout(() => {
+        this.settle(id, new Error(`worker transcription timed out after ${this.requestTimeoutMs}ms`));
+      }, this.requestTimeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      if (!this.child || !this.child.stdin || this.child.stdin.destroyed) {
+        this.settle(id, new Error('worker stdin is not writable'));
+        return;
+      }
+      try {
+        this.child.stdin.write(JSON.stringify({ type: 'transcribe', id, audioPath }) + '\n', (error) => {
+          if (error) this.settle(id, error);
+        });
+      } catch (error) {
+        this.settle(id, error);
+      }
     });
   }
 
@@ -273,6 +309,28 @@ class WorkerClient {
       this.child.once('close', () => { clearTimeout(timer); resolve(); });
     });
   }
+}
+
+function buildAcceptance({ ready, originalReport, variantReports, baselineMs, originalOnly }) {
+  const originalMedianMs = originalReport.summary.wall.medianMs;
+  return {
+    vulkanConfirmed: (ready.backendUsed || '') === 'vulkan',
+    originalQualityPass: originalReport.summary.qualityPass,
+    variantsQualityPass: originalOnly || Object.keys(variantReports).length === 0
+      ? null
+      : Object.values(variantReports).every((variant) => variant.summary.qualityPass),
+    rtfMedianBelow035: originalReport.summary.rtfMedian !== null && originalReport.summary.rtfMedian < 0.35,
+    noDroppedChunks: null,
+    droppedChunksMeasured: false,
+    improvementDeclarationRequiresBaseline: true,
+    baselineMedianMs: baselineMs,
+    improvementPercent: baselineMs && originalMedianMs
+      ? Number(((1 - originalMedianMs / baselineMs) * 100).toFixed(2))
+      : null,
+    speedImprovementAtLeast10Percent: baselineMs && originalMedianMs
+      ? originalMedianMs <= baselineMs * 0.9
+      : null
+  };
 }
 
 async function measureVariant(client, variant, runs) {
@@ -359,22 +417,13 @@ async function main() {
       warmup,
       original: originalReport,
       variants: variantReports,
-      acceptance: {
-        vulkanConfirmed: (ready.backendUsed || '') === 'vulkan' && /RX 6600/i.test(ready.gpuName || ''),
-        originalQualityPass: originalReport.summary.qualityPass,
-        variantsQualityPass: Object.values(variantReports).every((variant) => variant.summary.qualityPass),
-        rtfMedianBelow035: originalReport.summary.rtfMedian !== null && originalReport.summary.rtfMedian < 0.35,
-        noDroppedChunks: null,
-        droppedChunksMeasured: false,
-        improvementDeclarationRequiresBaseline: true,
-        baselineMedianMs: options.baselineMs,
-        improvementPercent: options.baselineMs && originalReport.summary.wall.medianMs
-          ? Number(((1 - originalReport.summary.wall.medianMs / options.baselineMs) * 100).toFixed(2))
-          : null,
-        speedImprovementAtLeast10Percent: options.baselineMs && originalReport.summary.wall.medianMs
-          ? originalReport.summary.wall.medianMs <= options.baselineMs * 0.9
-          : null
-      }
+      acceptance: buildAcceptance({
+        ready,
+        originalReport,
+        variantReports,
+        baselineMs: options.baselineMs,
+        originalOnly: options.originalOnly
+      })
     };
     process.stdout.write(JSON.stringify(report, null, 2) + '\n');
   } finally {
@@ -388,7 +437,9 @@ module.exports = {
   qualityCheck,
   sanitizeResult,
   summarizeDurations,
-  parseArgs
+  parseArgs,
+  buildAcceptance,
+  WorkerClient
 };
 
 if (require.main === module) {

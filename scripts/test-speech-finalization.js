@@ -277,7 +277,7 @@ async function testWhisperCppLaunchConfiguration() {
   };
   const originalResolveBinary = speechService._resolveWhisperCppBinary;
   const originalResolvePython = speechService._resolveWhisperCppPython;
-   const trustedBinary = path.join(process.cwd(), 'scripts', 'whisper-cpp-worker.py');
+  const trustedBinary = path.join(__dirname, 'whisper-cpp-worker.py');
    speechService._resolveWhisperCppBinary = () => trustedBinary;
   speechService._resolveWhisperCppPython = () => ({ command: 'python', baseArgs: [] });
   try {

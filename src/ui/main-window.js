@@ -1075,7 +1075,21 @@ class MainWindowUI {
 
                 const source = audioContext.createMediaStreamSource(stream);
                 this._startMicMeter(audioContext, source, stream, generation);
-                const bufferSize = 4096;
+                let bufferSize = 2048;
+                try {
+                    const settings = window.electronAPI && window.electronAPI.getSettings
+                        ? await window.electronAPI.getSettings()
+                        : null;
+                    const configuredBufferSize = Number(settings?.whisperCaptureChunkSamples);
+                    if (Number.isFinite(configuredBufferSize)) {
+                        bufferSize = Math.max(512, Math.min(8192, Math.floor(configuredBufferSize)));
+                    }
+                } catch (error) {
+                    logger.debug('Using default renderer capture chunk size', {
+                        component: 'MainWindowUI',
+                        error: error.message
+                    });
+                }
                 const scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
                 this._scriptNode = scriptNode;
 

@@ -1155,6 +1155,7 @@ class SpeechService extends EventEmitter {
     }
 
     const sessionId = this.recordingSessionId;
+    let finalizationHadFailures = false;
     const finalization = (async () => {
       if (this.segmentTimer) {
         clearInterval(this.segmentTimer);
@@ -1241,13 +1242,16 @@ class SpeechService extends EventEmitter {
 
       await this._waitForWhisperFlushes(sessionId);
       if (failed) {
+        finalizationHadFailures = true;
         this.emit('error', 'Some audio could not be transcribed.');
       }
     })();
 
     this._whisperFinalizationPromise = finalization;
+    let finalizationSucceeded = false;
     try {
       await finalization;
+      finalizationSucceeded = true;
     } catch (error) {
       logger.error('Final Whisper transcription failed', { error: error.message });
       if (sessionId === this.recordingSessionId) {
@@ -1256,7 +1260,9 @@ class SpeechService extends EventEmitter {
     } finally {
       if (sessionId === this.recordingSessionId && !this.isRecording) {
         this.isFinalizing = false;
-        this._markLatencyEvent('finalTranscriptionAt');
+        if (finalizationSucceeded && !finalizationHadFailures) {
+          this._markLatencyEvent('finalTranscriptionAt');
+        }
         this._emitTranscriptionProgress({
           state: 'complete',
           phase: 'complete',
@@ -1623,6 +1629,7 @@ class SpeechService extends EventEmitter {
     this._whisperRunningSegment = null;
     this._whisperFinalizationPromise = null;
     this.isFinalizing = false;
+    this._latencySession = null;
     this._resolveRendererCaptureDrain();
     this._resetVadState();
     this.transcriptionInFlight = this.activeTranscriptionCount > 0;
@@ -1970,44 +1977,38 @@ class SpeechService extends EventEmitter {
     candidates.push({ command: 'python', args: [] });
     if (process.platform === 'win32') candidates.push({ command: 'py', args: ['-3'] });
 
-    return new Promise((resolve) => {
-      let index = 0;
+    return (async () => {
       const tried = new Set();
-      const tryNext = () => {
-        if (index >= candidates.length) {
-          resolve(null);
-          return;
-        }
-        const candidate = candidates[index++];
+      for (const candidate of candidates) {
         const key = `${candidate.command}\u0000${candidate.args.join('\u0000')}`;
-        if (tried.has(key)) {
-          tryNext();
-          return;
-        }
+        if (tried.has(key) || !(await this._validateWhisperCommandAsync(candidate.command))) continue;
         tried.add(key);
-        if (!this._validateWhisperCommand(candidate.command)) {
-          tryNext();
+        try {
+          const { stdout } = await this._execFileAsync(candidate.command, [...candidate.args, scriptPath], {
+            encoding: 'utf8',
+            timeout: 10000,
+            windowsHide: true,
+            maxBuffer: 1024 * 1024,
+            env: this._buildChildEnv()
+          });
+          return JSON.parse(String(stdout || '').trim());
+        } catch (_) {
+          // Try the next interpreter when execution or JSON parsing fails.
+        }
+      }
+      return null;
+    })();
+  }
+
+  _execFileAsync(command, args, options = {}) {
+    return new Promise((resolve, reject) => {
+      execFile(command, args, options, (error, stdout, stderr) => {
+        if (error) {
+          reject(Object.assign(error, { stdout, stderr }));
           return;
         }
-        execFile(candidate.command, [...candidate.args, scriptPath], {
-          encoding: 'utf8',
-          timeout: 10000,
-          windowsHide: true,
-          maxBuffer: 1024 * 1024,
-          env: this._buildChildEnv()
-        }, (error, stdout) => {
-          if (!error) {
-            try {
-              resolve(JSON.parse(String(stdout || '').trim()));
-              return;
-            } catch (_) {
-              // Try the next interpreter when the output is not valid JSON.
-            }
-          }
-          tryNext();
-        });
-      };
-      tryNext();
+        resolve({ stdout, stderr });
+      });
     });
   }
   _writeSilentProbeWav(filePath) {
@@ -2039,8 +2040,10 @@ class SpeechService extends EventEmitter {
       env: this._buildChildEnv()
     });
     if (result.error || result.status !== 0) return null;
+    return this._parseWhisperCppVulkanDevice(`${result.stdout || ''}\n${result.stderr || ''}`);
+  }
 
-    const output = `${result.stdout || ''}\n${result.stderr || ''}`;
+  _parseWhisperCppVulkanDevice(output) {
     const blocks = output.split(/(?=^GPU\d+:)/m);
     const devices = [];
     for (const block of blocks) {
@@ -2061,17 +2064,32 @@ class SpeechService extends EventEmitter {
     return selected ? selected.index : null;
   }
 
-  _probeWhisperCppRuntimeAsync(launch) {
-    if (!launch || !launch.binary || !launch.model || !fs.existsSync(launch.binary) || !this._isTrustedWhisperPath(launch.binary)) {
-      return Promise.resolve({ success: false, usedGpu: false, backend: 'unavailable', gpuName: '', message: 'whisper-cli ou modelo não encontrado' });
+  async _selectWhisperCppVulkanDeviceAsync() {
+    try {
+      const result = await this._execFileAsync('vulkaninfo', ['--summary'], {
+        encoding: 'utf8',
+        timeout: 10000,
+        windowsHide: true,
+        maxBuffer: 1024 * 1024,
+        env: this._buildChildEnv()
+      });
+      return this._parseWhisperCppVulkanDevice(`${result.stdout || ''}\n${result.stderr || ''}`);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async _probeWhisperCppRuntimeAsync(launch) {
+    if (!launch || !launch.binary || !launch.model || !fs.existsSync(launch.binary) || !this._isWhisperExecutablePathAllowed(launch.binary)) {
+      return { success: false, usedGpu: false, backend: 'unavailable', gpuName: '', message: 'whisper-cli ou modelo não encontrado' };
     }
     if (!fs.existsSync(launch.model)) {
-      return Promise.resolve({ success: false, usedGpu: false, backend: 'unavailable', gpuName: '', message: 'modelo whisper.cpp não encontrado' });
+      return { success: false, usedGpu: false, backend: 'unavailable', gpuName: '', message: 'modelo whisper.cpp não encontrado' };
     }
 
     let tempDir;
     try {
-      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-gpu-probe-'));
+      tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'opencluely-gpu-probe-'));
       const audioPath = path.join(tempDir, 'probe.wav');
       const outputPrefix = path.join(tempDir, 'result');
       this._writeSilentProbeWav(audioPath);
@@ -2085,38 +2103,57 @@ class SpeechService extends EventEmitter {
         '-otxt',
         '-of', outputPrefix
       ];
+      const selectedDevice = launch.backend === 'cpu'
+        ? null
+        : (launch.device && launch.device !== 'auto'
+          ? launch.device
+          : await this._selectWhisperCppVulkanDeviceAsync());
       if (launch.backend === 'cpu') args.push('-ng');
+      else if (selectedDevice !== null) args.push('-dev', selectedDevice);
 
-      return new Promise((resolve) => {
-        execFile(launch.binary, args, {
+      try {
+        const result = await this._execFileAsync(launch.binary, args, {
           encoding: 'utf8',
           timeout: 90000,
           windowsHide: true,
           maxBuffer: 1024 * 1024,
           env: this._buildChildEnv()
-        }, (error, stdout, stderr) => {
-          const diagnostics = `${stdout || ''}\n${stderr || ''}`.trim();
-          const usedGpu = /ggml_vulkan|vulkan device/i.test(diagnostics);
-          const backend = usedGpu ? 'vulkan' : 'cpu';
-          resolve({
-            success: !error,
-            usedGpu,
-            backend,
-            device: null,
-            gpuName: '',
-            message: error
-              ? (error.killed ? 'Teste do whisper.cpp excedeu o tempo limite' : (error.message || 'whisper.cpp encerrou com erro'))
-              : (usedGpu ? 'whisper.cpp inicializou o backend Vulkan' : 'whisper.cpp respondeu sem inicializar Vulkan'),
-            output: diagnostics.slice(-3000)
-          });
-          try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
         });
-      });
-    } catch (error) {
-      if (tempDir) {
-        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+        const diagnostics = `${result.stdout || ''}\n${result.stderr || ''}`.trim();
+        const selectedVulkanMatch = selectedDevice !== null
+          ? diagnostics.match(new RegExp(`(?:^|\\n)\\s*(?:ggml_vulkan:\\s*)?${selectedDevice}\\s*=\\s*((?:AMD|NVIDIA|Intel)[^\\r\\n]+)$`, 'im'))
+          : null;
+        const vulkanMatch = selectedVulkanMatch
+          || diagnostics.match(/(?:ggml_vulkan|vulkan device)[\s\S]*?(?:\d+\s*=\s*)?((?:AMD|NVIDIA|Intel)[^\r\n]+)/i);
+        const usedGpu = /ggml_vulkan|vulkan device/i.test(diagnostics);
+        const backend = usedGpu ? 'vulkan' : 'cpu';
+        return {
+          success: true,
+          usedGpu,
+          backend,
+          device: selectedDevice,
+          gpuName: vulkanMatch ? vulkanMatch[1].trim() : '',
+          message: usedGpu ? 'whisper.cpp inicializou o backend Vulkan' : 'whisper.cpp respondeu sem inicializar Vulkan',
+          output: diagnostics.slice(-3000)
+        };
+      } catch (error) {
+        const diagnostics = `${error.stdout || ''}\n${error.stderr || ''}`.trim();
+        return {
+          success: false,
+          usedGpu: false,
+          backend: 'error',
+          device: selectedDevice,
+          gpuName: '',
+          message: error.killed ? 'Teste do whisper.cpp excedeu o tempo limite' : (error.message || 'whisper.cpp encerrou com erro'),
+          output: diagnostics.slice(-3000)
+        };
       }
-      return Promise.resolve({ success: false, usedGpu: false, backend: 'error', gpuName: '', message: error.message });
+    } catch (error) {
+      return { success: false, usedGpu: false, backend: 'error', gpuName: '', message: error.message };
+    } finally {
+      if (tempDir) {
+        try { await fsPromises.rm(tempDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+      }
     }
   }
   _probeWhisperCppRuntime(launch) {
@@ -2208,17 +2245,25 @@ class SpeechService extends EventEmitter {
     }
 
     const shouldProbe = this.provider === 'whisper';
+    const launchPromise = shouldProbe && this._getEffectiveWhisperEngine() === 'whisper-cpp'
+      ? (this.whisperCppLaunch || this._resolveWhisperCppLaunchAsync())
+      : Promise.resolve(this.whisperCppLaunch);
     const request = Promise.all([
       shouldProbe ? this._runHardwareScriptJsonAsync('detect-gpu.py') : Promise.resolve(null),
-      shouldProbe ? this._runHardwareScriptJsonAsync('detect-cpu.py') : Promise.resolve(null)
-    ]).then(([gpu, cpu]) => {
-      const result = this._buildHardwareStatus({ probe: false, gpu, cpu, allowResolve: false });
+      shouldProbe ? this._runHardwareScriptJsonAsync('detect-cpu.py') : Promise.resolve(null),
+      launchPromise
+    ]).then(([gpu, cpu, launch]) => {
+      if (launch && !this.whisperCppLaunch && this._getEffectiveWhisperEngine() === 'whisper-cpp') {
+        this.whisperCppLaunch = launch;
+        this.available = true;
+      }
+      const result = this._buildHardwareStatus({ probe: false, gpu, cpu, allowResolve: false, whisperCppLaunch: launch });
       if (!probe || this._getEffectiveWhisperEngine() !== 'whisper-cpp' ||
           !result.engine.binary || !result.engine.modelExists) {
         return result;
       }
 
-      return this._probeWhisperCppRuntimeAsync(this.whisperCppLaunch).then((probeResult) => {
+      return this._probeWhisperCppRuntimeAsync(launch || this.whisperCppLaunch).then((probeResult) => {
         result.probe = probeResult;
         result.execution = {
           kind: probeResult.usedGpu ? 'gpu' : 'cpu',
@@ -2231,7 +2276,7 @@ class SpeechService extends EventEmitter {
         return result;
       });
     }).catch((error) => {
-      const result = this._buildHardwareStatus({ probe: false, gpu: null, cpu: null, allowResolve: false });
+      const result = this._buildHardwareStatus({ probe: false, gpu: null, cpu: null, allowResolve: false, whisperCppLaunch: this.whisperCppLaunch });
       result.error = error.message || String(error);
       result.checks.push({ ok: false, label: 'Falha ao consultar o hardware' });
       return result;
@@ -2247,7 +2292,7 @@ class SpeechService extends EventEmitter {
     return request;
   }
 
-  _buildHardwareStatus({ probe = false, gpu, cpu, allowResolve = true } = {}) {
+  _buildHardwareStatus({ probe = false, gpu, cpu, allowResolve = true, whisperCppLaunch = null } = {}) {
     const configuredEngine = this._getConfiguredWhisperEngine();
     const effectiveEngine = this._getEffectiveWhisperEngine();
     gpu = gpu || {
@@ -2319,7 +2364,7 @@ class SpeechService extends EventEmitter {
     if (effectiveEngine === 'whisper-cpp') {
       const launch = allowResolve
         ? (this.whisperCppLaunch || this._resolveWhisperCppLaunch())
-        : this.whisperCppLaunch;
+        : (whisperCppLaunch || this.whisperCppLaunch);
       result.engine.binary = launch ? launch.binary || '' : '';
       result.engine.model = launch ? launch.model || '' : '';
       result.engine.modelExists = !!result.engine.model && fs.existsSync(result.engine.model);
@@ -2507,14 +2552,10 @@ class SpeechService extends EventEmitter {
   _getWhisperCppModelPath() {
     const configured = this._getSetting('whisperCppModel') || process.env.WHISPER_CPP_MODEL || '';
     if (configured && path.isAbsolute(configured)) {
-      const resolved = path.resolve(configured);
-      const modelDir = path.resolve(this._getWhisperModelDir('whisper-cpp'));
-      const rel = path.relative(modelDir, resolved);
-      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
-        logger.warn('Ignoring whisper.cpp model outside the managed model directory', { modelPath: configured });
-      } else {
-        return resolved;
-      }
+      // An explicit absolute path is a user-selected model location. Keep it
+      // intact so portable installs and externally managed model directories
+      // work; initialization still verifies that the file exists before use.
+      return path.resolve(configured);
     }
     if (configured && fs.existsSync(configured)) {
       const resolved = path.resolve(configured);
@@ -2620,11 +2661,10 @@ class SpeechService extends EventEmitter {
     const binary = this._resolveWhisperCppBinary();
     if (!workerPath || !python || !binary) return null;
     const configuredBinary = this._getWhisperCppCommand();
-    const allowedNames = new Set(['whisper-cli', 'whisper-cli.exe', 'main', 'main.exe']);
     const binaryIsPath = path.isAbsolute(configuredBinary) || configuredBinary.includes(path.sep) || configuredBinary.includes('/');
     if (
-      (binaryIsPath && !this._isTrustedWhisperPath(binary)) ||
-      (!this._isTrustedWhisperPath(binary) && !allowedNames.has(path.basename(binary).toLowerCase()))
+      (binaryIsPath && !this._isWhisperExecutablePathAllowed(binary)) ||
+      (!binaryIsPath && !this._isWhisperExecutablePathAllowed(binary))
     ) {
       logger.warn('Ignoring untrusted whisper.cpp binary', { binary });
       return null;
@@ -2648,6 +2688,98 @@ class SpeechService extends EventEmitter {
     args.push('--device', this._getWhisperCppDevice());
     if (serverBinary) args.push('--server-binary', serverBinary);
     return { command: python.command, args, binary, serverBinary, model, backend: this._getWhisperCppBackend(), device: this._getWhisperCppDevice(), source: 'whisper-cpp' };
+  }
+
+  async _resolveWhisperCppPythonAsync() {
+    const configured = this._getWhisperCppPython();
+    const candidates = [];
+    if (configured) candidates.push({ command: configured, baseArgs: [] });
+    try {
+      const { app } = require('electron');
+      const userData = app.getPath('userData');
+      const binDir = process.platform === 'win32' ? 'Scripts' : 'bin';
+      const ext = process.platform === 'win32' ? '.exe' : '';
+      const python = path.join(userData, '.venv-whisper-cpp', binDir, `python${ext}`);
+      if (await this._isFileAsync(python)) candidates.push({ command: python, baseArgs: [] });
+    } catch (_) { /* ignore */ }
+    for (const command of [process.env.PYTHON, process.env.PYTHON_EXECUTABLE, 'python3', 'python']) {
+      if (command) candidates.push({ command, baseArgs: [] });
+    }
+    if (process.platform === 'win32') candidates.push({ command: 'py', baseArgs: ['-3'] });
+    for (const candidate of candidates) {
+      if (!await this._validateWhisperCommandAsync(candidate.command)) continue;
+      try {
+        const result = await this._execFileAsync(candidate.command, [...candidate.baseArgs, '-c', 'import sys; print(sys.version_info[0])'], {
+          encoding: 'utf8',
+          timeout: 10000,
+          windowsHide: true,
+          maxBuffer: 1024 * 1024,
+          env: this._buildChildEnv()
+        });
+        if (result.stdout !== undefined) return candidate;
+      } catch (_) { /* try the next candidate */ }
+    }
+    return null;
+  }
+
+  async _resolveWhisperCppBinaryAsync() {
+    const configured = this._getWhisperCppCommand();
+    const candidates = [];
+    if (configured) candidates.push(configured);
+    try {
+      const { app } = require('electron');
+      candidates.push(path.join(app.getPath('userData'), '.whisper.cpp', 'build', 'bin', process.platform === 'win32' ? 'whisper-cli.exe' : 'whisper-cli'));
+      candidates.push(path.join(app.getPath('userData'), '.whisper.cpp', 'build', 'bin', 'Release', process.platform === 'win32' ? 'whisper-cli.exe' : 'whisper-cli'));
+    } catch (_) { /* ignore */ }
+    const extension = process.platform === 'win32' ? '.exe' : '';
+    for (const root of [path.join(__dirname, '..', '..', '.whisper.cpp'), path.join(__dirname, '..', '..', 'whisper.cpp')]) {
+      candidates.push(path.join(root, 'build', 'bin', `whisper-cli${extension}`));
+      candidates.push(path.join(root, 'build', 'bin', 'Release', `whisper-cli${extension}`));
+      candidates.push(path.join(root, 'build', 'Release', `whisper-cli${extension}`));
+    }
+
+    for (const candidate of candidates) {
+      if (await this._isFileAsync(candidate)) return candidate;
+      if (path.isAbsolute(candidate)) continue;
+      try {
+        const locator = process.platform === 'win32' ? 'where' : 'which';
+        const result = await this._execFileAsync(locator, [candidate], {
+          encoding: 'utf8',
+          timeout: 5000,
+          windowsHide: true,
+          maxBuffer: 1024 * 1024,
+          env: this._buildChildEnv()
+        });
+        const resolved = String(result.stdout || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+        if (resolved && await this._isFileAsync(resolved)) return resolved;
+      } catch (_) { /* try next candidate */ }
+    }
+    return null;
+  }
+
+  async _resolveWhisperCppLaunchAsync() {
+    const workerPath = this._getWhisperWorkerPath('whisper-cpp');
+    const [python, binary] = await Promise.all([
+      this._resolveWhisperCppPythonAsync(),
+      this._resolveWhisperCppBinaryAsync()
+    ]);
+    if (!workerPath || !python || !binary || !this._isWhisperExecutablePathAllowed(binary)) return null;
+    const model = this._getWhisperCppModelPath();
+    const args = [
+      ...python.baseArgs,
+      workerPath,
+      '--binary', binary,
+      '--model', model,
+      '--language', this._getWhisperLanguage(),
+      '--threads', String(this._getWhisperCppThreads()),
+      '--beam-size', String(this._getWhisperCppBeamSize()),
+      '--best-of', String(this._getWhisperCppBestOf())
+    ];
+    if (this._getWhisperCppNoFallback()) args.push('--no-fallback');
+    args.push(this._getWhisperCppFlashAttention() ? '--flash-attn' : '--no-flash-attn');
+    if (this._getWhisperCppBlas()) args.push('--blas');
+    args.push('--backend', this._getWhisperCppBackend(), '--device', this._getWhisperCppDevice());
+    return { command: python.command, args, binary, serverBinary: null, model, backend: this._getWhisperCppBackend(), device: this._getWhisperCppDevice(), source: 'whisper-cpp' };
   }
 
   _resolveFasterWhisperLaunch() {
@@ -2768,14 +2900,96 @@ class SpeechService extends EventEmitter {
       const candidate = typeof entry === 'string' ? entry : entry.path;
       const fromPath = typeof entry === 'object' && entry.fromPath === true;
       if (!fs.existsSync(candidate)) return false;
+      try {
+        if (!fs.statSync(candidate).isFile()) return false;
+      } catch (_) {
+        return false;
+      }
       let real;
       try { real = fs.realpathSync(candidate); } catch (_) { return false; }
       if (isInsideTrustedRoot(real)) return true;
-      // A bare system command is accepted only after PATH resolution and only
-      // for the fixed interpreter/Whisper executable names above. Arbitrary
-      // absolute paths supplied by a renderer are never trusted.
-      return !commandIsPath && fromPath && allowedPathNames.has(path.basename(real).toLowerCase());
+      // A command outside the managed roots is accepted only when it resolves
+      // to an explicitly allowlisted interpreter/Whisper executable. This
+      // keeps configured absolute installations usable without accepting an
+      // arbitrary executable path.
+      return allowedPathNames.has(path.basename(real).toLowerCase()) &&
+        (fromPath || commandIsPath);
     });
+  }
+
+  _isWhisperExecutablePathAllowed(filePath) {
+    if (!filePath || typeof filePath !== 'string' || !fs.existsSync(filePath)) return false;
+    try {
+      if (!fs.statSync(filePath).isFile()) return false;
+      const real = fs.realpathSync(filePath);
+      const allowedNames = new Set(['whisper-cli', 'whisper-cli.exe', 'main', 'main.exe']);
+      return this._isTrustedWhisperPath(real) || allowedNames.has(path.basename(real).toLowerCase());
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async _isFileAsync(filePath) {
+    try {
+      return (await fsPromises.stat(filePath)).isFile();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async _validateWhisperCommandAsync(command) {
+    if (!command || typeof command !== 'string') return false;
+    if (/[;&|`]/.test(command) || /\$\([^)]*\)/.test(command)) return false;
+
+    const normalizedCommand = command.trim();
+    const trustedRoots = this._getTrustedWhisperRoots();
+    const allowedPathNames = new Set([
+      'python', 'python3', 'python.exe', 'python3.exe', 'py',
+      'whisper', 'whisper.exe', 'whisper-cli', 'whisper-cli.exe', 'main', 'main.exe'
+    ]);
+    const commandIsPath = path.isAbsolute(normalizedCommand) || normalizedCommand.includes(path.sep) || normalizedCommand.includes('/');
+    const candidates = [];
+    if (path.isAbsolute(normalizedCommand)) {
+      candidates.push({ path: path.normalize(normalizedCommand), fromPath: false });
+    } else {
+      candidates.push({ path: path.resolve(normalizedCommand), fromPath: false });
+    }
+
+    if (!commandIsPath) {
+      try {
+        const locator = process.platform === 'win32' ? 'where' : 'which';
+        const result = await this._execFileAsync(locator, [normalizedCommand], {
+          encoding: 'utf8',
+          timeout: 5000,
+          windowsHide: true,
+          maxBuffer: 1024 * 1024,
+          env: this._buildChildEnv()
+        });
+        String(result.stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean).forEach((line) => {
+          candidates.push({ path: path.resolve(line), fromPath: true });
+        });
+      } catch (_) {
+        // The next candidate or interpreter may still be usable.
+      }
+    }
+
+    for (const candidate of candidates) {
+      try {
+        const stat = await fsPromises.stat(candidate.path);
+        if (!stat.isFile()) continue;
+        const real = await fsPromises.realpath(candidate.path);
+        const rel = trustedRoots.find((root) => {
+          const relative = path.relative(root, real);
+          return relative && !relative.startsWith('..') && !path.isAbsolute(relative);
+        });
+        if (rel || (allowedPathNames.has(path.basename(real).toLowerCase()) && (candidate.fromPath || commandIsPath))) {
+          return true;
+        }
+      } catch (_) {
+        // Ignore missing or inaccessible candidates.
+      }
+    }
+    return false;
   }
 
   _getTrustedWhisperRoots() {
@@ -2811,7 +3025,7 @@ class SpeechService extends EventEmitter {
   _buildChildEnv() {
     const env = { ...process.env };
     for (const key of Object.keys(env)) {
-      if (key === 'GEMINI_API_KEY' || key === 'AZURE_SPEECH_KEY' || key === 'AZURE_SPEECH_REGION' || key === 'AZURE_SPEECH_SUBSCRIPTION_KEY' || /TOKEN/i.test(key) || /SECRET/i.test(key)) {
+      if (key === 'GEMINI_API_KEY' || key === 'AZURE_SPEECH_KEY' || key === 'AZURE_SPEECH_REGION' || key === 'AZURE_SPEECH_SUBSCRIPTION_KEY' || /TOKEN/i.test(key) || /SECRET/i.test(key) || /API_KEY$/i.test(key)) {
         delete env[key];
       }
     }
@@ -3867,11 +4081,9 @@ class SpeechService extends EventEmitter {
       const clean = transcript ? transcript.trim() : '';
       const isHallucination = clean && this._isHallucinatedTranscript(clean);
       if (clean && !isHallucination) {
-        const partial = !this.isFinalizing && tracked.reason !== 'final' && tracked.reason !== 'final-batch' && tracked.reason !== 'final-retry';
+        const partial = !tracked.final && tracked.reason !== 'final' && tracked.reason !== 'final-batch' && tracked.reason !== 'final-retry';
         if (partial) {
           this._markLatencyEvent('firstPartialAt');
-        } else {
-          this._markLatencyEvent('finalTranscriptionAt');
         }
         this.emit('transcription', clean, {
           partial,
@@ -3985,11 +4197,9 @@ class SpeechService extends EventEmitter {
         const clean = transcript ? transcript.trim() : '';
         const isHallucination = clean && this._isHallucinatedTranscript(clean);
         if (clean && !isHallucination) {
-          const partial = !this.isFinalizing && tracked.reason !== 'final' && tracked.reason !== 'final-batch' && tracked.reason !== 'final-retry';
+          const partial = !tracked.final && tracked.reason !== 'final' && tracked.reason !== 'final-batch' && tracked.reason !== 'final-retry';
           if (partial) {
             this._markLatencyEvent('firstPartialAt');
-          } else {
-            this._markLatencyEvent('finalTranscriptionAt');
           }
           this.emit('transcription', clean, {
             partial,

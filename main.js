@@ -1550,6 +1550,9 @@ class ApplicationController {
     }
     this._utteranceBuffer = "";
     this._utteranceDispatchInFlight = true;
+    if (speechService && typeof speechService.markLatencyEvent === "function") {
+      speechService.markLatencyEvent('dispatchAt');
+    }
 
     try {
       const sessionHistory = sessionManager.getOptimizedHistory();
@@ -1915,7 +1918,9 @@ class ApplicationController {
       whisperEngine: process.env.WHISPER_ENGINE || "whisper-cpp",
       whisperCommand: process.env.WHISPER_COMMAND || "",
       whisperModel: process.env.WHISPER_MODEL || "small",
-      whisperLanguage: process.env.WHISPER_LANGUAGE || "auto",
+      whisperLanguage: process.env.WHISPER_LANGUAGE || "pt",
+      whisperCaptureChunkSamples: process.env.WHISPER_CAPTURE_CHUNK_SAMPLES ||
+        speechService.getStatus().effectiveSettings.whisperCaptureChunkSamples || "2048",
       whisperDevice: process.env.WHISPER_DEVICE || "auto",
       whisperCaptureMode: process.env.WHISPER_CAPTURE_MODE ||
         (process.env.WHISPER_MANUAL_CAPTURE === "true" ? "manual" : "vad"),
