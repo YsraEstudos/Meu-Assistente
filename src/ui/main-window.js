@@ -1094,6 +1094,13 @@ class MainWindowUI {
                         error: error.message
                     });
                 }
+                if (!this.isRecording || generation !== this._captureGeneration) {
+                    logger.debug('Renderer audio capture settings load cancelled', {
+                        component: 'MainWindowUI',
+                        generation
+                    });
+                    return;
+                }
                 const scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
                 this._scriptNode = scriptNode;
 

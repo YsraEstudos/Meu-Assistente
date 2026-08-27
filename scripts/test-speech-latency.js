@@ -87,6 +87,24 @@ function testCaptureChunkSizeUsesSupportedWebAudioValue() {
   assert.equal(speechService._getAudioChunkSamples(), 2048);
 }
 
+function testRendererCaptureRechecksGenerationAfterSettings() {
+  const rendererSource = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'ui', 'main-window.js'),
+    'utf8'
+  );
+  const captureStart = rendererSource.indexOf('_startRendererAudioCapture() {');
+  const settingsAwait = rendererSource.indexOf('await window.electronAPI.getSettings()', captureStart);
+  const scriptProcessor = rendererSource.indexOf('audioContext.createScriptProcessor', settingsAwait);
+  const generationGuard = rendererSource.indexOf(
+    'if (!this.isRecording || generation !== this._captureGeneration)',
+    settingsAwait
+  );
+  assert(settingsAwait >= 0, 'renderer capture must load settings asynchronously');
+  assert(captureStart >= 0, 'renderer capture start method must exist');
+  assert(generationGuard > settingsAwait && generationGuard < scriptProcessor,
+    'renderer capture must discard stale settings continuations before creating a script node');
+}
+
 function testAbsoluteWhisperOverridesRemainUsable() {
   resetService();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-whisper-paths-'));
@@ -143,6 +161,75 @@ async function testVersionedExternalPythonTargetsAreAllowed() {
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+}
+
+async function testWindowsPyLauncherIsAllowed() {
+  resetService();
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-whisper-py-'));
+  const pythonPath = path.join(tempDir, 'py.exe');
+  fs.writeFileSync(pythonPath, 'python launcher');
+  try {
+    assert.equal(speechService._validateWhisperCommand(pythonPath), true);
+    assert.equal(await speechService._validateWhisperCommandAsync(pythonPath), true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+function testWorkerDoesNotReportRequestedVulkanAsObservedWithoutDiagnostics() {
+  const workerPath = path.join(__dirname, 'whisper-cpp-worker.py');
+  const python = findPython();
+  if (!python) {
+    console.warn('Server backend confirmation probe skipped: no Python interpreter found');
+    return;
+  }
+  const probe = spawnSync(python.command, [...python.baseArgs,
+    '-c',
+    [
+      'import contextlib, json, runpy, sys, types',
+      'worker_path = sys.argv[1]',
+      'module = runpy.run_path(worker_path, run_name="worker_module")',
+      'module["socket"].socket = lambda *args, **kwargs: types.SimpleNamespace(bind=lambda address: None, getsockname=lambda: ("127.0.0.1", 54321), close=lambda: None)',
+      'module["socket"].create_connection = lambda *args, **kwargs: contextlib.nullcontext()',
+      'module["subprocess"].Popen = lambda *args, **kwargs: types.SimpleNamespace(stdout=[], stderr=[], poll=lambda: None, terminate=lambda: None, wait=lambda **kwargs: None, kill=lambda: None)',
+      'args = types.SimpleNamespace(server_binary=worker_path, model=worker_path, backend="vulkan", device="0", language="en", threads=1, beam_size=1, best_of=1, no_fallback=True, flash_attn=True, timeout_seconds=1)',
+      'runtime = module["_start_server"](args)',
+      'print(json.dumps({"backend": runtime.get("backend"), "backendConfirmed": runtime.get("backendConfirmed")}))'
+    ].join('; '),
+    workerPath
+  ], { encoding: 'utf8', windowsHide: true });
+  assert.equal(probe.status, 0, probe.stderr || 'server backend confirmation probe failed');
+  assert.deepEqual(JSON.parse(probe.stdout.trim()), { backend: 'cpu', backendConfirmed: false });
+}
+
+async function testWorkerResultPreservesBackendConfirmation() {
+  resetService();
+  const worker = {};
+  speechService._whisperWorker = worker;
+  speechService._whisperWorkerRequests = new Map();
+  const resultPromise = new Promise((resolve, reject) => {
+    speechService._whisperWorkerRequests.set('result-1', {
+      worker,
+      resolve,
+      reject,
+      timer: null
+    });
+  });
+  speechService._handleWhisperWorkerMessage(worker, {
+    type: 'result',
+    id: 'result-1',
+    ok: true,
+    text: 'ok',
+    backendRequested: 'vulkan',
+    backendUsed: 'cpu',
+    backendConfirmed: false,
+    executionMode: 'server',
+    device: '0',
+    gpuName: ''
+  });
+  const result = await resultPromise;
+  assert.equal(result.backendConfirmed, false);
+  assert.equal(speechService._lastWhisperRuntime.backendConfirmed, false);
 }
 
 async function testFinalLatencyWaitsForFinalization() {
@@ -437,10 +524,14 @@ async function run() {
   testForcedCpuRuntimeIsReportedAsCpu();
   testDiscreteGpuSelectionWinsOverIntegrated();
   testCaptureChunkSizeUsesSupportedWebAudioValue();
+  testRendererCaptureRechecksGenerationAfterSettings();
   testLatencyMetricsAreDeterministic();
   testLowLatencyContractsAreWired();
   await testAsyncHardwareValidationDoesNotUseSyncValidation();
   await testVersionedExternalPythonTargetsAreAllowed();
+  await testWindowsPyLauncherIsAllowed();
+  testWorkerDoesNotReportRequestedVulkanAsObservedWithoutDiagnostics();
+  await testWorkerResultPreservesBackendConfirmation();
   await testFinalLatencyWaitsForFinalization();
   await testAsyncRuntimeProbePreservesConfiguredDevice();
   await testAsyncHardwareStatusResolvesColdLaunch();

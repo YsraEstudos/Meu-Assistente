@@ -2977,7 +2977,7 @@ class SpeechService extends EventEmitter {
   _isAllowedWhisperExecutableName(value) {
     const basename = path.basename(String(value || '')).toLowerCase();
     const fixedNames = new Set([
-      'python', 'python3', 'python.exe', 'python3.exe', 'py',
+      'python', 'python3', 'python.exe', 'python3.exe', 'py', 'py.exe',
       'whisper', 'whisper.exe', 'whisper-cli', 'whisper-cli.exe', 'main', 'main.exe'
     ]);
     return fixedNames.has(basename) || /^python3\.\d+(?:\.exe)?$/.test(basename);
@@ -3233,6 +3233,7 @@ class SpeechService extends EventEmitter {
         modelLoadMs: Number(message.modelLoadMs) || null,
         backendRequested: message.backendRequested || message.backend || null,
         backendUsed: message.backendUsed || message.backend || null,
+        backendConfirmed: message.backendConfirmed === true,
         executionMode: message.executionMode || 'cli',
         gpuName: message.gpuName || '',
         beamSize: Number(message.beamSize) || null,
@@ -3281,10 +3282,12 @@ class SpeechService extends EventEmitter {
     this._settleWhisperWorkerRequest(message.id, (pending) => {
       if (message.ok) {
         const backendUsed = message.backendUsed || message.backend || null;
+        const backendConfirmed = message.backendConfirmed === true;
         if (backendUsed) {
           this._lastWhisperRuntime = {
             backend: String(backendUsed),
             backendRequested: String(message.backendRequested || this._getWhisperCppBackend()),
+            backendConfirmed,
             executionMode: String(message.executionMode || 'cli'),
             gpuName: String(message.gpuName || ''),
             device: String(message.device || ''),
@@ -3297,6 +3300,7 @@ class SpeechService extends EventEmitter {
           backend: backendUsed,
           backendRequested: message.backendRequested || this._getWhisperCppBackend(),
           backendUsed,
+          backendConfirmed,
           executionMode: message.executionMode || 'cli',
           device: message.device || '',
           gpuName: message.gpuName || ''

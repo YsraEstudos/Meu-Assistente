@@ -285,11 +285,10 @@ def _start_server(args: argparse.Namespace) -> dict[str, object]:
             _server_port = port
             _server_runtime = {
                 "mode": "server",
-                # The command reflects the requested backend even if this
-                # build does not print a Vulkan line during startup. The
-                # separate confirmation field prevents the benchmark from
-                # treating an unverified adapter name as proof.
-                "backend": "vulkan" if use_gpu else "cpu",
+                # Report the backend observed during real server startup. A
+                # requested Vulkan backend without initialization diagnostics
+                # must not be presented as a confirmed GPU execution.
+                "backend": runtime_backend,
                 "backendRequested": args.backend,
                 "backendConfirmed": runtime_backend == "vulkan" if use_gpu else runtime_backend == "cpu",
                 "device": (selected_device or "0") if use_gpu else "cpu",
@@ -333,8 +332,9 @@ def _transcribe_server(args: argparse.Namespace, item: object) -> dict[str, obje
         "text": "",
         "transcribeMs": 0,
         "executionMode": "server",
-        "backendRequested": args.backend,
+        "backendRequested": _server_runtime.get("backendRequested", args.backend),
         "backendUsed": _server_runtime.get("backend", "unknown"),
+        "backendConfirmed": _server_runtime.get("backendConfirmed", False),
         "device": _server_runtime.get("device", ""),
         "gpuName": _server_runtime.get("gpuName", ""),
     }
@@ -393,6 +393,7 @@ def _transcribe_cli(args: argparse.Namespace, item: object, selected_device: str
         "executionMode": "cli",
         "backendRequested": args.backend,
         "backendUsed": "cpu" if args.backend == "cpu" else "unknown",
+        "backendConfirmed": args.backend == "cpu",
     }
     if not request_id or not isinstance(audio_path, str) or not audio_path:
         base_result["error"] = "Invalid transcription item"
@@ -441,6 +442,7 @@ def _transcribe_cli(args: argparse.Namespace, item: object, selected_device: str
             backend, gpu_name = _runtime_backend(diagnostics, args.backend, selected_device)
             base_result["backend"] = backend
             base_result["backendUsed"] = backend
+            base_result["backendConfirmed"] = backend == "vulkan" if args.backend != "cpu" else backend == "cpu"
             base_result["gpuName"] = gpu_name
             base_result["device"] = selected_device or ("cpu" if args.backend == "cpu" else "auto")
             if completed.returncode != 0:
