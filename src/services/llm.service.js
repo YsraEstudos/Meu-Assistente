@@ -15,6 +15,7 @@ class LLMService {
     this.isInitialized = false;
     this.requestCount = 0;
     this.errorCount = 0;
+    this._unsupportedGenerationWarnings = new Set();
     
     this.initializeClient();
   }
@@ -66,9 +67,19 @@ class LLMService {
     // longer accept the legacy sampling controls in generationConfig.
     const model = this.model || config.get('llm.gemini.model');
     if (model === 'gemini-3.6-flash' || model === 'gemini-3.5-flash-lite') {
-      delete generationConfig.temperature;
-      delete generationConfig.topK;
-      delete generationConfig.topP;
+      const unsupportedFields = ['temperature', 'topK', 'topP']
+        .filter((field) => generationConfig[field] !== undefined);
+      if (unsupportedFields.length) {
+        const warningKey = `${model}:${unsupportedFields.join(',')}`;
+        if (!this._unsupportedGenerationWarnings.has(warningKey)) {
+          logger.warn('Ignoring unsupported Gemini sampling controls', {
+            model,
+            fields: unsupportedFields
+          });
+          this._unsupportedGenerationWarnings.add(warningKey);
+        }
+        unsupportedFields.forEach((field) => delete generationConfig[field]);
+      }
       generationConfig.thinkingConfig = {
         thinkingLevel: generationConfig.thinkingConfig?.thinkingLevel || 'medium'
       };

@@ -36,7 +36,7 @@ class ContextBuilder {
       ? `${prompt}\n\nCOMPACT SESSION SUMMARY:\n${summary}`
       : prompt;
     const currentInput = currentMessage == null ? this._formatUserMessage(cleanText, activeSkill) : String(currentMessage);
-    const history = this._fitHistory(source, cleanText, maxTokens, contextPrompt, '');
+    const history = this._fitHistory(source, currentInput, maxTokens, contextPrompt, '', cleanText);
     const contents = history.map((event) => ({
       role: event.role === 'model' ? 'model' : 'user',
       parts: [{ text: event.content }]
@@ -83,11 +83,11 @@ class ContextBuilder {
     ].filter(Boolean).join(' ');
   }
 
-  _fitHistory(events, currentText, maxTokens, prompt, summary) {
-    const budget = Math.max(32, maxTokens - this._estimateTokens(currentText) - this._estimateTokens(prompt) - this._estimateTokens(summary));
+  _fitHistory(events, currentInput, maxTokens, prompt, summary, dedupeText = currentInput) {
+    const budget = Math.max(32, maxTokens - this._estimateTokens(currentInput) - this._estimateTokens(prompt) - this._estimateTokens(summary));
     const selected = [];
     let used = 0;
-    const candidates = events.filter((event) => event.content !== currentText);
+    const candidates = events.filter((event) => event.content !== dedupeText && event.content !== currentInput);
 
     for (let index = candidates.length - 1; index >= 0;) {
       const event = candidates[index];
@@ -97,8 +97,17 @@ class ContextBuilder {
 
       if (used > 0 && used + cost > budget) break;
       if (used === 0 && cost > budget) {
-        const latest = group[group.length - 1];
-        selected.unshift({ ...latest, content: this._truncateToTokens(latest.content, budget) });
+        if (group.length === 2) {
+          const firstBudget = Math.max(1, Math.floor(budget / 2));
+          const secondBudget = Math.max(1, budget - firstBudget);
+          selected.unshift(
+            { ...group[0], content: this._truncateToTokens(group[0].content, firstBudget) },
+            { ...group[1], content: this._truncateToTokens(group[1].content, secondBudget) }
+          );
+        } else {
+          const latest = group[group.length - 1];
+          selected.unshift({ ...latest, content: this._truncateToTokens(latest.content, budget) });
+        }
         break;
       }
 

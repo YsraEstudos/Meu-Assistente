@@ -396,12 +396,17 @@ class SessionManager {
 
   removeOldSystemEvents() {
     const cutoffTime = Date.now() - (24 * 60 * 60 * 1000); // 24 hours
-    
-    this.sessionMemory = this.sessionMemory.filter(event => {
+
+    const filtered = this.sessionMemory.filter(event => {
       const eventTime = new Date(event.timestamp).getTime();
       const shouldKeep = event.category !== 'system' || eventTime > cutoffTime;
       return shouldKeep;
     });
+
+    if (filtered.length !== this.sessionMemory.length) {
+      this.sessionMemory = filtered;
+      this._invalidateContextCache();
+    }
   }
 
   consolidateSimilarEvents() {
@@ -416,7 +421,12 @@ class SessionManager {
       }
     }
     
-    this.sessionMemory = consolidated;
+    const changed = consolidated.length !== this.sessionMemory.length ||
+      consolidated.some((event, index) => event !== this.sessionMemory[index]);
+    if (changed) {
+      this.sessionMemory = consolidated;
+      this._invalidateContextCache();
+    }
   }
 
   groupSimilarEvents() {
@@ -476,11 +486,12 @@ class SessionManager {
 
   compressOldEvents() {
     const cutoffTime = Date.now() - (2 * 60 * 60 * 1000); // 2 hours
-    
-    this.sessionMemory = this.sessionMemory.map(event => {
+    let changed = false;
+    const compressed = this.sessionMemory.map(event => {
       const eventTime = new Date(event.timestamp).getTime();
       
       if (eventTime < cutoffTime && event.primaryContent && event.primaryContent.length > 100) {
+        changed = true;
         return {
           ...event,
           primaryContent: event.primaryContent.substring(0, 100) + '...[compressed]',
@@ -490,6 +501,11 @@ class SessionManager {
       
       return event;
     });
+
+    if (changed) {
+      this.sessionMemory = compressed;
+      this._invalidateContextCache();
+    }
   }
 
   getOptimizedHistory() {
