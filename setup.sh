@@ -23,6 +23,12 @@ WHISPER_CPP_BLAS="${WHISPER_CPP_BLAS:-auto}"
 WHISPER_CPP_BACKEND="${WHISPER_CPP_BACKEND:-vulkan}"
 WHISPER_CPP_MODEL_DIR="${WHISPER_CPP_MODEL_DIR:-.whisper-cpp-models}"
 WHISPER_CPP_MODEL="${WHISPER_CPP_MODEL:-}"
+# Keep installer dependencies reproducible. Review these pins deliberately when
+# upgrading the local speech stack instead of silently accepting latest PyPI.
+FASTER_WHISPER_PACKAGE="faster-whisper==1.0.3"
+PIP_PACKAGE="pip==24.3.1"
+CUDA_CUBLAS_PACKAGE="nvidia-cublas-cu12==12.1.3.1"
+CUDA_CUDNN_PACKAGE="nvidia-cudnn-cu12==9.1.0.70"
 WHISPER_VENV_DIR=".venv-whisper"
 WHISPER_FASTER_VENV_DIR=".venv-faster-whisper"
 WHISPER_MODEL_DIR=".whisper-models"
@@ -478,15 +484,15 @@ setup_whisper_env() {
   detect_faster_gpu
 
   echo "Installing faster-whisper into $WHISPER_FASTER_VENV_DIR"
-  "$WHISPER_PIP_PATH" install --upgrade pip || true
-  "$WHISPER_PIP_PATH" install faster-whisper || {
+  "$WHISPER_PIP_PATH" install "$PIP_PACKAGE" || true
+  "$WHISPER_PIP_PATH" install "$FASTER_WHISPER_PACKAGE" || {
     echo "WARNING: pip install faster-whisper failed. Faster Whisper may be unavailable."
     echo "Common causes: insufficient disk space, missing Python headers, or network issues."
   }
 
   if [[ "$GPU_DETECTED_DEVICE" == "cuda" || "$WHISPER_FASTER_DEVICE" == "cuda" ]]; then
     echo "Installing CUDA runtime packages for Faster Whisper"
-    "$WHISPER_PIP_PATH" install nvidia-cublas-cu12 nvidia-cudnn-cu12 || {
+    "$WHISPER_PIP_PATH" install "$CUDA_CUBLAS_PACKAGE" "$CUDA_CUDNN_PACKAGE" || {
       echo "WARNING: CUDA runtime packages could not be installed. The CPU fallback may be required."
     }
   fi
