@@ -27,14 +27,44 @@ function normalizeText(value) {
     .trim();
 }
 
-function qualityCheck(text) {
+function parseReference(referenceInput) {
+  const value = String(referenceInput || '').trim();
+  if (!value) throw new Error('Benchmark reference must contain at least one keyword');
+
+  let source = value;
+  const candidatePath = path.resolve(value);
+  if (fs.existsSync(candidatePath) && fs.statSync(candidatePath).isFile()) {
+    source = fs.readFileSync(candidatePath, 'utf8');
+  }
+
+  const alternatives = source
+    .split(/[\r\n,]+/)
+    .map((group) => group.split('|').map((term) => term.trim()).filter(Boolean))
+    .filter((group) => group.length > 0);
+  if (!alternatives.length) throw new Error('Benchmark reference must contain at least one keyword');
+  return alternatives;
+}
+
+function qualityCheck(text, referenceAlternatives = REFERENCE_ALTERNATIVES) {
   const normalized = normalizeText(text);
-  const missingKeywords = REFERENCE_ALTERNATIVES
+  const referenceProvided = Array.isArray(referenceAlternatives) && referenceAlternatives.length > 0;
+  if (!referenceProvided) {
+    return {
+      pass: false,
+      missingKeywords: [],
+      referenceProvided: false,
+      referenceRequired: true,
+      textLength: String(text || '').trim().length
+    };
+  }
+  const missingKeywords = referenceAlternatives
     .filter((alternatives) => !alternatives.some((term) => normalized.includes(normalizeText(term))))
     .map((alternatives) => alternatives[0]);
   return {
     pass: missingKeywords.length === 0,
     missingKeywords,
+    referenceProvided: true,
+    referenceRequired: false,
     textLength: String(text || '').trim().length
   };
 }
@@ -68,7 +98,7 @@ function buildVariantSpecs() {
   ];
 }
 
-function sanitizeResult(result, durationMs = null) {
+function sanitizeResult(result, durationMs = null, referenceAlternatives = REFERENCE_ALTERNATIVES) {
   const transcribeMs = Number(result && result.transcribeMs) || null;
   return {
     ok: result?.ok === true,
@@ -79,13 +109,14 @@ function sanitizeResult(result, durationMs = null) {
     device: result?.device || null,
     gpuName: result?.gpuName || null,
     rtf: transcribeMs && durationMs ? Number((transcribeMs / durationMs).toFixed(4)) : null,
-    quality: qualityCheck(result?.text || '')
+    quality: qualityCheck(result?.text || '', referenceAlternatives)
   };
 }
 
 function parseArgs(argv = process.argv.slice(2)) {
   const result = {
     audio: null,
+    reference: null,
     runs: 5,
     backend: process.env.WHISPER_CPP_BACKEND || 'vulkan',
     device: process.env.WHISPER_CPP_DEVICE || '0',
@@ -108,6 +139,10 @@ function parseArgs(argv = process.argv.slice(2)) {
       result.audio = arg.slice('--audio='.length);
     } else if (arg === '--audio') {
       result.audio = argv[++index];
+    } else if (arg.startsWith('--reference=')) {
+      result.reference = arg.slice('--reference='.length);
+    } else if (arg === '--reference') {
+      result.reference = argv[++index];
     } else if (arg.startsWith('--runs=')) {
       result.runs = Number(arg.slice('--runs='.length));
     } else if (arg === '--runs') {
@@ -358,7 +393,7 @@ function buildAcceptance({ ready, originalReport, variantReports, baselineMs, or
   };
 }
 
-async function measureVariant(client, variant, runs) {
+async function measureVariant(client, variant, runs, referenceAlternatives = REFERENCE_ALTERNATIVES) {
   const measurements = [];
   for (let index = 0; index < runs; index += 1) {
     const started = Date.now();
@@ -367,7 +402,7 @@ async function measureVariant(client, variant, runs) {
       measurements.push({
         run: index + 1,
         wallMs: Date.now() - started,
-        ...sanitizeResult(result, variant.durationMs)
+        ...sanitizeResult(result, variant.durationMs, referenceAlternatives)
       });
     } catch (error) {
       measurements.push({ run: index + 1, wallMs: Date.now() - started, ok: false, error: error.message });
@@ -398,6 +433,7 @@ async function measureVariant(client, variant, runs) {
 async function main() {
   const options = parseArgs();
   const audio = findAudio(options.audio);
+  const referenceAlternatives = options.reference ? parseReference(options.reference) : null;
   if (!fs.existsSync(audio)) throw new Error(`Audio file not found: ${audio}`);
   const paths = resolveLocalPaths();
   for (const [label, value] of Object.entries({ binary: paths.bin, model: paths.model, worker: paths.worker })) {
@@ -415,13 +451,13 @@ async function main() {
     const warmupResult = await client.transcribe(original.path);
     const warmup = {
       wallMs: Date.now() - warmupStarted,
-      ...sanitizeResult(warmupResult, original.durationMs)
+      ...sanitizeResult(warmupResult, original.durationMs, referenceAlternatives)
     };
-    const originalReport = await measureVariant(client, original, options.runs);
+    const originalReport = await measureVariant(client, original, options.runs, referenceAlternatives);
     const variantReports = {};
     if (!options.originalOnly) {
       for (const variant of variants.slice(1)) {
-        variantReports[variant.label] = await measureVariant(client, variant, 1);
+        variantReports[variant.label] = await measureVariant(client, variant, 1, referenceAlternatives);
       }
     }
     const report = {
@@ -442,7 +478,8 @@ async function main() {
         beamSize: 1,
         bestOf: 1,
         noFallback: true,
-        flashAttention: true
+        flashAttention: true,
+        qualityReferenceProvided: referenceAlternatives !== null
       },
       warmup,
       original: originalReport,
@@ -464,6 +501,7 @@ async function main() {
 
 module.exports = {
   buildVariantSpecs,
+  parseReference,
   qualityCheck,
   sanitizeResult,
   summarizeDurations,

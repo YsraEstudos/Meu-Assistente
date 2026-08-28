@@ -27,6 +27,22 @@ function testReportDoesNotExposeTranscript() {
   assert.equal(report.transcribeMs, 1234);
 }
 
+function testCustomReferenceControlsQualityKeywords() {
+  const reference = benchmark.parseReference('alpha,beta|b');
+  const report = benchmark.sanitizeResult({ ok: true, text: 'alpha b' }, 1000, reference);
+  assert.equal(report.quality.pass, true);
+  assert.deepEqual(report.quality.missingKeywords, []);
+  assert.equal(report.quality.referenceProvided, true);
+}
+
+function testMissingReferenceDoesNotApplyDefaultKeywords() {
+  const report = benchmark.sanitizeResult({ ok: true, text: 'custom transcript' }, 1000, null);
+  assert.equal(report.quality.pass, false);
+  assert.equal(report.quality.referenceProvided, false);
+  assert.equal(report.quality.referenceRequired, true);
+  assert.deepEqual(report.quality.missingKeywords, []);
+}
+
 function testBenchmarkOptionsAcceptBaseline() {
   const options = benchmark.parseArgs(['--runs=5', '--threads=12', '--baseline-ms=10190', '--original-only']);
   assert.equal(options.runs, 5);
@@ -39,11 +55,13 @@ function testBenchmarkOptionsAcceptSpaceSeparatedValues() {
   const options = benchmark.parseArgs([
     '--backend', 'vulkan',
     '--device', '1',
-    '--threads', '12'
+    '--threads', '12',
+    '--reference', 'alpha,beta|b'
   ]);
   assert.equal(options.backend, 'vulkan');
   assert.equal(options.device, '1');
   assert.equal(options.threads, 12);
+  assert.equal(options.reference, 'alpha,beta|b');
 }
 
 function testAcceptanceDoesNotOverclaimHardwareOrMissingVariants() {
@@ -180,6 +198,8 @@ async function run() {
   testPercentiles();
   testVariantsAreComparable();
   testReportDoesNotExposeTranscript();
+  testCustomReferenceControlsQualityKeywords();
+  testMissingReferenceDoesNotApplyDefaultKeywords();
   testBenchmarkOptionsAcceptBaseline();
   testBenchmarkOptionsAcceptSpaceSeparatedValues();
   testAcceptanceDoesNotOverclaimHardwareOrMissingVariants();
