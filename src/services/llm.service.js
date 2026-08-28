@@ -1,7 +1,12 @@
 const { GoogleGenAI } = require('@google/genai');
 const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
-const { promptLoader } = require('../../prompt-loader');
+const contextBuilder = require('./context.builder');
+const {
+  buildTechnicalTranscriptionContext,
+  buildTranscriptionUserMessage
+} = require('./transcription-context');
+const performanceTracker = require('../core/performance');
 
 class LLMService {
   constructor() {
@@ -10,6 +15,8 @@ class LLMService {
     this.isInitialized = false;
     this.requestCount = 0;
     this.errorCount = 0;
+    this._unsupportedGenerationWarnings = new Set();
+    this._generationConfigSources = new WeakMap();
     
     this.initializeClient();
   }
@@ -42,25 +49,81 @@ class LLMService {
     }
   }
 
-  getGenerationConfig(overrides = {}) {
+  _thinkingBudgetForLevel(level) {
+    const budgets = {
+      none: 0,
+      minimal: 1024,
+      low: 1024,
+      medium: 8192,
+      high: 24576
+    };
+    return budgets[String(level || '').trim().toLowerCase()] ?? 0;
+  }
+
+  getGenerationConfig(overrides = {}, model = null) {
     const defaults = config.get('llm.gemini.generation') || {};
     const fallback = {
       temperature: 0.7,
       topK: 40,
       topP: 0.95,
       maxOutputTokens: 4096,
-      thinkingConfig: { thinkingBudget: 0 }
+      thinkingConfig: { thinkingLevel: 'medium' }
     };
 
     const merged = { ...fallback, ...defaults, ...overrides };
-    return Object.fromEntries(
+    const generationConfig = Object.fromEntries(
       Object.entries(merged).filter(([, value]) => value !== undefined && value !== null)
     );
+
+    // Gemini 3.6 Flash and Gemini 3.5 Flash-Lite use thinkingLevel and no
+    // longer accept the legacy sampling controls in generationConfig.
+    const targetModel = model || this.model || config.get('llm.gemini.model');
+    if (targetModel === 'gemini-2.5-flash-lite') {
+      const overrideThinking = overrides.thinkingConfig || {};
+      const thinkingConfig = generationConfig.thinkingConfig || {};
+      const thinkingBudget = overrideThinking.thinkingLevel !== undefined
+        ? this._thinkingBudgetForLevel(overrideThinking.thinkingLevel)
+        : thinkingConfig.thinkingBudget !== undefined
+          ? thinkingConfig.thinkingBudget
+          : this._thinkingBudgetForLevel(thinkingConfig.thinkingLevel);
+      generationConfig.thinkingConfig = { thinkingBudget };
+    }
+
+    if (targetModel === 'gemini-3.6-flash' || targetModel === 'gemini-3.5-flash-lite') {
+      const unsupportedFields = ['temperature', 'topK', 'topP']
+        .filter((field) => generationConfig[field] !== undefined);
+      if (unsupportedFields.length) {
+        const warningKey = `${targetModel}:${unsupportedFields.join(',')}`;
+        if (!this._unsupportedGenerationWarnings.has(warningKey)) {
+          logger.warn('Ignoring unsupported Gemini sampling controls', {
+            model: targetModel,
+            fields: unsupportedFields
+          });
+          this._unsupportedGenerationWarnings.add(warningKey);
+        }
+        unsupportedFields.forEach((field) => delete generationConfig[field]);
+      }
+      generationConfig.thinkingConfig = {
+        thinkingLevel: generationConfig.thinkingConfig?.thinkingLevel || 'medium'
+      };
+    }
+
+    return generationConfig;
   }
 
-  applyGenerationDefaults(request, overrides = {}) {
-    request.generationConfig = this.getGenerationConfig({ ...(request.generationConfig || {}), ...overrides });
+  applyGenerationDefaults(request, overrides = {}, model = null) {
+    const generationOverrides = {
+      ...(this._generationConfigSources.get(request) || request.generationConfig || {}),
+      ...overrides
+    };
+    this._generationConfigSources.set(request, generationOverrides);
+    request.generationConfig = this.getGenerationConfig(generationOverrides, model);
     return request;
+  }
+
+  _getGenerationConfigForModel(request, model) {
+    const source = this._generationConfigSources.get(request) || request.generationConfig || {};
+    return this.getGenerationConfig(source, model);
   }
 
   extractTextFromCandidates(response) {
@@ -135,8 +198,7 @@ class LLMService {
 
     try {
       // Build system instruction using the skill prompt (with optional language injection)
-      const { promptLoader } = require('../../prompt-loader');
-      const skillPrompt = promptLoader.getSkillPrompt(activeSkill, programmingLanguage) || '';
+      const imageContext = contextBuilder.buildImageContext({ activeSkill, codingLanguage: programmingLanguage });
 
       // Build request with text + image parts
       const base64 = imageBuffer.toString('base64');
@@ -155,8 +217,8 @@ class LLMService {
 
       this.applyGenerationDefaults(request);
 
-      if (skillPrompt && skillPrompt.trim().length > 0) {
-        request.systemInstruction = { parts: [{ text: skillPrompt }] };
+      if (imageContext.systemInstruction) {
+        request.systemInstruction = imageContext.systemInstruction;
       }
 
       // Execute with retries/timeout - try alternative method first for network reliability
@@ -238,8 +300,7 @@ class LLMService {
     this.requestCount++;
 
     try {
-      const { promptLoader } = require('../../prompt-loader');
-      const skillPrompt = promptLoader.getSkillPrompt(activeSkill, programmingLanguage) || '';
+      const imageContext = contextBuilder.buildImageContext({ activeSkill, codingLanguage: programmingLanguage });
       const base64 = imageBuffer.toString('base64');
 
       const geminiRequest = {
@@ -254,8 +315,8 @@ class LLMService {
         ]
       };
       this.applyGenerationDefaults(geminiRequest);
-      if (skillPrompt && skillPrompt.trim().length > 0) {
-        geminiRequest.systemInstruction = { parts: [{ text: skillPrompt }] };
+      if (imageContext.systemInstruction) {
+        geminiRequest.systemInstruction = imageContext.systemInstruction;
       }
 
       const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
@@ -302,7 +363,7 @@ class LLMService {
     return `Analyze this image for a ${activeSkill.toUpperCase()} question. Extract the problem concisely and provide the best possible solution with explanation and final code.${langNote}`;
   }
 
-  async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
+  async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null, historyIncludesCurrentMessage = true) {
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
@@ -319,7 +380,7 @@ class LLMService {
         requestId: this.requestCount
       });
 
-      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
+      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage, historyIncludesCurrentMessage);
 
       const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
       let response;
@@ -389,7 +450,7 @@ class LLMService {
     }
   }
 
-  async processTextWithSkillStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
+  async processTextWithSkillStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null, historyIncludesCurrentMessage = true) {
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
@@ -398,7 +459,7 @@ class LLMService {
     this.requestCount++;
 
     try {
-      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
+      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage, historyIncludesCurrentMessage);
 
       const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
         if (typeof onDelta === 'function' && delta) {
@@ -433,11 +494,11 @@ class LLMService {
         error: error.message,
         requestId: this.requestCount
       });
-      return this.processTextWithSkill(text, activeSkill, sessionMemory, programmingLanguage);
+      return this.processTextWithSkill(text, activeSkill, sessionMemory, programmingLanguage, historyIncludesCurrentMessage);
     }
   }
 
-  async processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
+  async processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory = [], programmingLanguage = null, historyIncludesCurrentMessage = false) {
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
@@ -454,7 +515,7 @@ class LLMService {
         requestId: this.requestCount
       });
 
-      const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
+      const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage, historyIncludesCurrentMessage);
 
       const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
       let response;
@@ -553,231 +614,59 @@ class LLMService {
     }
   }
 
-  buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage) {
-    // Check if we have the new conversation history format
-    const sessionManager = require('../managers/session.manager');
-    
-    if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
-      const conversationHistory = sessionManager.getConversationHistory(15);
-      const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage);
-      return this.buildGeminiRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage);
-    }
-
-    // Fallback to old method for compatibility - now with programming language support
-    const requestComponents = promptLoader.getRequestComponents(
-      activeSkill, 
-      text, 
-      sessionMemory,
-      programmingLanguage
-    );
-
-    const request = {
-      contents: []
-    };
-
-    this.applyGenerationDefaults(request);
-
-    // Use the skill prompt that already has programming language injected
-    if (requestComponents.shouldUseModelMemory && requestComponents.skillPrompt) {
-      request.systemInstruction = {
-        parts: [{ text: requestComponents.skillPrompt }]
-      };
-      
-      logger.debug('Using language-enhanced system instruction for skill', {
-        skill: activeSkill,
-        programmingLanguage: programmingLanguage || 'not specified',
-        promptLength: requestComponents.skillPrompt.length,
-        requiresProgrammingLanguage: requestComponents.requiresProgrammingLanguage
-      });
-    }
-
-    request.contents.push({
-      role: 'user',
-      parts: [{ text: this.formatUserMessage(text, activeSkill) }]
+  buildGeminiRequest(text, activeSkill, historySnapshot = {}, programmingLanguage, historyIncludesCurrentMessage = true) {
+    const context = contextBuilder.build({
+      text,
+      activeSkill,
+      codingLanguage: programmingLanguage,
+      historySnapshot,
+      historyIncludesCurrentMessage
     });
-
-    return request;
-  }
-
-  buildGeminiRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage) {
-    const request = {
-      contents: []
-    };
-
+    const request = { contents: context.contents };
     this.applyGenerationDefaults(request);
+    if (context.systemInstruction) request.systemInstruction = context.systemInstruction;
 
-    // Use the skill prompt from context (which may already include programming language)
-    if (skillContext.skillPrompt) {
-      request.systemInstruction = {
-        parts: [{ text: skillContext.skillPrompt }]
-      };
-      
-      logger.debug('Using skill context prompt as system instruction', {
-        skill: activeSkill,
-        programmingLanguage: programmingLanguage || 'not specified',
-        promptLength: skillContext.skillPrompt.length,
-        requiresProgrammingLanguage: skillContext.requiresProgrammingLanguage || false,
-        hasLanguageInjection: programmingLanguage && skillContext.requiresProgrammingLanguage
-      });
-    }
-
-    // Add conversation history (excluding system messages) with validation
-    const conversationContents = conversationHistory
-      .filter(event => {
-        return event.role !== 'system' && 
-               event.content && 
-               typeof event.content === 'string' && 
-               event.content.trim().length > 0;
-      })
-      .map(event => {
-        const content = event.content.trim();
-        return {
-          role: event.role === 'model' ? 'model' : 'user',
-          parts: [{ text: content }]
-        };
-      });
-
-    // Add the conversation history
-    request.contents.push(...conversationContents);
-
-    // Format and validate the current user input
-    const formattedMessage = this.formatUserMessage(text, activeSkill);
-    if (!formattedMessage || formattedMessage.trim().length === 0) {
-      throw new Error('Failed to format user message or message is empty');
-    }
-
-    // Add the current user input
-    request.contents.push({
-      role: 'user',
-      parts: [{ text: formattedMessage }]
-    });
-
-    logger.debug('Built Gemini request with conversation history', {
+    logger.debug('Built optimized Gemini request', {
       skill: activeSkill,
       programmingLanguage: programmingLanguage || 'not specified',
-      historyLength: conversationHistory.length,
-      totalContents: request.contents.length,
-      hasSystemInstruction: !!request.systemInstruction,
-      requiresProgrammingLanguage: skillContext.requiresProgrammingLanguage || false
+      ...context.stats
     });
-
+    performanceTracker.mark('llm-context-built', { skill: activeSkill, ...context.stats });
     return request;
   }
 
-  buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage) {
-    // Validate input text first
+  buildIntelligentTranscriptionRequest(text, activeSkill, historySnapshot = {}, programmingLanguage, historyIncludesCurrentMessage = false) {
     const cleanText = text && typeof text === 'string' ? text.trim() : '';
-    if (!cleanText) {
-      throw new Error('Empty or invalid transcription text provided to buildIntelligentTranscriptionRequest');
-    }
+    if (!cleanText) throw new Error('Empty or invalid transcription text provided to buildIntelligentTranscriptionRequest');
 
-    // Check if we have the new conversation history format
-    const sessionManager = require('../managers/session.manager');
-    
-    if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
-      const conversationHistory = Array.isArray(sessionMemory)
-        ? sessionMemory
-        : sessionManager.getConversationHistory(10);
-      const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage);
-      return this.buildIntelligentTranscriptionRequestWithHistory(cleanText, activeSkill, conversationHistory, skillContext, programmingLanguage);
-    }
-
-    // Fallback to basic intelligent request
-    const request = {
-      contents: []
-    };
-
-    this.applyGenerationDefaults(request);
-
-    // Add intelligent filtering system instruction
     const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage);
-    if (!intelligentPrompt) {
-      throw new Error('Failed to generate intelligent transcription prompt');
-    }
+    if (!intelligentPrompt) throw new Error('Failed to generate intelligent transcription prompt');
 
-    request.systemInstruction = {
-      parts: [{ text: intelligentPrompt }]
-    };
-
-    request.contents.push({
-      role: 'user',
-      parts: [{ text: cleanText }]
+    const context = contextBuilder.build({
+      text: cleanText,
+      activeSkill,
+      codingLanguage: programmingLanguage,
+      historySnapshot,
+      systemPrompt: intelligentPrompt,
+      currentMessage: buildTranscriptionUserMessage(cleanText, activeSkill),
+      historyIncludesCurrentMessage
     });
+    const request = { contents: context.contents };
+    this.applyGenerationDefaults(request);
+    request.systemInstruction = context.systemInstruction;
 
-    logger.debug('Built basic intelligent transcription request', {
+    logger.debug('Built optimized intelligent transcription request', {
       skill: activeSkill,
       programmingLanguage: programmingLanguage || 'not specified',
       textLength: cleanText.length,
-      hasSystemInstruction: !!request.systemInstruction
+      ...context.stats
     });
-
+    performanceTracker.mark('transcription-context-built', { skill: activeSkill, ...context.stats });
     return request;
   }
 
-  buildIntelligentTranscriptionRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage) {
-    const request = {
-      contents: []
-    };
-
-    this.applyGenerationDefaults(request);
-
-  // For chat/transcription messages, DO NOT include the full skill prompt; use only the intelligent filter prompt
-  const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage);
-  request.systemInstruction = { parts: [{ text: intelligentPrompt }] };
-
-    // Add recent conversation history (excluding system messages) with validation
-    const conversationContents = conversationHistory
-      .filter(event => {
-        // Filter out system messages and ensure content exists and is valid
-        return event.role !== 'system' && 
-               event.content && 
-               typeof event.content === 'string' && 
-               event.content.trim().length > 0;
-      })
-      .slice(-8) // Keep last 8 exchanges for context
-      .map(event => {
-        const content = event.content.trim();
-        if (!content) {
-          logger.warn('Empty content found in conversation history', { event });
-          return null;
-        }
-        return {
-          role: event.role === 'model' ? 'model' : 'user',
-          parts: [{ text: content }]
-        };
-      })
-      .filter(content => content !== null); // Remove any null entries
-
-    // Add the conversation history
-    request.contents.push(...conversationContents);
-
-    // Validate and add the current transcription
-    const cleanText = text && typeof text === 'string' ? text.trim() : '';
-    if (!cleanText) {
-      throw new Error('Empty or invalid transcription text provided');
-    }
-
-    request.contents.push({
-      role: 'user',
-      parts: [{ text: cleanText }]
-    });
-
-    // Ensure we have at least one content item
-    if (request.contents.length === 0) {
-      throw new Error('No valid content to send to Gemini API');
-    }
-
-    logger.debug('Built intelligent transcription request with conversation history', {
-      skill: activeSkill,
-      programmingLanguage: programmingLanguage || 'not specified',
-      historyLength: conversationHistory.length,
-      totalContents: request.contents.length,
-      hasSkillPrompt: !!skillContext.skillPrompt,
-      cleanTextLength: cleanText.length,
-      requiresProgrammingLanguage: skillContext.requiresProgrammingLanguage || false
-    });
-
-    return request;
+  buildIntelligentTranscriptionRequestWithHistory(text, activeSkill, historySnapshot, _skillContext, programmingLanguage) {
+    return this.buildIntelligentTranscriptionRequest(text, activeSkill, historySnapshot, programmingLanguage);
   }
 
   getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage) {
@@ -848,6 +737,8 @@ If the user's input is a coding or DSA problem statement and contains no code, p
 Remember: Be intelligent about filtering - only provide detailed responses when the user actually needs help with ${activeSkill}.`;
 
     }
+
+    prompt += `\n\n${buildTechnicalTranscriptionContext({ programmingLanguage })}`;
     return prompt;
   }
 
@@ -891,7 +782,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
           const requestPromise = this.client.models.generateContent({
             model: modelName,
             contents: geminiRequest.contents,
-            config: geminiRequest.generationConfig,
+            config: this._getGenerationConfigForModel(geminiRequest, modelName),
             systemInstruction: geminiRequest.systemInstruction
           });
           const result = await Promise.race([requestPromise, timeoutPromise]);
@@ -995,7 +886,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
    * {response, metadata} shape. Falls back to the non-streaming path on any
    * streaming failure so reliability is never worse than before.
    */
-  async processTranscriptionWithIntelligentResponseStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
+  async processTranscriptionWithIntelligentResponseStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null, historyIncludesCurrentMessage = false) {
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
@@ -1004,7 +895,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     this.requestCount++;
 
     try {
-      const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
+      const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage, historyIncludesCurrentMessage);
 
       const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
         if (typeof onDelta === 'function' && delta) {
@@ -1042,7 +933,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
       });
       // Non-streaming path returns the same shape; the caller renders it as a
       // single final response.
-      return this.processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory, programmingLanguage);
+      return this.processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory, programmingLanguage, historyIncludesCurrentMessage);
     }
   }
 
@@ -1133,7 +1024,11 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     const https = require('https');
     const timeout = config.get('llm.gemini.timeout');
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:streamGenerateContent?alt=sse`;
-    const postData = JSON.stringify(geminiRequest);
+    const requestForModel = {
+      ...geminiRequest,
+      generationConfig: this._getGenerationConfigForModel(geminiRequest, modelName)
+    };
+    const postData = JSON.stringify(requestForModel);
     const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
 
     const options = {
@@ -1424,7 +1319,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
         logger.warn('Network connectivity issues detected', networkCheck);
       }
 
-      const generationConfig = this.getGenerationConfig({ temperature: 0, maxOutputTokens: 64 });
+      const generationOverrides = { temperature: 0, maxOutputTokens: 64 };
       const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
       const modelsToTry = [this.model, ...fallbackModels];
 
@@ -1438,7 +1333,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
           result = await this.client.models.generateContent({
             model: modelName,
             contents: 'Test connection. Please respond with "OK".',
-            config: generationConfig
+            config: this.getGenerationConfig(generationOverrides, modelName)
           });
           usedModel = modelName;
           const latency = Date.now() - startTime;
@@ -1592,7 +1487,11 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
 
-    const postData = JSON.stringify(geminiRequest);
+    const requestForModel = {
+      ...geminiRequest,
+      generationConfig: this._getGenerationConfigForModel(geminiRequest, modelName)
+    };
+    const postData = JSON.stringify(requestForModel);
 
     const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
 

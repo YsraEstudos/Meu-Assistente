@@ -1555,7 +1555,7 @@ class ApplicationController {
         }
       });
 
-      this.broadcastLLMError(error.message);
+      this.broadcastLLMError(error.message, messageId);
     }
   }
 
@@ -1693,7 +1693,8 @@ class ApplicationController {
           });
           this.appendResponseStream(messageId, delta);
           this.publishMobileResponseChunk({ messageId, delta });
-        }
+        },
+        false
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
       this.endResponseStream(messageId, { response: llmResult.response });
@@ -1812,11 +1813,13 @@ class ApplicationController {
     windowManager.broadcastToAllWindows("llm-response", broadcastData);
   }
 
-  broadcastLLMError(errorMessage) {
-    windowManager.broadcastToAllWindows("llm-error", {
+  broadcastLLMError(errorMessage, messageId = null) {
+    const data = {
       error: errorMessage,
-      timestamp: new Date().toISOString(),
-    });
+      timestamp: new Date().toISOString()
+    };
+    if (messageId) data.messageId = messageId;
+    windowManager.broadcastToAllWindows("llm-error", data);
   }
 
   startResponseStream(messageId, skill) {
@@ -1847,10 +1850,11 @@ class ApplicationController {
     };
     const channel = channels[type];
     if (!channel) return;
+    const isTerminalEvent = type === 'end' || type === 'error';
 
     for (const windowType of ['chat', 'llmResponse']) {
       const target = windowManager.getWindow(windowType);
-      if (!target || target.isDestroyed() || !target.isVisible()) continue;
+      if (!target || target.isDestroyed() || (!isTerminalEvent && !target.isVisible())) continue;
       target.webContents.send(channel, data);
     }
   }
