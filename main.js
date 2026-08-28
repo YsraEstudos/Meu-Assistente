@@ -1693,7 +1693,8 @@ class ApplicationController {
           });
           this.appendResponseStream(messageId, delta);
           this.publishMobileResponseChunk({ messageId, delta });
-        }
+        },
+        false
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
       this.endResponseStream(messageId, { response: llmResult.response });
