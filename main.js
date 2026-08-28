@@ -113,6 +113,7 @@ const llmService = require("./src/services/llm.service");
 const windowManager = require("./src/managers/window.manager");
 const sessionManager = require("./src/managers/session.manager");
 const MobileSyncService = require("./src/services/mobile-sync.service");
+const ResponseStream = require("./src/services/response-stream");
 const performanceTracker = require("./src/core/performance");
 
 class ApplicationController {
@@ -125,6 +126,7 @@ class ApplicationController {
     this.speechAvailable = false;
     this._speechInitializationTimer = null;
     this.mobileSync = new MobileSyncService({ logger });
+    this.responseStream = new ResponseStream();
 
     // Voice fragments are display-only until the recording session reaches its
     // final transcription barrier. The LLM receives one consolidated message.
@@ -1495,7 +1497,7 @@ class ApplicationController {
         }
       });
 
-      this.broadcastLLMError(error.message);
+      this.broadcastLLMError(error.message, messageId);
     }
   }
 
@@ -1635,7 +1637,8 @@ class ApplicationController {
             delta
           });
           this.publishMobileResponseChunk({ messageId, delta });
-        }
+        },
+        false
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
 
@@ -1752,11 +1755,50 @@ class ApplicationController {
     windowManager.broadcastToAllWindows("llm-response", broadcastData);
   }
 
-  broadcastLLMError(errorMessage) {
-    windowManager.broadcastToAllWindows("llm-error", {
+  broadcastLLMError(errorMessage, messageId = null) {
+    const data = {
       error: errorMessage,
-      timestamp: new Date().toISOString(),
+      timestamp: new Date().toISOString()
+    };
+    if (messageId) data.messageId = messageId;
+    windowManager.broadcastToAllWindows("llm-error", data);
+  }
+
+  startResponseStream(messageId, skill) {
+    performanceTracker.mark("response-stream-start", { messageId, skill });
+    this.responseStream.start({
+      messageId,
+      sessionId: this._speechSessionId || null,
+      skill,
+      emit: (type, data) => this.publishResponseEvent(type, data)
     });
+  }
+
+  appendResponseStream(messageId, delta) {
+    this.responseStream.append(messageId, delta);
+  }
+
+  endResponseStream(messageId, options = {}) {
+    this.responseStream.end(messageId, options);
+    performanceTracker.mark("response-stream-end", { messageId, responseLength: options.response ? options.response.length : 0, hasError: Boolean(options.error) });
+  }
+
+  publishResponseEvent(type, data) {
+    const channels = {
+      start: 'response-start',
+      delta: 'response-delta',
+      end: 'response-end',
+      error: 'response-error'
+    };
+    const channel = channels[type];
+    if (!channel) return;
+    const isTerminalEvent = type === 'end' || type === 'error';
+
+    for (const windowType of ['chat', 'llmResponse']) {
+      const target = windowManager.getWindow(windowType);
+      if (!target || target.isDestroyed() || (!isTerminalEvent && !target.isVisible())) continue;
+      target.webContents.send(channel, data);
+    }
   }
 
   broadcastTranscriptionLLMResponse(llmResult) {
