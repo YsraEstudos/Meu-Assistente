@@ -561,7 +561,9 @@ class ApplicationController {
       if (typeof speechService.markLatencyEvent === 'function') {
         speechService.markLatencyEvent('dispatchAt');
       }
-      const latency = payload.latency || speechService.getLatencyMetrics?.() || null;
+      const latency = payload.latency || (speechService && typeof speechService.getLatencyMetrics === "function"
+        ? speechService.getLatencyMetrics()
+        : null);
       performanceTracker.mark('speech-consolidated-dispatch', {
         sessionId: payload.sessionId || this._speechSessionId,
         latency
@@ -570,7 +572,7 @@ class ApplicationController {
       BrowserWindow.getAllWindows().forEach((window) => {
         window.webContents.send("recording-stopped", {
           sessionId: payload.sessionId || this._speechSessionId,
-          latency: speechService.getLatencyMetrics?.() || latency
+          latency
         });
       });
     });
@@ -798,7 +800,9 @@ class ApplicationController {
     ipcMain.handle("get-speech-status", async () => {
       try {
         const readStatus = speechService.getHardwareStatusAsync || speechService.getHardwareStatus;
-        return await readStatus.call(speechService, { probe: false });
+        return readStatus
+          ? await readStatus.call(speechService, { probe: false })
+          : { ok: false, available: false, execution: { kind: 'unavailable', label: 'Indisponível' } };
       } catch (error) {
         logger.warn("Failed to read speech hardware status", { error: error.message });
         return { ok: false, available: false, error: error.message, execution: { kind: 'unavailable', label: 'Indisponível' } };
@@ -808,7 +812,9 @@ class ApplicationController {
     ipcMain.handle("diagnose-speech", async (event, options = {}) => {
       try {
         const readStatus = speechService.getHardwareStatusAsync || speechService.getHardwareStatus;
-        return await readStatus.call(speechService, { probe: options.probe === true });
+        return readStatus
+          ? await readStatus.call(speechService, { probe: options.probe === true })
+          : { ok: false, available: false, execution: { kind: 'unavailable', label: 'Indisponível' } };
       } catch (error) {
         logger.warn("Speech hardware diagnosis failed", { error: error.message });
         return { ok: false, available: false, error: error.message, execution: { kind: 'unavailable', label: 'Indisponível' } };
@@ -1614,6 +1620,9 @@ class ApplicationController {
     }
     this._utteranceBuffer = "";
     this._utteranceDispatchInFlight = true;
+    if (speechService && typeof speechService.markLatencyEvent === "function") {
+      speechService.markLatencyEvent('dispatchAt');
+    }
 
     try {
       const sessionHistory = sessionManager.getOptimizedHistory();
@@ -2071,7 +2080,9 @@ class ApplicationController {
       whisperEngine: process.env.WHISPER_ENGINE || "whisper-cpp",
       whisperCommand: process.env.WHISPER_COMMAND || "",
       whisperModel: process.env.WHISPER_MODEL || "small",
-      whisperLanguage: process.env.WHISPER_LANGUAGE || "auto",
+      whisperLanguage: process.env.WHISPER_LANGUAGE || "pt",
+      whisperCaptureChunkSamples: process.env.WHISPER_CAPTURE_CHUNK_SAMPLES ||
+        speechService.getStatus().effectiveSettings.whisperCaptureChunkSamples || "2048",
       whisperDevice: process.env.WHISPER_DEVICE || "auto",
       whisperCaptureMode: process.env.WHISPER_CAPTURE_MODE ||
         (process.env.WHISPER_MANUAL_CAPTURE === "true" ? "manual" : "vad"),

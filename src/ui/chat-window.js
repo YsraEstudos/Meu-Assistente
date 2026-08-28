@@ -572,7 +572,7 @@ class ChatWindowUI {
         timeDiv.textContent = new Date().toLocaleTimeString();
         const textDiv = document.createElement('div');
         textDiv.className = 'message-text';
-        const escapedLang = (language || 'text').toUpperCase();
+        const escapedLang = this.escapeHtmlForSnippet((language || 'text').toUpperCase());
         const escapedCode = this.escapeHtmlForSnippet(code || '');
         textDiv.innerHTML = `
             <div style="font-size:12px;color:rgba(255,255,255,0.85);margin-bottom:6px;">Snippet: ${escapedLang}</div>

@@ -12,6 +12,13 @@ const logger = {
 };
 const MAX_CAPTURE_RESTART_ATTEMPTS = 3;
 
+function normalizeCaptureBufferSize(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return 2048;
+    const clamped = Math.max(512, Math.min(8192, Math.floor(parsed)));
+    return 2 ** Math.floor(Math.log2(clamped));
+}
+
 class MainWindowUI {
     constructor() {
         this.isInteractive = false;
@@ -1129,7 +1136,6 @@ class MainWindowUI {
                 this._audioPort = audioPort;
                 const source = audioContext.createMediaStreamSource(stream);
                 this._startMicMeter(audioContext, source, stream, generation);
-
                 if (await this._tryStartAudioWorkletCapture(audioContext, source, stream, generation)) {
                     this._startRendererCaptureWatchdog(generation);
                     if (audioContext.state === 'suspended') {
@@ -1143,7 +1149,25 @@ class MainWindowUI {
                     return;
                 }
 
-                const bufferSize = 2048;
+                let bufferSize = 2048;
+                try {
+                    const settings = window.electronAPI && window.electronAPI.getSettings
+                        ? await window.electronAPI.getSettings()
+                        : null;
+                    bufferSize = normalizeCaptureBufferSize(settings?.whisperCaptureChunkSamples);
+                } catch (error) {
+                    logger.debug('Using default renderer capture chunk size', {
+                        component: 'MainWindowUI',
+                        error: error.message
+                    });
+                }
+                if (!this.isRecording || generation !== this._captureGeneration) {
+                    logger.debug('Renderer audio capture settings load cancelled', {
+                        component: 'MainWindowUI',
+                        generation
+                    });
+                    return;
+                }
                 const scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
                 this._scriptNode = scriptNode;
 
