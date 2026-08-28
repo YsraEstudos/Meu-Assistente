@@ -24,7 +24,7 @@ class ContextBuilder {
     return prompt;
   }
 
-  build({ text, activeSkill = 'general', codingLanguage = null, historySnapshot = {}, systemPrompt = null, currentMessage = null } = {}) {
+  build({ text, activeSkill = 'general', codingLanguage = null, historySnapshot = {}, systemPrompt = null, currentMessage = null, historyIncludesCurrentMessage = true } = {}) {
     const cleanText = typeof text === 'string' ? text.trim() : '';
     if (!cleanText) throw new Error('ContextBuilder requires non-empty text');
 
@@ -39,7 +39,14 @@ class ContextBuilder {
     const boundedContextPrompt = this._truncateToTokens(contextPrompt, Math.max(1, maxTokens - 1));
     const currentInputBudget = Math.max(1, maxTokens - this._estimateTokens(boundedContextPrompt));
     const boundedCurrentInput = this._truncateToTokens(currentInput, currentInputBudget);
-    const history = this._fitHistory(source, boundedCurrentInput, maxTokens, boundedContextPrompt, '', cleanText);
+    const history = this._fitHistory(
+      source,
+      boundedCurrentInput,
+      maxTokens,
+      boundedContextPrompt,
+      '',
+      historyIncludesCurrentMessage ? cleanText : null
+    );
     const contents = history.map((event) => ({
       role: event.role === 'model' ? 'model' : 'user',
       parts: [{ text: event.content }]
@@ -62,7 +69,12 @@ class ContextBuilder {
 
   buildImageContext({ activeSkill = 'general', codingLanguage = null } = {}) {
     const prompt = this.getSkillPrompt(activeSkill, codingLanguage);
-    return { systemInstruction: prompt ? { parts: [{ text: prompt }] } : undefined, stats: { promptLength: prompt.length } };
+    const maxTokens = Number(config.get('performance.contextMaxTokens')) || DEFAULT_MAX_TOKENS;
+    const boundedPrompt = this._truncateToTokens(prompt, Math.max(1, maxTokens));
+    return {
+      systemInstruction: boundedPrompt ? { parts: [{ text: boundedPrompt }] } : undefined,
+      stats: { promptLength: boundedPrompt.length }
+    };
   }
 
   _getHistory(snapshot) {
@@ -92,7 +104,7 @@ class ContextBuilder {
     let used = 0;
     let duplicateIndex = -1;
     events.forEach((event, index) => {
-      if (event.content === dedupeText || event.content === currentInput) duplicateIndex = index;
+      if (dedupeText !== null && (event.content === dedupeText || event.content === currentInput)) duplicateIndex = index;
     });
     const candidates = events.filter((_event, index) => index !== duplicateIndex);
 

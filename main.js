@@ -1635,7 +1635,8 @@ class ApplicationController {
             delta
           });
           this.publishMobileResponseChunk({ messageId, delta });
-        }
+        },
+        false
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
 

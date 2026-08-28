@@ -90,6 +90,27 @@ function testOversizedCurrentMessageIsBounded() {
   assert(built.stats.currentMessageTokens < maxTokens * 2);
 }
 
+function testImageContextPromptRespectsTokenLimit() {
+  const originalGetSkillPrompt = contextBuilder.getSkillPrompt;
+  const maxTokens = Number(config.get('performance.contextMaxTokens')) || 8192;
+
+  try {
+    contextBuilder.getSkillPrompt = () => 'i'.repeat(maxTokens * 8);
+    const bounded = contextBuilder.buildImageContext({ activeSkill: 'general' });
+    const boundedText = bounded.systemInstruction.parts[0].text;
+
+    assert(contextBuilder._estimateTokens(boundedText) <= maxTokens);
+    assert.equal(bounded.stats.promptLength, boundedText.length);
+
+    contextBuilder.getSkillPrompt = () => '';
+    const empty = contextBuilder.buildImageContext({ activeSkill: 'general' });
+    assert.equal(empty.systemInstruction, undefined);
+    assert.equal(empty.stats.promptLength, 0);
+  } finally {
+    contextBuilder.getSkillPrompt = originalGetSkillPrompt;
+  }
+}
+
 function testRepeatedPromptKeepsOlderHistory() {
   const built = contextBuilder.build({
     text: 'same current text',
@@ -100,6 +121,24 @@ function testRepeatedPromptKeepsOlderHistory() {
         { role: 'user', content: 'same current text' },
         { role: 'model', content: 'older answer' },
         { role: 'user', content: 'same current text' }
+      ]
+    }
+  });
+
+  assert.equal(built.stats.historyEvents, 2);
+  assert.deepEqual(built.contents.map((item) => item.role), ['user', 'model', 'user']);
+}
+
+function testVoiceHistoryDoesNotDedupeBeforePersistence() {
+  const built = contextBuilder.build({
+    text: 'repeat current text',
+    systemPrompt: 'short system prompt',
+    currentMessage: 'wrapped current text',
+    historyIncludesCurrentMessage: false,
+    historySnapshot: {
+      conversation: [
+        { role: 'user', content: 'repeat current text' },
+        { role: 'model', content: 'older answer' }
       ]
     }
   });
@@ -179,6 +218,40 @@ function testUnsupportedSamplingControlsWarnOnce() {
   });
   const output = `${result.stdout}\n${result.stderr}`;
   assert.equal((output.match(/Ignoring unsupported Gemini sampling controls/g) || []).length, 1);
+}
+
+function testGenerationSettingsAdaptPerModel() {
+  const originalModel = llmService.model;
+  const originalWarnings = llmService._unsupportedGenerationWarnings;
+
+  try {
+    llmService.model = 'gemini-3.6-flash';
+    llmService._unsupportedGenerationWarnings = new Set();
+    const request = { contents: [] };
+    llmService.applyGenerationDefaults(request, {
+      temperature: 0.2,
+      thinkingConfig: { thinkingLevel: 'low' }
+    });
+
+    const modern = llmService._getGenerationConfigForModel(request, 'gemini-3.6-flash');
+    const fallback = llmService._getGenerationConfigForModel(request, 'gemini-2.5-flash-lite');
+
+    assert.equal(modern.temperature, undefined);
+    assert.equal(modern.thinkingConfig.thinkingLevel, 'low');
+    assert.equal(fallback.temperature, 0.2);
+    assert.equal(fallback.thinkingConfig.thinkingBudget, 1024);
+    assert.equal(fallback.thinkingConfig.thinkingLevel, undefined);
+  } finally {
+    llmService.model = originalModel;
+    llmService._unsupportedGenerationWarnings = originalWarnings;
+  }
+}
+
+function testModelAttemptsRebuildGenerationConfig() {
+  const source = fs.readFileSync(path.resolve(__dirname, '..', 'src/services/llm.service.js'), 'utf8');
+
+  assert(source.includes('this._getGenerationConfigForModel(geminiRequest, modelName)'));
+  assert(source.includes('this.getGenerationConfig(generationOverrides, modelName)'));
 }
 
 class FakeElement {
@@ -286,11 +359,15 @@ const tests = [
   testHistoryTruncationPreservesCompleteTurn,
   testWrappedCurrentMessageUsesItsActualBudget,
   testOversizedCurrentMessageIsBounded,
+  testImageContextPromptRespectsTokenLimit,
   testRepeatedPromptKeepsOlderHistory,
+  testVoiceHistoryDoesNotDedupeBeforePersistence,
   testSnapshotStartsWithCompleteUserTurn,
   testAsrMarkersInsideTextAreNeutralized,
   testAsrMarkersUseFreshPerCallNonce,
   testUnsupportedSamplingControlsWarnOnce,
+  testGenerationSettingsAdaptPerModel,
+  testModelAttemptsRebuildGenerationConfig,
   testStreamingFinalizeCancelsFallbackTimer,
   testStreamingChecksScrollPositionAtRenderTime,
   testTerminalEventsReachHiddenWindowsAndErrorsCarryIds
