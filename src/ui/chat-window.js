@@ -164,6 +164,8 @@ class ChatWindowUI {
             });
             
             window.electronAPI.onLlmError((event, data) => {
+                if (data?.messageId && (this._canonicalStreamIds.has(data.messageId) ||
+                    this._completedCanonicalIds.has(data.messageId))) return;
                 this.addMessage(`LLM Error: ${data.error}`, 'error');
             });
             

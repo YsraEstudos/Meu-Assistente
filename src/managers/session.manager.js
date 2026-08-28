@@ -197,9 +197,15 @@ class SessionManager {
    */
   getConversationHistory(maxEntries = 20) {
     // Get recent conversation events (excluding system initialization)
-    const conversationEvents = this.sessionMemory
+    let conversationEvents = this.sessionMemory
       .filter(event => event.role !== 'system' || !event.metadata?.isInitialization)
       .slice(-maxEntries);
+
+    // A bounded slice can start on a model response when it cuts through a
+    // completed user/model turn. Drop that orphaned response from context.
+    if (conversationEvents[0]?.role === 'model') {
+      conversationEvents = conversationEvents.slice(1);
+    }
     
     return conversationEvents.map(event => ({
       role: event.role,

@@ -36,23 +36,26 @@ class ContextBuilder {
       ? `${prompt}\n\nCOMPACT SESSION SUMMARY:\n${summary}`
       : prompt;
     const currentInput = currentMessage == null ? this._formatUserMessage(cleanText, activeSkill) : String(currentMessage);
-    const history = this._fitHistory(source, currentInput, maxTokens, contextPrompt, '', cleanText);
+    const boundedContextPrompt = this._truncateToTokens(contextPrompt, Math.max(1, maxTokens - 1));
+    const currentInputBudget = Math.max(1, maxTokens - this._estimateTokens(boundedContextPrompt));
+    const boundedCurrentInput = this._truncateToTokens(currentInput, currentInputBudget);
+    const history = this._fitHistory(source, boundedCurrentInput, maxTokens, boundedContextPrompt, '', cleanText);
     const contents = history.map((event) => ({
       role: event.role === 'model' ? 'model' : 'user',
       parts: [{ text: event.content }]
     }));
-    contents.push({ role: 'user', parts: [{ text: currentInput }] });
+    contents.push({ role: 'user', parts: [{ text: boundedCurrentInput }] });
 
     return {
-      systemInstruction: contextPrompt ? { parts: [{ text: contextPrompt }] } : undefined,
+      systemInstruction: boundedContextPrompt ? { parts: [{ text: boundedContextPrompt }] } : undefined,
       contents,
       stats: {
         maxTokens,
-        contextTokens: this._estimateTokens(contextPrompt) + contents.reduce((total, item) => total + this._estimateTokens(item.parts[0].text), 0),
+        contextTokens: this._estimateTokens(boundedContextPrompt) + contents.reduce((total, item) => total + this._estimateTokens(item.parts[0].text), 0),
         historyEvents: history.length,
         omittedEvents: Math.max(0, source.length - history.length),
         hasSummary: Boolean(summary),
-        currentMessageTokens: this._estimateTokens(currentInput)
+        currentMessageTokens: this._estimateTokens(boundedCurrentInput)
       }
     };
   }
@@ -84,10 +87,14 @@ class ContextBuilder {
   }
 
   _fitHistory(events, currentInput, maxTokens, prompt, summary, dedupeText = currentInput) {
-    const budget = Math.max(32, maxTokens - this._estimateTokens(currentInput) - this._estimateTokens(prompt) - this._estimateTokens(summary));
+    const budget = Math.max(0, maxTokens - this._estimateTokens(currentInput) - this._estimateTokens(prompt) - this._estimateTokens(summary));
     const selected = [];
     let used = 0;
-    const candidates = events.filter((event) => event.content !== dedupeText && event.content !== currentInput);
+    let duplicateIndex = -1;
+    events.forEach((event, index) => {
+      if (event.content === dedupeText || event.content === currentInput) duplicateIndex = index;
+    });
+    const candidates = events.filter((_event, index) => index !== duplicateIndex);
 
     for (let index = candidates.length - 1; index >= 0;) {
       const event = candidates[index];
@@ -98,13 +105,14 @@ class ContextBuilder {
       if (used > 0 && used + cost > budget) break;
       if (used === 0 && cost > budget) {
         if (group.length === 2) {
+          if (budget < 2) break;
           const firstBudget = Math.max(1, Math.floor(budget / 2));
           const secondBudget = Math.max(1, budget - firstBudget);
           selected.unshift(
             { ...group[0], content: this._truncateToTokens(group[0].content, firstBudget) },
             { ...group[1], content: this._truncateToTokens(group[1].content, secondBudget) }
           );
-        } else {
+        } else if (budget > 0) {
           const latest = group[group.length - 1];
           selected.unshift({ ...latest, content: this._truncateToTokens(latest.content, budget) });
         }
