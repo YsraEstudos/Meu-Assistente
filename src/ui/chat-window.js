@@ -484,7 +484,7 @@ class ChatWindowUI {
             textDiv,
             buffer: '',
             frame: null,
-            shouldAutoScroll: this.isChatAtBottom()
+            frameType: null
         });
         this.elements.chatMessages.scrollTop = this.elements.chatMessages.scrollHeight;
     }
@@ -495,18 +495,21 @@ class ChatWindowUI {
         const state = this._streamStates.get(messageId);
         if (!state) return;
         state.buffer += String(delta);
-        state.shouldAutoScroll = this.isChatAtBottom();
         if (state.frame != null) return;
 
         const render = () => {
             state.frame = null;
             if (!this._streamStates.has(messageId)) return;
+            const shouldAutoScroll = this.isChatAtBottom();
             state.textDiv.textContent = state.buffer;
-            if (state.shouldAutoScroll) {
+            if (shouldAutoScroll) {
                 this.elements.chatMessages.scrollTop = this.elements.chatMessages.scrollHeight;
             }
         };
-        state.frame = typeof requestAnimationFrame === 'function'
+        const canCancelAnimationFrame = typeof requestAnimationFrame === 'function' &&
+            typeof cancelAnimationFrame === 'function';
+        state.frameType = canCancelAnimationFrame ? 'animation-frame' : 'timeout';
+        state.frame = canCancelAnimationFrame
             ? requestAnimationFrame(render)
             : setTimeout(render, 16);
     }
@@ -521,7 +524,11 @@ class ChatWindowUI {
     finalizeStreamingResponse(messageId, response) {
         const state = messageId && this._streamStates.get(messageId);
         if (state) {
-            if (state.frame != null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(state.frame);
+            if (state.frame != null) {
+                if (state.frameType === 'animation-frame') cancelAnimationFrame(state.frame);
+                else clearTimeout(state.frame);
+                state.frame = null;
+            }
             state.messageDiv.remove();
             this._streamStates.delete(messageId);
         }
