@@ -113,6 +113,7 @@ const llmService = require("./src/services/llm.service");
 const windowManager = require("./src/managers/window.manager");
 const sessionManager = require("./src/managers/session.manager");
 const MobileSyncService = require("./src/services/mobile-sync.service");
+const ResponseStream = require("./src/services/response-stream");
 const performanceTracker = require("./src/core/performance");
 
 class ApplicationController {
@@ -125,6 +126,7 @@ class ApplicationController {
     this.speechAvailable = false;
     this._speechInitializationTimer = null;
     this.mobileSync = new MobileSyncService({ logger });
+    this.responseStream = new ResponseStream();
 
     // Voice fragments are display-only until the recording session reaches its
     // final transcription barrier. The LLM receives one consolidated message.
