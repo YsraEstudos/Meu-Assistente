@@ -11,11 +11,6 @@ document.addEventListener('DOMContentLoaded', () => {
         return 'openai';
     };
 
-    const validateWhisperModelName = (value) => {
-        if (value === '') return true;
-        return /^[a-zA-Z0-9._-]{1,64}$/.test(value) && !value.includes('..');
-    };
-
     // Get DOM elements
     const closeButton = document.getElementById('closeButton');
     const quitButton = document.getElementById('quitButton');
@@ -37,8 +32,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const whisperResponseTargetSelect = document.getElementById('whisperResponseTarget');
     const whisperSegmentMsInput = document.getElementById('whisperSegmentMs');
     const geminiKeyInput = document.getElementById('geminiKey');
-    const geminiModelSelect = document.getElementById('geminiModel');
-    const geminiThinkingLevelSelect = document.getElementById('geminiThinkingLevel');
     const windowGapInput = document.getElementById('windowGap');
     const codingLanguageSelect = document.getElementById('codingLanguage');
     const activeSkillSelect = document.getElementById('activeSkill');
@@ -117,8 +110,6 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperResponseTargetSelect) whisperResponseTargetSelect.value = settings.whisperResponseTarget || 'both';
         if (whisperSegmentMsInput) whisperSegmentMsInput.value = settings.whisperSegmentMs || '';
         if (geminiKeyInput) geminiKeyInput.value = settings.geminiKey || '';
-        if (geminiModelSelect) geminiModelSelect.value = settings.geminiModel || 'gemini-3.6-flash';
-        if (geminiThinkingLevelSelect) geminiThinkingLevelSelect.value = settings.geminiThinkingLevel || 'medium';
         if (windowGapInput) windowGapInput.value = settings.windowGap || '';
 
         // Set C++ as default if no coding language is specified
@@ -178,24 +169,13 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperCppThreadsInput) settings.whisperCppThreads = whisperCppThreadsInput.value;
         if (whisperCppBlasSelect) settings.whisperCppBlas = whisperCppBlasSelect.value;
         if (whisperCppBackendSelect) settings.whisperCppBackend = whisperCppBackendSelect.value;
-        if (whisperModelInput) {
-            const whisperModelValue = whisperModelInput.value;
-            if (whisperModelValue && !validateWhisperModelName(whisperModelValue)) {
-                console.warn('[SettingsWindowUI] Invalid whisper model name, skipping persist:', whisperModelValue);
-                whisperModelInput.style.borderColor = 'red';
-            } else {
-                whisperModelInput.style.borderColor = '';
-                if (whisperModelValue) settings.whisperModel = whisperModelValue;
-            }
-        }
+        if (whisperModelInput) settings.whisperModel = whisperModelInput.value;
         if (whisperLanguageInput) settings.whisperLanguage = whisperLanguageInput.value;
         if (whisperDeviceSelect) settings.whisperDevice = whisperDeviceSelect.value;
         if (whisperCaptureModeSelect) settings.whisperCaptureMode = whisperCaptureModeSelect.value;
         if (whisperResponseTargetSelect) settings.whisperResponseTarget = whisperResponseTargetSelect.value;
         if (whisperSegmentMsInput) settings.whisperSegmentMs = whisperSegmentMsInput.value;
         if (geminiKeyInput) settings.geminiKey = geminiKeyInput.value;
-        if (geminiModelSelect) settings.geminiModel = geminiModelSelect.value;
-        if (geminiThinkingLevelSelect) settings.geminiThinkingLevel = geminiThinkingLevelSelect.value;
         if (windowGapInput) settings.windowGap = windowGapInput.value;
         if (codingLanguageSelect) settings.codingLanguage = codingLanguageSelect.value;
         if (activeSkillSelect) settings.activeSkill = activeSkillSelect.value;
@@ -269,8 +249,6 @@ document.addEventListener('DOMContentLoaded', () => {
         whisperResponseTargetSelect,
         whisperSegmentMsInput,
         geminiKeyInput,
-        geminiModelSelect,
-        geminiThinkingLevelSelect,
         windowGapInput
     ];
 
@@ -280,15 +258,6 @@ document.addEventListener('DOMContentLoaded', () => {
             input.addEventListener('blur', saveSettings);
         }
     });
-
-    if (whisperModelInput) {
-        const updateWhisperModelValidation = () => {
-            const value = whisperModelInput.value;
-            whisperModelInput.style.borderColor = value && !validateWhisperModelName(value) ? 'red' : '';
-        };
-        whisperModelInput.addEventListener('input', updateWhisperModelValidation);
-        whisperModelInput.addEventListener('blur', updateWhisperModelValidation);
-    }
 
     if (speechProviderSelect) {
         speechProviderSelect.addEventListener('change', () => {

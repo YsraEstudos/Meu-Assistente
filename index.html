@@ -9,18 +9,14 @@
       body {
         margin: 0;
         padding: 0;
-        width: max-content;
-        min-width: max-content;
+        width: fit-content;
         height: fit-content;
         background: transparent;
         -webkit-app-region: no-drag;
       }
 
-      .command-tab {
-        box-sizing: border-box;
+  .command-tab {
         height: 28px;
-        width: max-content;
-        min-width: max-content;
         background: linear-gradient(
           135deg,
           rgba(0, 0, 0, 0.4) 0%,
@@ -40,10 +36,12 @@
         flex-wrap: nowrap;
         overflow: visible;
         border: 1px solid rgba(255, 255, 255, 0.15);
+  width: 100%;
+  /* Allow horizontal collapse to approximately one icon's width */
+  min-width: 60px;
       }
 
       .command-item {
-        box-sizing: border-box;
         display: flex;
         align-items: center;
         gap: 8px;
@@ -54,8 +52,8 @@
         cursor: pointer;
         transition: all 0.2s ease;
         -webkit-app-region: no-drag;
-        flex: 0 0 auto;
-        white-space: nowrap;
+  /* Allow items to shrink so the bar can collapse to one icon width */
+  flex-shrink: 1;
       }
 
       .command-item:hover {
@@ -70,7 +68,6 @@
       .command-item span {
         color: rgba(255, 255, 255, 0.6);
         font-size: 11px;
-        white-space: nowrap;
       }
 
       .command-item.recording i {
@@ -93,8 +90,6 @@
       #infoButton {
         width: 26px;
         height: 26px;
-        min-width: 26px;
-        flex: 0 0 26px;
         border-radius: 9999px;
         display: inline-flex;
         align-items: center;
@@ -111,8 +106,6 @@
       #whisperStatusButton {
         width: 26px;
         height: 26px;
-        min-width: 26px;
-        flex: 0 0 26px;
         border-radius: 9999px;
         display: inline-flex;
         align-items: center;
@@ -343,7 +336,6 @@
       }
 
       .command-item select {
-        flex: 0 0 auto;
         background: linear-gradient(135deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.05) 100%);
         border: 1px solid rgba(255, 255, 255, 0.2);
         border-radius: 4px;
