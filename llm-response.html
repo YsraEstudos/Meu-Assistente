@@ -475,6 +475,8 @@
         let isInteractive = false;
         let scrollableElements = [];
         let initialized = false;
+        let streamingMessageId = null;
+        let streamingResponse = '';
         
         // Immediate logging to verify script execution
         console.log('[LLM-RESPONSE] Script tag executed');
@@ -531,6 +533,42 @@
                 window.electronAPI.onShowLoading(() => {
                     console.log('[LLM-RESPONSE] show-loading received');
                     showLoadingState();
+                });
+
+                window.electronAPI.onResponseStart?.((_event, data) => {
+                    if (!data || !data.messageId) return;
+                    streamingMessageId = data.messageId;
+                    streamingResponse = '';
+                    showLoadingState();
+                });
+
+                window.electronAPI.onResponseDelta?.((_event, data) => {
+                    if (!data || !data.messageId) return;
+                    if (streamingMessageId !== data.messageId) {
+                        streamingMessageId = data.messageId;
+                        streamingResponse = '';
+                    }
+                    streamingResponse += data.delta || '';
+                    displayStreamingResponse(streamingResponse);
+                });
+
+                window.electronAPI.onResponseEnd?.((_event, data) => {
+                    if (!data || !data.messageId) return;
+                    streamingMessageId = null;
+                    streamingResponse = '';
+                    hideLoadingState();
+                    if (data.response) {
+                        displayResponse({ response: data.response });
+                        setupScrolling();
+                    }
+                });
+
+                window.electronAPI.onResponseError?.((_event, data) => {
+                    if (!data || !data.messageId) return;
+                    streamingMessageId = null;
+                    streamingResponse = '';
+                    hideLoadingState();
+                    displayStreamingResponse(`LLM Error: ${data.error || 'stream failed'}`);
                 });
                 
                 // Listen for LLM response
@@ -600,6 +638,20 @@
             } else {
                 console.error('Loading element not found!');
             }
+        }
+
+        function displayStreamingResponse(response) {
+            hideLoadingState();
+            const responseElement = document.getElementById('response-content');
+            const splitLayout = document.getElementById('split-layout');
+            const fullContent = document.getElementById('full-content');
+            const fullMarkdown = document.getElementById('full-markdown');
+            if (!responseElement || !splitLayout || !fullContent || !fullMarkdown) return;
+
+            responseElement.classList.remove('hidden');
+            splitLayout.classList.add('hidden');
+            fullContent.classList.remove('hidden');
+            fullMarkdown.textContent = response || '';
         }
 
         function renderMarkdown(text) {

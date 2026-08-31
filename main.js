@@ -127,7 +127,10 @@ class ApplicationController {
   this.codingLanguage = "cpp";
     this.speechAvailable = false;
     this._speechInitializationTimer = null;
-    this.mobileSync = new MobileSyncService({ logger });
+    this.mobileSync = new MobileSyncService({
+      logger,
+      bindHost: config.get("mobileSync.bindHost")
+    });
     this.responseStream = new ResponseStream();
     this._startupTrace = performanceTracker.begin("app-start");
 
@@ -553,7 +556,6 @@ class ApplicationController {
         });
       }
       this._audioIpcStats = null;
-    this._audioPorts = new Set();
       this._audioChunkWindow = { count: 0, bytes: 0, resetAt: Date.now() + 1000, dropped: 0 };
       // This is the only point where voice text may reach the LLM. The speech
       // service emits it only after the active segment and consolidated tail
@@ -740,7 +742,7 @@ class ApplicationController {
     if (len > 2 * 1024 * 1024) {
       logger.warn('Oversized audio chunk rejected', { length: len });
       speechService.recordAudioChunk?.(len, true);
-      return;
+      return false;
     }
 
     const now = Date.now();
@@ -755,9 +757,10 @@ class ApplicationController {
       }
       this._audioChunkWindow.dropped += 1;
       speechService.recordAudioChunk?.(len, true);
-      return;
+      return false;
     }
     this.handleRendererAudioPayload(rawBuffer);
+    return true;
   }
 
   closeAudioPorts() {
@@ -836,22 +839,41 @@ class ApplicationController {
     // serialization copy; audio-chunk remains the compatibility fallback.
     ipcMain.on("audio-port", (event) => {
       const port = event.ports && event.ports[0];
+      if (!this._isAllowedRenderer(event, ['main'])) {
+        try { port?.close(); } catch (_) { /* best effort */ }
+        logger.warn('Rejected audio transport from unauthorized renderer');
+        return;
+      }
       if (!port || typeof port.on !== 'function') return;
       this._audioPorts.add(port);
       port.on('message', (messageEvent) => {
-        const buf = messageEvent && messageEvent.data && messageEvent.data.buffer;
-        this._handleBoundedRendererAudioPayload(buf);
+        const data = messageEvent && messageEvent.data;
+        const accepted = this._handleBoundedRendererAudioPayload(data && data.buffer);
+        if (data && data.flushId) {
+          try {
+            port.postMessage({
+              type: 'audio-tail-accepted',
+              flushId: data.flushId,
+              accepted
+            });
+          } catch (_) { /* renderer timeout remains the fallback */ }
+        }
       });
       port.on('close', () => this._audioPorts.delete(port));
       if (typeof port.start === 'function') port.start();
     });
 
-    ipcMain.on("audio-chunk", (_event, data) => {
+    ipcMain.on("audio-chunk", (event, data) => {
+      if (!this._isAllowedRenderer(event, ['main'])) {
+        logger.warn('Rejected audio chunk from unauthorized renderer');
+        return;
+      }
       const buf = data && data.buffer;
       this._handleBoundedRendererAudioPayload(buf);
     });
 
-    ipcMain.on("speech-capture-drained", () => {
+    ipcMain.on("speech-capture-drained", (event) => {
+      if (!this._isAllowedRenderer(event, ['main'])) return;
       speechService.confirmRendererCaptureStopped();
     });
 

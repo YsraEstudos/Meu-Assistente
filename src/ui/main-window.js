@@ -11,6 +11,7 @@ const logger = {
     warn: (...args) => console.warn('[MainWindowUI WARN]', ...args)
 };
 const MAX_CAPTURE_RESTART_ATTEMPTS = 3;
+const AUDIO_TAIL_ACK_TIMEOUT_MS = 500;
 
 function normalizeCaptureBufferSize(value) {
     const parsed = Number(value);
@@ -46,10 +47,13 @@ class MainWindowUI {
         this._captureStatsTimer = null;
         this._captureStartPromise = null;
         this._captureRestartPromise = null;
+        this._captureStopPromise = null;
         this._captureGeneration = 0;
         this._captureRestartCount = 0;
         this._captureStats = null;
         this._audioPort = null;
+        this._audioWorkletFlushState = null;
+        this._audioTailSequence = 0;
         this._resizeTimer = null;
         this._lastWindowSize = null;
         
@@ -449,15 +453,18 @@ class MainWindowUI {
                     this._lastWindowSize.height === height) {
                     return;
                 }
-                this._lastWindowSize = { width, height };
-
                 logger.debug('Resizing window to content', {
                     width,
                     height,
                     component: 'MainWindowUI'
                 });
 
-                Promise.resolve(window.electronAPI.resizeWindow(width, height)).catch((error) => {
+                Promise.resolve(window.electronAPI.resizeWindow(width, height)).then((result) => {
+                    if (result && result.success === false) {
+                        throw new Error(result.error || 'Main process rejected window resize');
+                    }
+                    this._lastWindowSize = { width, height };
+                }).catch((error) => {
                     logger.warn('Failed to resize main window', {
                         component: 'MainWindowUI',
                         error: error.message
@@ -547,7 +554,7 @@ class MainWindowUI {
                         if (status.isRecording && !this.isRecording) {
                             this.handleRecordingStarted();
                         } else if (!status.isRecording && this.isRecording) {
-                            this.handleRecordingStopped();
+                            await this.handleRecordingStopped();
                         }
                     }
                 } catch (error) {
@@ -555,7 +562,7 @@ class MainWindowUI {
                         component: 'MainWindowUI',
                         error: error.message
                     });
-                    this.handleRecordingStopped();
+                    await this.handleRecordingStopped();
                 } finally {
                     this._micTogglePending = false;
                     this.updateMicButtonState();
@@ -701,17 +708,17 @@ class MainWindowUI {
                 this.handleRecordingStarted();
             });
 
-            window.electronAPI.onRecordingCaptureStopped(() => {
+            window.electronAPI.onRecordingCaptureStopped(async () => {
                 this._isTranscribing = true;
-                this.handleRecordingStopped();
+                await this.handleRecordingStopped();
                 if (window.electronAPI.confirmAudioCaptureStopped) {
                     window.electronAPI.confirmAudioCaptureStopped();
                 }
             });
 
-            window.electronAPI.onRecordingStopped(() => {
+            window.electronAPI.onRecordingStopped(async () => {
                 this._isTranscribing = false;
-                this.handleRecordingStopped();
+                await this.handleRecordingStopped();
             });
 
             window.electronAPI.onTranscriptionProgress((_event, progress) => {
@@ -985,12 +992,12 @@ class MainWindowUI {
         this.updateMicButtonState();
     }
 
-    handleRecordingStopped() {
+    async handleRecordingStopped() {
         this.isRecording = false;
         if (this.micButton) {
             this.micButton.classList.remove('recording');
         }
-        this._stopRendererAudioCapture();
+        await this._stopRendererAudioCapture();
         this.updateMicButtonState();
         logger.debug('Recording stopped', { component: 'MainWindowUI' });
     }
@@ -1127,6 +1134,11 @@ class MainWindowUI {
                 try {
                     if (window.electronAPI.openAudioTransport) {
                         audioPort = window.electronAPI.openAudioTransport();
+                        if (audioPort) {
+                            audioPort.onmessage = (event) => {
+                                this._handleAudioTransportMessage(event && event.data);
+                            };
+                        }
                         if (audioPort && typeof audioPort.start === 'function') audioPort.start();
                     }
                 } catch (error) {
@@ -1136,7 +1148,15 @@ class MainWindowUI {
                 this._audioPort = audioPort;
                 const source = audioContext.createMediaStreamSource(stream);
                 this._startMicMeter(audioContext, source, stream, generation);
-                if (await this._tryStartAudioWorkletCapture(audioContext, source, stream, generation)) {
+                const workletStarted = await this._tryStartAudioWorkletCapture(audioContext, source, stream, generation);
+                if (!this.isRecording || generation !== this._captureGeneration) {
+                    logger.debug('Renderer audio capture worklet start cancelled', {
+                        component: 'MainWindowUI',
+                        generation
+                    });
+                    return;
+                }
+                if (workletStarted) {
                     this._startRendererCaptureWatchdog(generation);
                     if (audioContext.state === 'suspended') {
                         await audioContext.resume();
@@ -1250,8 +1270,8 @@ class MainWindowUI {
         return startPromise;
     }
 
-    _sendRendererAudioBuffer(rawBuffer, generation) {
-        if (!this.isRecording || generation !== this._captureGeneration ||
+    _sendRendererAudioBuffer(rawBuffer, generation, { allowStopped = false, flushId = null } = {}) {
+        if ((!this.isRecording && !allowStopped) || generation !== this._captureGeneration ||
             !window.electronAPI || (!this._audioPort && !window.electronAPI.sendAudioChunk)) {
             return false;
         }
@@ -1274,7 +1294,7 @@ class MainWindowUI {
 
         try {
             if (this._audioPort && typeof this._audioPort.postMessage === 'function') {
-                this._audioPort.postMessage({ buffer }, [buffer]);
+                this._audioPort.postMessage(flushId ? { buffer, flushId } : { buffer }, [buffer]);
             } else {
                 window.electronAPI.sendAudioChunk(buffer);
             }
@@ -1288,6 +1308,54 @@ class MainWindowUI {
         }
     }
 
+    _handleAudioTransportMessage(payload) {
+        const state = this._audioWorkletFlushState;
+        if (!state || !payload || payload.type !== 'audio-tail-accepted' ||
+            payload.flushId !== state.flushId) {
+            return;
+        }
+        state.mainAck = true;
+        if (payload.accepted === false) {
+            logger.warn('Main process rejected final renderer audio tail', {
+                component: 'MainWindowUI',
+                generation: state.generation
+            });
+        }
+        this._completeAudioWorkletFlushIfReady();
+    }
+
+    _handleAudioWorkletMessage(payload, generation) {
+        if (payload && payload.type === 'flush-complete') {
+            const state = this._audioWorkletFlushState;
+            if (state && state.generation === generation) {
+                state.workletDone = true;
+                this._completeAudioWorkletFlushIfReady();
+            }
+            return;
+        }
+        if (payload && payload.type === 'audio-tail') {
+            const state = this._audioWorkletFlushState;
+            const waitsForMainAck = Boolean(state && state.generation === generation && this._audioPort);
+            if (waitsForMainAck) state.waitingMainAck = true;
+            const sent = this._sendRendererAudioBuffer(payload.buffer, generation, {
+                allowStopped: true,
+                flushId: waitsForMainAck ? state.flushId : null
+            });
+            if (waitsForMainAck && !sent) {
+                state.waitingMainAck = false;
+            }
+            return;
+        }
+        this._sendRendererAudioBuffer(payload, generation);
+    }
+
+    _completeAudioWorkletFlushIfReady() {
+        const state = this._audioWorkletFlushState;
+        if (state && state.workletDone && (!state.waitingMainAck || state.mainAck)) {
+            state.finish();
+        }
+    }
+
     async _tryStartAudioWorkletCapture(audioContext, source, stream, generation) {
         const AudioWorkletNodeClass = window.AudioWorkletNode;
         if (!audioContext.audioWorklet || typeof AudioWorkletNodeClass !== 'function') {
@@ -1298,6 +1366,9 @@ class MainWindowUI {
         try {
             const moduleUrl = new URL('./src/ui/audio-capture.worklet.js', document.baseURI).href;
             await audioContext.audioWorklet.addModule(moduleUrl);
+            if (!this.isRecording || generation !== this._captureGeneration) {
+                return false;
+            }
             workletNode = new AudioWorkletNodeClass(audioContext, 'opencluely-audio-capture', {
                 numberOfInputs: 1,
                 numberOfOutputs: 1,
@@ -1305,7 +1376,7 @@ class MainWindowUI {
                 processorOptions: { bufferSize: 2048 }
             });
             workletNode.port.onmessage = (event) => {
-                this._sendRendererAudioBuffer(event && event.data, generation);
+                this._handleAudioWorkletMessage(event && event.data, generation);
             };
             workletNode.port.onmessageerror = () => {
                 logger.debug('AudioWorklet message error', { component: 'MainWindowUI', generation });
@@ -1440,13 +1511,13 @@ class MainWindowUI {
                     error: error.message
                 });
             }
-            this.handleRecordingStopped();
+            await this.handleRecordingStopped();
             return;
         }
         const restartPromise = (async () => {
             this._captureRestartCount += 1;
             logger.debug('Restarting renderer audio capture', { component: 'MainWindowUI', reason, restartCount: this._captureRestartCount });
-            this._stopRendererAudioCapture();
+            await this._stopRendererAudioCapture();
             if (this.isRecording) {
                 await this._startRendererAudioCapture();
             }
@@ -1464,8 +1535,55 @@ class MainWindowUI {
         return restartPromise;
     }
 
+    _flushAudioWorkletTail() {
+        const workletNode = this._audioWorkletNode;
+        if (!workletNode || !workletNode.port) {
+            return Promise.resolve();
+        }
+
+        return new Promise((resolve) => {
+            let settled = false;
+            const timeout = setTimeout(() => finish(), AUDIO_TAIL_ACK_TIMEOUT_MS);
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                if (this._audioWorkletFlushState && this._audioWorkletFlushState.finish === finish) {
+                    this._audioWorkletFlushState = null;
+                }
+                resolve();
+            };
+            this._audioWorkletFlushState = {
+                flushId: `tail-${this._captureGeneration}-${++this._audioTailSequence}`,
+                generation: this._captureGeneration,
+                workletDone: false,
+                waitingMainAck: false,
+                mainAck: false,
+                finish
+            };
+            try {
+                workletNode.port.postMessage({ type: 'flush' });
+            } catch (_) {
+                finish();
+            }
+        });
+    }
+
     _stopRendererAudioCapture() {
-        this._captureGeneration += 1;
+        if (this._captureStopPromise) {
+            return this._captureStopPromise;
+        }
+        const stopPromise = this._performStopRendererAudioCapture();
+        this._captureStopPromise = stopPromise;
+        stopPromise.finally(() => {
+            if (this._captureStopPromise === stopPromise) {
+                this._captureStopPromise = null;
+            }
+        });
+        return stopPromise;
+    }
+
+    async _performStopRendererAudioCapture() {
         this._stopMicMeter();
         if (this._captureWatchdog) {
             clearInterval(this._captureWatchdog);
@@ -1477,7 +1595,10 @@ class MainWindowUI {
         }
         this._captureStartPromise = null;
         try {
+            await this._flushAudioWorkletTail();
+            this._captureGeneration += 1;
             if (this._audioPort) {
+                this._audioPort.onmessage = null;
                 try { this._audioPort.close(); } catch (_) { /* best effort */ }
                 this._audioPort = null;
             }
@@ -1488,6 +1609,7 @@ class MainWindowUI {
                 this._audioWorkletNode.disconnect();
                 this._audioWorkletNode = null;
             }
+            this._audioWorkletFlushState = null;
             if (this._scriptNode) {
                 this._scriptNode.disconnect();
                 this._scriptNode.onaudioprocess = null;
@@ -1607,6 +1729,7 @@ class MainWindowUI {
             window.electronAPI.updateActiveSkill(newSkill).then((result) => {
                 if (result && result.success === false) return;
                 this.handleSkillActivated(result && result.skill || newSkill);
+                this.showSkillChangeNotification(newSkill, direction);
                 logger.info('Skill navigation completed', {
                     component: 'MainWindowUI',
                     newSkill,
@@ -1620,10 +1743,8 @@ class MainWindowUI {
             });
         } else {
             this.handleSkillActivated(newSkill);
+            this.showSkillChangeNotification(newSkill, direction);
         }
-        
-        // Show visual feedback
-        this.showSkillChangeNotification(newSkill, direction);
     }
 
     showSkillChangeNotification(skill, direction) {
