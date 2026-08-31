@@ -21,7 +21,7 @@
     "test:gpu": "node scripts/test-gpu-regression.js",
     "test:gpu:build": "node scripts/test-gpu-regression.js --target build",
     "test:review-fixes": "node scripts/test-pr-review-fixes.js",
-    "test:all": "npm run test-speech-finalization && npm run test:gpu && npm run test:security && npm run test:audio-session && npm run test:review-fixes && npm run test:context-review-fixes && npm run test:audio-meter",
+    "test:all": "npm run test-speech-finalization && npm run test:gpu && npm run test:security && npm run test:audio-session && npm run test:review-fixes && npm run test:context-review-fixes && npm run test:audio-meter && npm run test:ui-config",
     "test:build:win": "npm run test-speech-finalization && npm run test:security && npm run test:audio-session && npm run test:review-fixes && npm run test:context-review-fixes && npm run test:audio-meter",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",

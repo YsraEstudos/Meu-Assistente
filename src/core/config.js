@@ -64,6 +64,8 @@ class ConfigManager {
       llm: {
         gemini: {
           model: configuredGeminiModel,
+          supportedModels: supportedGeminiModels,
+          supportedThinkingLevels,
           fallbackModels: supportedGeminiModels.filter((model) => model !== configuredGeminiModel),
           maxRetries: 3,
           timeout: 30000,

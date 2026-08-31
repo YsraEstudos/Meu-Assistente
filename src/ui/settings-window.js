@@ -179,13 +179,13 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperCppBlasSelect) settings.whisperCppBlas = whisperCppBlasSelect.value;
         if (whisperCppBackendSelect) settings.whisperCppBackend = whisperCppBackendSelect.value;
         if (whisperModelInput) {
-            const whisperModelValue = whisperModelInput.value;
+            const whisperModelValue = whisperModelInput.value.trim();
             if (whisperModelValue && !validateWhisperModelName(whisperModelValue)) {
                 console.warn('[SettingsWindowUI] Invalid whisper model name, skipping persist:', whisperModelValue);
                 whisperModelInput.style.borderColor = 'red';
             } else {
                 whisperModelInput.style.borderColor = '';
-                if (whisperModelValue) settings.whisperModel = whisperModelValue;
+                settings.whisperModel = whisperModelValue;
             }
         }
         if (whisperLanguageInput) settings.whisperLanguage = whisperLanguageInput.value;

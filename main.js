@@ -1963,7 +1963,7 @@ class ApplicationController {
       azureRegion: process.env.AZURE_SPEECH_REGION || "",
       whisperEngine: process.env.WHISPER_ENGINE || "whisper-cpp",
       whisperCommand: process.env.WHISPER_COMMAND || "",
-      whisperModel: process.env.WHISPER_MODEL || "small",
+      whisperModel: process.env.WHISPER_MODEL ?? "small",
       whisperLanguage: process.env.WHISPER_LANGUAGE || "pt",
       whisperCaptureChunkSamples: process.env.WHISPER_CAPTURE_CHUNK_SAMPLES ||
         speechService.getStatus().effectiveSettings.whisperCaptureChunkSamples || "2048",
@@ -1984,6 +1984,8 @@ class ApplicationController {
       whisperMaxConcurrent: process.env.WHISPER_MAX_CONCURRENT || "4",
       whisperBeamSize: process.env.WHISPER_BEAM_SIZE || "5",
       geminiKey: process.env.GEMINI_API_KEY || "",
+      geminiModel: config.get("llm.gemini.model") || "gemini-3.6-flash",
+      geminiThinkingLevel: config.get("llm.gemini.generation.thinkingConfig.thinkingLevel") || "medium",
 
       azureConfigured: !!process.env.AZURE_SPEECH_KEY && !!process.env.AZURE_SPEECH_REGION,
       speechAvailable: this.speechAvailable
@@ -2091,6 +2093,24 @@ class ApplicationController {
       if (settings.geminiKey !== undefined) {
         envUpdates.GEMINI_API_KEY = settings.geminiKey;
       }
+      const supportedGeminiModels = config.get("llm.gemini.supportedModels") || [];
+      const supportedThinkingLevels = config.get("llm.gemini.supportedThinkingLevels") || [];
+      if (settings.geminiModel !== undefined) {
+        const geminiModel = String(settings.geminiModel).trim();
+        if (supportedGeminiModels.includes(geminiModel)) {
+          envUpdates.GEMINI_MODEL = geminiModel;
+        } else {
+          logger.warn("Ignoring unsupported Gemini model from settings", { geminiModel });
+        }
+      }
+      if (settings.geminiThinkingLevel !== undefined) {
+        const thinkingLevel = String(settings.geminiThinkingLevel).trim().toLowerCase();
+        if (supportedThinkingLevels.includes(thinkingLevel)) {
+          envUpdates.GEMINI_THINKING_LEVEL = thinkingLevel;
+        } else {
+          logger.warn("Ignoring unsupported Gemini thinking level from settings", { thinkingLevel });
+        }
+      }
 
       // Capture the previous whisper command BEFORE persisting — persistEnvUpdates
       // mutates process.env in place, so comparing afterwards would always read
@@ -2108,12 +2128,22 @@ class ApplicationController {
 
       const persistedKeys = this.persistEnvUpdates(envUpdates);
 
+      if (persistedKeys.includes("GEMINI_MODEL")) {
+        config.set("llm.gemini.model", envUpdates.GEMINI_MODEL);
+      }
+      if (persistedKeys.includes("GEMINI_THINKING_LEVEL")) {
+        config.set("llm.gemini.generation.thinkingConfig.thinkingLevel", envUpdates.GEMINI_THINKING_LEVEL);
+      }
+
       // If the Gemini key was just saved, reinitialize the LLM service
       // so the new client picks up the key. Without this, the test-
       // connection button in the onboarding wizard fails with
       // "Service not initialized" because the client was first created
       // at app startup, before any key was set.
-      if (settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) {
+      const geminiRuntimeChanged = persistedKeys.includes("GEMINI_MODEL") ||
+        persistedKeys.includes("GEMINI_THINKING_LEVEL");
+      if ((settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) ||
+        (geminiRuntimeChanged && llmService.isInitialized)) {
         try {
           llmService.initializeClient();
           logger.info("LLM service reinitialized after Gemini key update");
