@@ -11,9 +11,23 @@ document.addEventListener('DOMContentLoaded', () => {
         return 'openai';
     };
 
-    const validateWhisperModelName = (value) => {
-        if (value === '') return true;
-        return /^[a-zA-Z0-9._-]{1,64}$/.test(value) && !value.includes('..');
+    const validateWhisperModelName = (value, engineValue = 'openai') => {
+        const model = String(value ?? '').trim();
+        if (model === '') return true;
+
+        // Faster Whisper accepts Hugging Face repository IDs (org/model) and
+        // local model paths. Keep the value argument-safe while allowing the
+        // separators used by both forms; reject traversal and option-like
+        // values before forwarding it to the Python worker.
+        if (normalizeWhisperEngine(engineValue) === 'faster') {
+            return model.length <= 256 &&
+                /^[a-zA-Z0-9._:/\\ -]+$/.test(model) &&
+                !model.startsWith('-') &&
+                !model.includes('..') &&
+                /[a-zA-Z0-9]$/.test(model);
+        }
+
+        return /^[a-zA-Z0-9._-]{1,64}$/.test(model) && !model.includes('..');
     };
 
     // Get DOM elements
@@ -180,7 +194,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperCppBackendSelect) settings.whisperCppBackend = whisperCppBackendSelect.value;
         if (whisperModelInput) {
             const whisperModelValue = whisperModelInput.value.trim();
-            if (whisperModelValue && !validateWhisperModelName(whisperModelValue)) {
+            if (whisperModelValue && !validateWhisperModelName(whisperModelValue, whisperEngineSelect?.value)) {
                 console.warn('[SettingsWindowUI] Invalid whisper model name, skipping persist:', whisperModelValue);
                 whisperModelInput.style.borderColor = 'red';
             } else {
@@ -284,7 +298,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (whisperModelInput) {
         const updateWhisperModelValidation = () => {
             const value = whisperModelInput.value;
-            whisperModelInput.style.borderColor = value && !validateWhisperModelName(value) ? 'red' : '';
+            whisperModelInput.style.borderColor = value &&
+                !validateWhisperModelName(value, whisperEngineSelect?.value) ? 'red' : '';
         };
         whisperModelInput.addEventListener('input', updateWhisperModelValidation);
         whisperModelInput.addEventListener('blur', updateWhisperModelValidation);

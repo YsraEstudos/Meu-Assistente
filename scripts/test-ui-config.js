@@ -38,12 +38,14 @@ assert.match(main, /geminiModel:\s*config\.get\(["']llm\.gemini\.model["']\)/);
 assert.match(main, /geminiThinkingLevel:\s*config\.get\(["']llm\.gemini\.generation\.thinkingConfig\.thinkingLevel["']\)/);
 assert.match(main, /envUpdates\.GEMINI_MODEL\s*=/);
 assert.match(main, /envUpdates\.GEMINI_THINKING_LEVEL\s*=/);
+assert.match(main, /config\.set\(["']llm\.gemini\.fallbackModels["'],\s*supportedGeminiModels\.filter\(\(model\)\s*=>\s*model\s*!==\s*envUpdates\.GEMINI_MODEL\)\)/,
+  'changing the Gemini primary model must recompute fallback models');
 assert(packageJson.scripts['test:all'].includes('test:ui-config'),
   'test:all must execute the UI configuration contract');
 
-function testClearingWhisperModelSendsAnExplicitReset() {
-  const whisperModelInput = {
-    value: '',
+function createSettingsHarness({ engine = 'whisper-cpp', model = '' } = {}) {
+  const makeInput = (value) => ({
+    value,
     style: {},
     listeners: new Map(),
     addEventListener(type, handler) {
@@ -52,14 +54,18 @@ function testClearingWhisperModelSendsAnExplicitReset() {
     dispatch(type) {
       this.listeners.get(type)?.({ target: this });
     }
-  };
+  });
+  const whisperModelInput = makeInput(model);
+  const whisperEngineSelect = makeInput(engine);
   const sent = [];
   const document = {
     addEventListener(type, handler) {
       if (type === 'DOMContentLoaded') handler();
     },
     getElementById(id) {
-      return id === 'whisperModel' ? whisperModelInput : null;
+      if (id === 'whisperModel') return whisperModelInput;
+      if (id === 'whisperEngine') return whisperEngineSelect;
+      return null;
     },
     querySelectorAll() {
       return [];
@@ -78,6 +84,12 @@ function testClearingWhisperModelSendsAnExplicitReset() {
   vm.runInNewContext(controller, { console, document, window, setTimeout() {} }, {
     filename: path.join(root, 'src/ui/settings-window.js')
   });
+
+  return { whisperModelInput, whisperEngineSelect, sent };
+}
+
+function testClearingWhisperModelSendsAnExplicitReset() {
+  const { whisperModelInput, sent } = createSettingsHarness({ model: '' });
   whisperModelInput.dispatch('change');
 
   const save = sent.find(({ channel }) => channel === 'save-settings');
@@ -86,6 +98,27 @@ function testClearingWhisperModelSendsAnExplicitReset() {
     'clearing the model must send an explicit empty value');
 }
 
+function testFasterWhisperAcceptsRepositoryAndLocalReferences() {
+  const repositoryHarness = createSettingsHarness({
+    engine: 'faster',
+    model: 'distil-whisper/distil-large-v3'
+  });
+  repositoryHarness.whisperModelInput.dispatch('change');
+  const repositorySave = repositoryHarness.sent.find(({ channel }) => channel === 'save-settings');
+  assert.equal(repositorySave?.payload.whisperModel, 'distil-whisper/distil-large-v3',
+    'Faster Whisper must persist Hugging Face repository IDs');
+
+  const localHarness = createSettingsHarness({
+    engine: 'faster',
+    model: 'C:\\Models\\large-v3'
+  });
+  localHarness.whisperModelInput.dispatch('change');
+  const localSave = localHarness.sent.find(({ channel }) => channel === 'save-settings');
+  assert.equal(localSave?.payload.whisperModel, 'C:\\Models\\large-v3',
+    'Faster Whisper must persist local model paths');
+}
+
 testClearingWhisperModelSendsAnExplicitReset();
+testFasterWhisperAcceptsRepositoryAndLocalReferences();
 
 console.log('UI configuration contract tests passed');
