@@ -36,6 +36,161 @@ function loadAudioWorkletProcessor() {
   return ProcessorClass;
 }
 
+function loadPreloadApi() {
+  const exposed = {};
+  const posted = [];
+  const ipcMessages = [];
+
+  class FakePort {
+    constructor(name) {
+      this.name = name;
+    }
+  }
+
+  class FakeMessageChannel {
+    constructor() {
+      this.port1 = new FakePort('port1');
+      this.port2 = new FakePort('port2');
+    }
+  }
+
+  const window = {
+    postMessage(message, targetOrigin, transfer) {
+      posted.push({ message, targetOrigin, transfer });
+    }
+  };
+  const ipcRenderer = {
+    postMessage(channel, message, transfer) {
+      ipcMessages.push({ channel, message, transfer });
+    }
+  };
+  const contextBridge = {
+    exposeInMainWorld(name, api) {
+      exposed[name] = api;
+    }
+  };
+  const context = vm.createContext({
+    console,
+    require: () => ({ contextBridge, ipcRenderer }),
+    contextBridge,
+    ipcRenderer,
+    MessageChannel: FakeMessageChannel,
+    process: { defaultApp: false, env: {} },
+    window
+  });
+  vm.runInContext(read('preload.js'), context, { filename: 'preload.js' });
+  return { api: exposed.electronAPI, ipcMessages, posted };
+}
+
+function loadWindowManagerClass() {
+  const source = read('src/managers/window.manager.js');
+  const classStart = source.indexOf('class WindowManager');
+  const exportStart = source.indexOf('module.exports =');
+  const context = vm.createContext({
+    console,
+    require() {
+      return {
+        BrowserWindow: class {},
+        screen: {},
+        desktopCapturer: {},
+        shell: {},
+        get() { return undefined; }
+      };
+    },
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    process: { platform: 'win32' },
+    URL,
+    Math,
+    Number,
+    String,
+    Date,
+    Promise,
+    Map,
+    WeakSet
+  });
+  context.logger = { debug() {}, info() {}, warn() {}, error() {} };
+  const classSource = `${source.slice(classStart, exportStart)}\nglobalThis.__WindowManager = WindowManager;`;
+  vm.runInContext(classSource, context, { filename: 'window.manager.js' });
+  return context.__WindowManager;
+}
+
+function loadLlmResponseCallbacks() {
+  const source = read('llm-response.html');
+  const scripts = [...source.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  const script = scripts.at(-1)?.[1];
+  assert(script, 'response overlay inline script must be available');
+
+  const callbacks = {};
+  const elements = new Map();
+  const makeElement = () => {
+    const classNames = new Set();
+    const element = {
+      style: {},
+      children: [],
+      classList: {
+        add: (...names) => names.forEach((name) => classNames.add(name)),
+        remove: (...names) => names.forEach((name) => classNames.delete(name)),
+        contains: (name) => classNames.has(name)
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      appendChild(child) { this.children.push(child); },
+      querySelector() { return null; },
+      querySelectorAll() { return []; },
+      setAttribute() {}
+    };
+    let textContent = '';
+    Object.defineProperty(element, 'textContent', {
+      get: () => textContent,
+      set: (value) => { textContent = String(value ?? ''); }
+    });
+    return element;
+  };
+  const document = {
+    readyState: 'loading',
+    activeElement: null,
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    createElement: makeElement,
+    getElementById(id) {
+      if (!elements.has(id)) elements.set(id, makeElement());
+      return elements.get(id);
+    }
+  };
+  const electronAPI = {};
+  for (const name of [
+    'onShowLoading', 'onResponseStart', 'onResponseDelta', 'onResponseEnd',
+    'onResponseError', 'onDisplayLlmResponse'
+  ]) {
+    electronAPI[name] = (callback) => { callbacks[name] = callback; };
+  }
+  electronAPI.resizeLlmWindowForContent = () => Promise.resolve();
+  const context = vm.createContext({
+    console,
+    document,
+    window: {
+      electronAPI,
+      addEventListener() {}
+    },
+    setTimeout,
+    clearTimeout,
+    Promise,
+    Object,
+    Array,
+    String,
+    Number,
+    Math,
+    Date
+  });
+  vm.runInContext(script, context, { filename: 'llm-response.html' });
+  context.initLLMResponseWindow();
+  return { callbacks, elements };
+}
+
 function testAudioWorkletFlushesPartialTail() {
   const ProcessorClass = loadAudioWorkletProcessor();
   const processor = new ProcessorClass({ processorOptions: { bufferSize: 8 } });
@@ -136,7 +291,91 @@ async function testAudioTailWaitsForMainProcessAck() {
   assert.equal(settled, true);
 }
 
+function testPreloadTransfersAudioPortToBothContexts() {
+  const { api, ipcMessages, posted } = loadPreloadApi();
+  const result = api.openAudioTransport();
+
+  assert.equal(result, true, 'audio transport setup must report that the handoff was requested');
+  assert.equal(ipcMessages.length, 1);
+  assert.equal(ipcMessages[0].channel, 'audio-port');
+  assert.equal(ipcMessages[0].message, null);
+  assert.equal(ipcMessages[0].transfer[0].name, 'port2');
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].message, 'opencluely-audio-port');
+  assert.equal(posted[0].targetOrigin, '*');
+  assert.equal(posted[0].transfer[0].name, 'port1');
+}
+
+async function testMainWindowConsumesAudioPortHandoff() {
+  const { MainWindowUI, context } = loadMainWindowUI();
+  const ui = Object.create(MainWindowUI.prototype);
+  ui._pendingAudioPorts = [];
+  ui._audioPortWaiters = [];
+  const port = { postMessage() {} };
+
+  const waiting = ui._waitForAudioTransportPort();
+  ui._handleAudioPortMessage({
+    source: context.window,
+    data: 'opencluely-audio-port',
+    ports: [port]
+  });
+
+  assert.equal(await waiting, port, 'the transferred renderer port must be delivered to the capture flow');
+}
+
+async function testConcurrentLlmStreamsKeepIndependentBuffers() {
+  const { callbacks, elements } = loadLlmResponseCallbacks();
+  const start = callbacks.onResponseStart;
+  const delta = callbacks.onResponseDelta;
+  assert.equal(typeof start, 'function');
+  assert.equal(typeof delta, 'function');
+
+  start(null, { messageId: 'stream-a' });
+  delta(null, { messageId: 'stream-a', delta: 'A1' });
+  start(null, { messageId: 'stream-b' });
+  callbacks.onResponseEnd(null, { messageId: 'stream-a', response: 'A final' });
+  assert.equal(elements.get('loading').classList.contains('hidden'), false,
+    'an older stream ending must not hide the active stream');
+  delta(null, { messageId: 'stream-b', delta: 'B1' });
+  delta(null, { messageId: 'stream-a', delta: 'A2' });
+
+  assert.equal(elements.get('full-markdown').textContent, 'B1',
+    'a delta from an older stream must not replace the active stream');
+  delta(null, { messageId: 'stream-b', delta: 'B2' });
+  assert.equal(elements.get('full-markdown').textContent, 'B1B2',
+    'the active stream must retain its own accumulated text');
+
+  const secondRun = loadLlmResponseCallbacks();
+  secondRun.callbacks.onResponseStart(null, { messageId: 'older' });
+  secondRun.callbacks.onResponseDelta(null, { messageId: 'older', delta: 'O1' });
+  secondRun.callbacks.onResponseStart(null, { messageId: 'newer' });
+  secondRun.callbacks.onResponseDelta(null, { messageId: 'newer', delta: 'N1' });
+  secondRun.callbacks.onResponseEnd(null, { messageId: 'newer', response: '' });
+  secondRun.callbacks.onResponseDelta(null, { messageId: 'older', delta: 'O2' });
+  assert.equal(secondRun.elements.get('full-markdown').textContent, 'O1O2',
+    'an older stream must resume independently when the active stream finishes first');
+}
+
+async function testRecordingStartBroadcastWaitsForChatCreation() {
+  const WindowManager = loadWindowManagerClass();
+  const manager = Object.create(WindowManager.prototype);
+  manager.isRecording = false;
+  const broadcasts = [];
+  let releaseChat;
+  manager.showChatWindow = () => new Promise((resolve) => { releaseChat = resolve; });
+  manager.broadcastToAllWindows = (channel) => broadcasts.push(channel);
+
+  const started = manager.handleRecordingStarted();
+  assert.equal(typeof started?.then, 'function', 'recording start must await lazy chat creation');
+  assert.deepEqual(broadcasts, [], 'recording state must not broadcast before chat creation settles');
+
+  releaseChat();
+  await started;
+  assert.deepEqual(broadcasts, ['recording-started']);
+}
+
 function testSourceContracts() {
+  const preload = read('preload.js');
   const main = read('main.js');
   const manager = read('src/managers/window.manager.js');
   const capture = read('src/services/capture.service.js');
@@ -187,6 +426,13 @@ function testSourceContracts() {
   assert.match(mainWindow, /await this\._stopRendererAudioCapture\(\);[\s\S]*?await this\._startRendererAudioCapture\(\)/,
     'capture restart must finish stopping the previous generation first');
 
+  assert.match(preload, /window\.postMessage\(['"]opencluely-audio-port['"], ['"]\*['"], \[channel\.port1\]\)/,
+    'the preload must relay the renderer port through window.postMessage');
+  assert.match(mainWindow, /_waitForAudioTransportPort\(\)/,
+    'the renderer must wait for the transferred port instead of receiving it through contextBridge');
+  assert.match(manager, /async handleRecordingStarted\(\)[\s\S]*?await this\.showChatWindow\(\)/,
+    'recording-started must wait for lazy chat creation');
+
   for (const listener of ['onResponseStart', 'onResponseDelta', 'onResponseEnd', 'onResponseError']) {
     assert.match(chat, new RegExp(`whysperAPI\\.${listener}`),
       `the loaded chat page must consume ${listener}`);
@@ -212,6 +458,10 @@ const tests = [
   testAudioWorkletFlushesPartialTail,
   testStaleAudioWorkletStartDoesNotCreateNode,
   testAudioTailWaitsForMainProcessAck,
+  testPreloadTransfersAudioPortToBothContexts,
+  testMainWindowConsumesAudioPortHandoff,
+  testConcurrentLlmStreamsKeepIndependentBuffers,
+  testRecordingStartBroadcastWaitsForChatCreation,
   testSourceContracts
 ];
 

@@ -12,6 +12,7 @@ const logger = {
 };
 const MAX_CAPTURE_RESTART_ATTEMPTS = 3;
 const AUDIO_TAIL_ACK_TIMEOUT_MS = 500;
+const AUDIO_PORT_HANDOFF_TIMEOUT_MS = 500;
 
 function normalizeCaptureBufferSize(value) {
     const parsed = Number(value);
@@ -52,6 +53,12 @@ class MainWindowUI {
         this._captureRestartCount = 0;
         this._captureStats = null;
         this._audioPort = null;
+        this._pendingAudioPorts = [];
+        this._audioPortWaiters = [];
+        this._audioPortMessageHandler = (event) => this._handleAudioPortMessage(event);
+        if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+            window.addEventListener('message', this._audioPortMessageHandler);
+        }
         this._audioWorkletFlushState = null;
         this._audioTailSequence = 0;
         this._resizeTimer = null;
@@ -1133,7 +1140,13 @@ class MainWindowUI {
                 let audioPort = null;
                 try {
                     if (window.electronAPI.openAudioTransport) {
-                        audioPort = window.electronAPI.openAudioTransport();
+                        const transportRequested = window.electronAPI.openAudioTransport();
+                        if (transportRequested && typeof transportRequested.postMessage === 'function') {
+                            // Keep compatibility with older preload implementations.
+                            audioPort = transportRequested;
+                        } else if (transportRequested === true) {
+                            audioPort = await this._waitForAudioTransportPort();
+                        }
                         if (audioPort) {
                             audioPort.onmessage = (event) => {
                                 this._handleAudioTransportMessage(event && event.data);
@@ -1144,6 +1157,10 @@ class MainWindowUI {
                 } catch (error) {
                     logger.debug('Audio MessagePort unavailable; using legacy IPC', { component: 'MainWindowUI', error: error.message });
                     audioPort = null;
+                }
+                if (!this.isRecording || generation !== this._captureGeneration) {
+                    try { audioPort?.close?.(); } catch (_) { /* best effort */ }
+                    return;
                 }
                 this._audioPort = audioPort;
                 const source = audioContext.createMediaStreamSource(stream);
@@ -1306,6 +1323,47 @@ class MainWindowUI {
             });
             return false;
         }
+    }
+
+    _handleAudioPortMessage(event) {
+        if (!event || event.source !== window || event.data !== 'opencluely-audio-port') {
+            return;
+        }
+        const port = event.ports && event.ports[0];
+        if (!port || typeof port.postMessage !== 'function') return;
+
+        if (!this._audioPortWaiters) this._audioPortWaiters = [];
+        if (!this._pendingAudioPorts) this._pendingAudioPorts = [];
+        const waiter = this._audioPortWaiters.shift();
+        if (waiter) {
+            waiter(port);
+        } else {
+            this._pendingAudioPorts.push(port);
+        }
+    }
+
+    _waitForAudioTransportPort() {
+        if (!this._pendingAudioPorts) this._pendingAudioPorts = [];
+        if (this._pendingAudioPorts.length) {
+            return Promise.resolve(this._pendingAudioPorts.shift());
+        }
+
+        if (!this._audioPortWaiters) this._audioPortWaiters = [];
+        return new Promise((resolve) => {
+            let settled = false;
+            let timeout = null;
+            const settle = (port) => {
+                if (settled) return;
+                settled = true;
+                if (timeout) clearTimeout(timeout);
+                const index = this._audioPortWaiters.indexOf(waiter);
+                if (index >= 0) this._audioPortWaiters.splice(index, 1);
+                resolve(port || null);
+            };
+            const waiter = (port) => settle(port);
+            this._audioPortWaiters.push(waiter);
+            timeout = setTimeout(() => settle(null), AUDIO_PORT_HANDOFF_TIMEOUT_MS);
+        });
     }
 
     _handleAudioTransportMessage(payload) {

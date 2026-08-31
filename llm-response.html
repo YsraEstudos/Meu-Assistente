@@ -475,8 +475,8 @@
         let isInteractive = false;
         let scrollableElements = [];
         let initialized = false;
-        let streamingMessageId = null;
-        let streamingResponse = '';
+        const streamingResponses = new Map();
+        let activeStreamingMessageId = null;
         
         // Immediate logging to verify script execution
         console.log('[LLM-RESPONSE] Script tag executed');
@@ -537,25 +537,33 @@
 
                 window.electronAPI.onResponseStart?.((_event, data) => {
                     if (!data || !data.messageId) return;
-                    streamingMessageId = data.messageId;
-                    streamingResponse = '';
+                    streamingResponses.set(data.messageId, { buffer: '' });
+                    activeStreamingMessageId = data.messageId;
                     showLoadingState();
                 });
 
                 window.electronAPI.onResponseDelta?.((_event, data) => {
                     if (!data || !data.messageId) return;
-                    if (streamingMessageId !== data.messageId) {
-                        streamingMessageId = data.messageId;
-                        streamingResponse = '';
+                    let state = streamingResponses.get(data.messageId);
+                    if (!state) {
+                        state = { buffer: '' };
+                        streamingResponses.set(data.messageId, state);
                     }
-                    streamingResponse += data.delta || '';
-                    displayStreamingResponse(streamingResponse);
+                    if (!activeStreamingMessageId) activeStreamingMessageId = data.messageId;
+                    state.buffer += data.delta || '';
+                    if (activeStreamingMessageId === data.messageId) {
+                        displayStreamingResponse(state.buffer);
+                    }
                 });
 
                 window.electronAPI.onResponseEnd?.((_event, data) => {
                     if (!data || !data.messageId) return;
-                    streamingMessageId = null;
-                    streamingResponse = '';
+                    if (activeStreamingMessageId && activeStreamingMessageId !== data.messageId) {
+                        streamingResponses.delete(data.messageId);
+                        return;
+                    }
+                    streamingResponses.delete(data.messageId);
+                    activeStreamingMessageId = null;
                     hideLoadingState();
                     if (data.response) {
                         displayResponse({ response: data.response });
@@ -565,8 +573,12 @@
 
                 window.electronAPI.onResponseError?.((_event, data) => {
                     if (!data || !data.messageId) return;
-                    streamingMessageId = null;
-                    streamingResponse = '';
+                    if (activeStreamingMessageId && activeStreamingMessageId !== data.messageId) {
+                        streamingResponses.delete(data.messageId);
+                        return;
+                    }
+                    streamingResponses.delete(data.messageId);
+                    activeStreamingMessageId = null;
                     hideLoadingState();
                     displayStreamingResponse(`LLM Error: ${data.error || 'stream failed'}`);
                 });

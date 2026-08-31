@@ -1771,9 +1771,13 @@ class WindowManager {
     }
   }
 
-  handleRecordingStarted() {
+  async handleRecordingStarted() {
     this.isRecording = true;
-    this.showChatWindow();
+    try {
+      await this.showChatWindow();
+    } catch (error) {
+      logger.warn('Failed to show chat window before recording broadcast', { error: error.message });
+    }
     // Notify all windows about recording state
     this.broadcastToAllWindows('recording-started');
     logger.debug('Recording started, chat window shown');
