@@ -33,6 +33,12 @@ class ConfigManager {
         dualAudioMode: resolveDualAudioMode(process.env.OPENCLUEY_DUAL_AUDIO_MODE)
       },
 
+      mobileSync: {
+        bindHost: process.env.OPENCLUEY_MOBILE_SYNC_LAN === '1'
+          ? '0.0.0.0'
+          : '127.0.0.1'
+      },
+
       app: {
         name: 'OpenCluely',
         version: '1.0.0',

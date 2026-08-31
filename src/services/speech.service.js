@@ -390,6 +390,7 @@ const config = require('../core/config');
 const { normalizeWhisperEngine } = require('../core/whisper-engine');
 const WHISPER_WORKER_REQUEST_TIMEOUT_MS = 210000;
 const WHISPER_WORKER_SHUTDOWN_TIMEOUT_MS = 5000;
+const RENDERER_CAPTURE_DRAIN_TIMEOUT_MS = 1000;
 const performanceTracker = require('../core/performance');
 
 let sdk = null;
@@ -1530,7 +1531,7 @@ class SpeechService extends EventEmitter {
       this._rendererCaptureDrainResolve = resolve;
       this._rendererCaptureDrainTimer = setTimeout(() => {
         this._resolveRendererCaptureDrain();
-      }, 350);
+      }, RENDERER_CAPTURE_DRAIN_TIMEOUT_MS);
     });
   }
 
