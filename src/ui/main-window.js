@@ -11,6 +11,8 @@ const logger = {
     warn: (...args) => console.warn('[MainWindowUI WARN]', ...args)
 };
 const MAX_CAPTURE_RESTART_ATTEMPTS = 3;
+const AUDIO_TAIL_ACK_TIMEOUT_MS = 500;
+const AUDIO_PORT_HANDOFF_TIMEOUT_MS = 500;
 
 function normalizeCaptureBufferSize(value) {
     const parsed = Number(value);
@@ -23,7 +25,7 @@ class MainWindowUI {
     constructor() {
         this.isInteractive = false;
         this.isHidden = false;
-        this.currentSkill = 'dsa'; // Default, will be updated from settings
+        this.currentSkill = 'general'; // Default, will be updated from settings
         this.statusDot = null;
         this.skillIndicator = null;
         this.micButton = null;
@@ -38,6 +40,7 @@ class MainWindowUI {
         this._audioContext = null;
         this._mediaStream = null;
         this._scriptNode = null;
+        this._audioWorkletNode = null;
         this._micMeter = null;
         this._micAnalyser = null;
         this._audioMonitorGain = null;
@@ -45,12 +48,25 @@ class MainWindowUI {
         this._captureStatsTimer = null;
         this._captureStartPromise = null;
         this._captureRestartPromise = null;
+        this._captureStopPromise = null;
         this._captureGeneration = 0;
         this._captureRestartCount = 0;
         this._captureStats = null;
+        this._audioPort = null;
+        this._pendingAudioPorts = [];
+        this._audioPortWaiters = [];
+        this._audioPortMessageHandler = (event) => this._handleAudioPortMessage(event);
+        if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+            window.addEventListener('message', this._audioPortMessageHandler);
+        }
+        this._audioWorkletFlushState = null;
+        this._audioTailSequence = 0;
+        this._resizeTimer = null;
+        this._lastWindowSize = null;
         
         // Define available skills for navigation
         this.availableSkills = [
+            'general',
             'dsa'
         ];
         
@@ -100,8 +116,9 @@ class MainWindowUI {
         try {
             if (window.electronAPI && window.electronAPI.getSettings) {
                 const settings = await window.electronAPI.getSettings();
-                if (settings && settings.activeSkill) {
-                    this.currentSkill = settings.activeSkill;
+                const loadedSkill = String(settings && settings.activeSkill || '').trim().toLowerCase();
+                if (this.availableSkills.includes(loadedSkill)) {
+                    this.currentSkill = loadedSkill;
                     logger.debug('Loaded current skill from settings', {
                         component: 'MainWindowUI',
                         skill: this.currentSkill
@@ -153,13 +170,12 @@ class MainWindowUI {
 
     applyMicVisibility() {
         if (this.micButton) {
-            if (this.speechAvailable) {
-                this.micButton.style.display = '';
-            } else {
-                this.micButton.style.display = 'none';
+            const nextDisplay = this.speechAvailable ? '' : 'none';
+            if (this.micButton.style.display !== nextDisplay) {
+                this.micButton.style.display = nextDisplay;
+                // Resize only when the visibility actually changes.
+                this.resizeWindowToContent();
             }
-            // Resize to reflect layout change
-            setTimeout(() => this.resizeWindowToContent(), 50);
         }
     }
 
@@ -411,12 +427,21 @@ class MainWindowUI {
     }
 
     resizeWindowToContent() {
-        // Wait for DOM to fully render
-        setTimeout(() => {
+        if (this._resizeTimer) {
+            clearTimeout(this._resizeTimer);
+        }
+
+        // Coalesce rapid state/layout updates into one IPC resize.
+        this._resizeTimer = setTimeout(() => {
+            this._resizeTimer = null;
             const commandTab = document.querySelector('.command-tab');
             if (commandTab && window.electronAPI && window.electronAPI.resizeWindow) {
                 const rect = commandTab.getBoundingClientRect();
-                const width = Math.ceil(rect.width);
+                const width = Math.ceil(Math.max(
+                    rect.width,
+                    commandTab.scrollWidth,
+                    commandTab.offsetWidth
+                ));
                 let height = Math.ceil(rect.height);
 
                 // If shortcuts popover is visible, extend height to fit it
@@ -429,16 +454,31 @@ class MainWindowUI {
                     const popRect = this.whisperStatusPopover.getBoundingClientRect();
                     height = Math.max(height, Math.ceil(36 + popRect.height + 8));
                 }
-                
+
+                if (this._lastWindowSize &&
+                    this._lastWindowSize.width === width &&
+                    this._lastWindowSize.height === height) {
+                    return;
+                }
                 logger.debug('Resizing window to content', {
                     width,
                     height,
                     component: 'MainWindowUI'
                 });
-                
-                window.electronAPI.resizeWindow(width, height);
+
+                Promise.resolve(window.electronAPI.resizeWindow(width, height)).then((result) => {
+                    if (result && result.success === false) {
+                        throw new Error(result.error || 'Main process rejected window resize');
+                    }
+                    this._lastWindowSize = { width, height };
+                }).catch((error) => {
+                    logger.warn('Failed to resize main window', {
+                        component: 'MainWindowUI',
+                        error: error.message
+                    });
+                });
             }
-        }, 100);
+        }, 0);
     }
 
     setupElements() {
@@ -472,13 +512,23 @@ class MainWindowUI {
             }
         });
 
-        // Skill indicator click handler toggles DSA skill
+        // Skill indicator click handler toggles General/DSA.
         this.skillIndicator.addEventListener('click', () => {
             if (!this.isInteractive) return;
-            const newSkill = 'dsa';
+            const currentIndex = this.availableSkills.indexOf(this.currentSkill);
+            const newSkill = this.availableSkills[
+                (currentIndex + 1) % this.availableSkills.length
+            ];
             if (window.electronAPI && window.electronAPI.updateActiveSkill) {
-                window.electronAPI.updateActiveSkill(newSkill).then(() => {
-                    this.handleSkillActivated(newSkill);
+                window.electronAPI.updateActiveSkill(newSkill).then((result) => {
+                    if (!result || result.success !== false) {
+                        this.handleSkillActivated((result && result.skill) || newSkill);
+                    }
+                }).catch((error) => {
+                    logger.error('Failed to toggle skill via indicator', {
+                        component: 'MainWindowUI',
+                        error: error.message
+                    });
                 });
             } else {
                 this.handleSkillActivated(newSkill);
@@ -511,7 +561,7 @@ class MainWindowUI {
                         if (status.isRecording && !this.isRecording) {
                             this.handleRecordingStarted();
                         } else if (!status.isRecording && this.isRecording) {
-                            this.handleRecordingStopped();
+                            await this.handleRecordingStopped();
                         }
                     }
                 } catch (error) {
@@ -519,7 +569,7 @@ class MainWindowUI {
                         component: 'MainWindowUI',
                         error: error.message
                     });
-                    this.handleRecordingStopped();
+                    await this.handleRecordingStopped();
                 } finally {
                     this._micTogglePending = false;
                     this.updateMicButtonState();
@@ -560,13 +610,7 @@ class MainWindowUI {
                     window.electronAPI.saveSettings({ codingLanguage: lang });
                 }
                 // Resize for any width change
-                setTimeout(() => {
-                    const commandTab = document.querySelector('.command-tab');
-                    if (commandTab && window.electronAPI && window.electronAPI.resizeWindow) {
-                        const rect = commandTab.getBoundingClientRect();
-                        window.electronAPI.resizeWindow(Math.ceil(rect.width), Math.ceil(rect.height));
-                    }
-                }, 50);
+                this.resizeWindowToContent();
             });
         }
 
@@ -671,17 +715,17 @@ class MainWindowUI {
                 this.handleRecordingStarted();
             });
 
-            window.electronAPI.onRecordingCaptureStopped(() => {
+            window.electronAPI.onRecordingCaptureStopped(async () => {
                 this._isTranscribing = true;
-                this.handleRecordingStopped();
+                await this.handleRecordingStopped();
                 if (window.electronAPI.confirmAudioCaptureStopped) {
                     window.electronAPI.confirmAudioCaptureStopped();
                 }
             });
 
-            window.electronAPI.onRecordingStopped(() => {
+            window.electronAPI.onRecordingStopped(async () => {
                 this._isTranscribing = false;
-                this.handleRecordingStopped();
+                await this.handleRecordingStopped();
             });
 
             window.electronAPI.onTranscriptionProgress((_event, progress) => {
@@ -784,6 +828,7 @@ class MainWindowUI {
     handleLLMResponse(data) {
         const skill = data.skill || data.metadata?.skill || 'General';
         const skillNames = {
+            'general': 'General',
             'dsa': 'DSA',
             'behavioral': 'Behavioral', 
             'sales': 'Sales',
@@ -875,12 +920,21 @@ class MainWindowUI {
 
     handleSkillChanged(data) {
         const oldSkill = this.currentSkill;
-        this.currentSkill = data.skill;
+        const newSkill = String(data && data.skill || '').trim().toLowerCase();
+        if (!this.availableSkills.includes(newSkill)) {
+            logger.warn('Ignoring unsupported skill update', {
+                component: 'MainWindowUI',
+                skill: data && data.skill
+            });
+            return;
+        }
+        if (oldSkill === newSkill) return;
+        this.currentSkill = newSkill;
         
         logger.info('Handling skill change', {
             component: 'MainWindowUI',
             oldSkill: oldSkill,
-            newSkill: data.skill,
+            newSkill,
             skillIndicatorExists: !!this.skillIndicator
         });
         
@@ -888,17 +942,20 @@ class MainWindowUI {
         
         logger.info('Skill changed successfully', {
             component: 'MainWindowUI',
-            skill: data.skill
+            skill: newSkill
         });
     }
 
     handleSkillActivated(skillName) {
-        this.currentSkill = skillName;
+        const normalizedSkill = String(skillName || '').trim().toLowerCase();
+        if (!this.availableSkills.includes(normalizedSkill)) return;
+        if (this.currentSkill === normalizedSkill) return;
+        this.currentSkill = normalizedSkill;
         this.updateSkillIndicator();
         
         logger.info('Skill activated', {
             component: 'MainWindowUI',
-            skill: skillName
+            skill: normalizedSkill
         });
     }
 
@@ -942,12 +999,12 @@ class MainWindowUI {
         this.updateMicButtonState();
     }
 
-    handleRecordingStopped() {
+    async handleRecordingStopped() {
         this.isRecording = false;
         if (this.micButton) {
             this.micButton.classList.remove('recording');
         }
-        this._stopRendererAudioCapture();
+        await this._stopRendererAudioCapture();
         this.updateMicButtonState();
         logger.debug('Recording stopped', { component: 'MainWindowUI' });
     }
@@ -1038,7 +1095,7 @@ class MainWindowUI {
         if (this._captureStartPromise) {
             return this._captureStartPromise;
         }
-        if (this._audioContext || this._mediaStream || this._scriptNode) {
+        if (this._audioContext || this._mediaStream || this._scriptNode || this._audioWorkletNode) {
             logger.debug('Renderer audio capture already active', { component: 'MainWindowUI' });
             return Promise.resolve();
         }
@@ -1080,8 +1137,55 @@ class MainWindowUI {
                     totalBytes: 0
                 };
 
+                let audioPort = null;
+                try {
+                    if (window.electronAPI.openAudioTransport) {
+                        const transportRequested = window.electronAPI.openAudioTransport();
+                        if (transportRequested && typeof transportRequested.postMessage === 'function') {
+                            // Keep compatibility with older preload implementations.
+                            audioPort = transportRequested;
+                        } else if (transportRequested === true) {
+                            audioPort = await this._waitForAudioTransportPort();
+                        }
+                        if (audioPort) {
+                            audioPort.onmessage = (event) => {
+                                this._handleAudioTransportMessage(event && event.data);
+                            };
+                        }
+                        if (audioPort && typeof audioPort.start === 'function') audioPort.start();
+                    }
+                } catch (error) {
+                    logger.debug('Audio MessagePort unavailable; using legacy IPC', { component: 'MainWindowUI', error: error.message });
+                    audioPort = null;
+                }
+                if (!this.isRecording || generation !== this._captureGeneration) {
+                    try { audioPort?.close?.(); } catch (_) { /* best effort */ }
+                    return;
+                }
+                this._audioPort = audioPort;
                 const source = audioContext.createMediaStreamSource(stream);
                 this._startMicMeter(audioContext, source, stream, generation);
+                const workletStarted = await this._tryStartAudioWorkletCapture(audioContext, source, stream, generation);
+                if (!this.isRecording || generation !== this._captureGeneration) {
+                    logger.debug('Renderer audio capture worklet start cancelled', {
+                        component: 'MainWindowUI',
+                        generation
+                    });
+                    return;
+                }
+                if (workletStarted) {
+                    this._startRendererCaptureWatchdog(generation);
+                    if (audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                    }
+                    logger.info('Renderer audio capture started with AudioWorklet', {
+                        component: 'MainWindowUI',
+                        generation,
+                        audioContextState: audioContext.state
+                    });
+                    return;
+                }
+
                 let bufferSize = 2048;
                 try {
                     const settings = window.electronAPI && window.electronAPI.getSettings
@@ -1106,7 +1210,7 @@ class MainWindowUI {
 
                 scriptNode.onaudioprocess = (event) => {
                     if (!this.isRecording || generation !== this._captureGeneration ||
-                        !window.electronAPI || !window.electronAPI.sendAudioChunk) {
+                        !window.electronAPI || (!this._audioPort && !window.electronAPI.sendAudioChunk)) {
                         return;
                     }
                     const inputData = event.inputBuffer.getChannelData(0);
@@ -1115,22 +1219,7 @@ class MainWindowUI {
                         const sample = Math.max(-1, Math.min(1, inputData[i]));
                         pcm16[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
                     }
-
-                    const stats = this._captureStats;
-                    const now = Date.now();
-                    if (stats && stats.generation === generation) {
-                        stats.totalChunks += 1;
-                        stats.totalBytes += pcm16.byteLength;
-                        stats.lastAudioProcessAt = now;
-                    }
-                    try {
-                        window.electronAPI.sendAudioChunk(pcm16.buffer);
-                    } catch (error) {
-                        logger.error('Failed to send renderer audio chunk', {
-                            component: 'MainWindowUI',
-                            error: error.message
-                        });
-                    }
+                    this._sendRendererAudioBuffer(pcm16.buffer, generation);
                 };
 
                 audioContext.onstatechange = () => {
@@ -1196,6 +1285,198 @@ class MainWindowUI {
             }
         });
         return startPromise;
+    }
+
+    _sendRendererAudioBuffer(rawBuffer, generation, { allowStopped = false, flushId = null } = {}) {
+        if ((!this.isRecording && !allowStopped) || generation !== this._captureGeneration ||
+            !window.electronAPI || (!this._audioPort && !window.electronAPI.sendAudioChunk)) {
+            return false;
+        }
+
+        let buffer = rawBuffer;
+        if (ArrayBuffer.isView(buffer)) {
+            buffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+        }
+        if (!(buffer instanceof ArrayBuffer) || buffer.byteLength === 0) {
+            return false;
+        }
+
+        const stats = this._captureStats;
+        const now = Date.now();
+        if (stats && stats.generation === generation) {
+            stats.totalChunks += 1;
+            stats.totalBytes += buffer.byteLength;
+            stats.lastAudioProcessAt = now;
+        }
+
+        try {
+            if (this._audioPort && typeof this._audioPort.postMessage === 'function') {
+                this._audioPort.postMessage(flushId ? { buffer, flushId } : { buffer }, [buffer]);
+            } else {
+                window.electronAPI.sendAudioChunk(buffer);
+            }
+            return true;
+        } catch (error) {
+            logger.error('Failed to send renderer audio chunk', {
+                component: 'MainWindowUI',
+                error: error.message
+            });
+            return false;
+        }
+    }
+
+    _handleAudioPortMessage(event) {
+        if (!event || event.source !== window || event.data !== 'opencluely-audio-port') {
+            return;
+        }
+        const port = event.ports && event.ports[0];
+        if (!port || typeof port.postMessage !== 'function') return;
+
+        if (!this._audioPortWaiters) this._audioPortWaiters = [];
+        if (!this._pendingAudioPorts) this._pendingAudioPorts = [];
+        const waiter = this._audioPortWaiters.shift();
+        if (waiter) {
+            waiter(port);
+        } else {
+            this._pendingAudioPorts.push(port);
+        }
+    }
+
+    _waitForAudioTransportPort() {
+        if (!this._pendingAudioPorts) this._pendingAudioPorts = [];
+        if (this._pendingAudioPorts.length) {
+            return Promise.resolve(this._pendingAudioPorts.shift());
+        }
+
+        if (!this._audioPortWaiters) this._audioPortWaiters = [];
+        return new Promise((resolve) => {
+            let settled = false;
+            let timeout = null;
+            const settle = (port) => {
+                if (settled) return;
+                settled = true;
+                if (timeout) clearTimeout(timeout);
+                const index = this._audioPortWaiters.indexOf(waiter);
+                if (index >= 0) this._audioPortWaiters.splice(index, 1);
+                resolve(port || null);
+            };
+            const waiter = (port) => settle(port);
+            this._audioPortWaiters.push(waiter);
+            timeout = setTimeout(() => settle(null), AUDIO_PORT_HANDOFF_TIMEOUT_MS);
+        });
+    }
+
+    _handleAudioTransportMessage(payload) {
+        const state = this._audioWorkletFlushState;
+        if (!state || !payload || payload.type !== 'audio-tail-accepted' ||
+            payload.flushId !== state.flushId) {
+            return;
+        }
+        state.mainAck = true;
+        if (payload.accepted === false) {
+            logger.warn('Main process rejected final renderer audio tail', {
+                component: 'MainWindowUI',
+                generation: state.generation
+            });
+        }
+        this._completeAudioWorkletFlushIfReady();
+    }
+
+    _handleAudioWorkletMessage(payload, generation) {
+        if (payload && payload.type === 'flush-complete') {
+            const state = this._audioWorkletFlushState;
+            if (state && state.generation === generation) {
+                state.workletDone = true;
+                this._completeAudioWorkletFlushIfReady();
+            }
+            return;
+        }
+        if (payload && payload.type === 'audio-tail') {
+            const state = this._audioWorkletFlushState;
+            const waitsForMainAck = Boolean(state && state.generation === generation && this._audioPort);
+            if (waitsForMainAck) state.waitingMainAck = true;
+            const sent = this._sendRendererAudioBuffer(payload.buffer, generation, {
+                allowStopped: true,
+                flushId: waitsForMainAck ? state.flushId : null
+            });
+            if (waitsForMainAck && !sent) {
+                state.waitingMainAck = false;
+            }
+            return;
+        }
+        this._sendRendererAudioBuffer(payload, generation);
+    }
+
+    _completeAudioWorkletFlushIfReady() {
+        const state = this._audioWorkletFlushState;
+        if (state && state.workletDone && (!state.waitingMainAck || state.mainAck)) {
+            state.finish();
+        }
+    }
+
+    async _tryStartAudioWorkletCapture(audioContext, source, stream, generation) {
+        const AudioWorkletNodeClass = window.AudioWorkletNode;
+        if (!audioContext.audioWorklet || typeof AudioWorkletNodeClass !== 'function') {
+            return false;
+        }
+
+        let workletNode = null;
+        try {
+            const moduleUrl = new URL('./src/ui/audio-capture.worklet.js', document.baseURI).href;
+            await audioContext.audioWorklet.addModule(moduleUrl);
+            if (!this.isRecording || generation !== this._captureGeneration) {
+                return false;
+            }
+            workletNode = new AudioWorkletNodeClass(audioContext, 'opencluely-audio-capture', {
+                numberOfInputs: 1,
+                numberOfOutputs: 1,
+                channelCount: 1,
+                processorOptions: { bufferSize: 2048 }
+            });
+            workletNode.port.onmessage = (event) => {
+                this._handleAudioWorkletMessage(event && event.data, generation);
+            };
+            workletNode.port.onmessageerror = () => {
+                logger.debug('AudioWorklet message error', { component: 'MainWindowUI', generation });
+            };
+            workletNode.onprocessorerror = () => {
+                logger.debug('AudioWorklet processor error', { component: 'MainWindowUI', generation });
+                if (this.isRecording && generation === this._captureGeneration) {
+                    this._restartRendererAudioCapture('audio-worklet-error');
+                }
+            };
+            source.connect(workletNode);
+            this._connectAudioNodeSilently(workletNode, audioContext);
+            this._audioWorkletNode = workletNode;
+
+            const audioTrack = stream.getAudioTracks && stream.getAudioTracks()[0];
+            if (audioTrack && audioTrack.addEventListener) {
+                audioTrack.addEventListener('mute', () => {
+                    logger.debug('Renderer microphone track muted', { component: 'MainWindowUI', generation });
+                });
+                audioTrack.addEventListener('unmute', () => {
+                    logger.debug('Renderer microphone track unmuted', { component: 'MainWindowUI', generation });
+                });
+                audioTrack.addEventListener('ended', () => {
+                    logger.debug('Renderer microphone track ended', { component: 'MainWindowUI', generation });
+                    if (this.isRecording && generation === this._captureGeneration) {
+                        this._restartRendererAudioCapture('microphone-track-ended');
+                    }
+                });
+            }
+            return true;
+        } catch (error) {
+            if (workletNode) {
+                try { workletNode.disconnect(); } catch (_) { /* best effort */ }
+            }
+            this._audioWorkletNode = null;
+            logger.debug('AudioWorklet unavailable; falling back to ScriptProcessorNode', {
+                component: 'MainWindowUI',
+                generation,
+                error: error.message
+            });
+            return false;
+        }
     }
 
     _startRendererCaptureWatchdog(generation) {
@@ -1288,13 +1569,13 @@ class MainWindowUI {
                     error: error.message
                 });
             }
-            this.handleRecordingStopped();
+            await this.handleRecordingStopped();
             return;
         }
         const restartPromise = (async () => {
             this._captureRestartCount += 1;
             logger.debug('Restarting renderer audio capture', { component: 'MainWindowUI', reason, restartCount: this._captureRestartCount });
-            this._stopRendererAudioCapture();
+            await this._stopRendererAudioCapture();
             if (this.isRecording) {
                 await this._startRendererAudioCapture();
             }
@@ -1312,8 +1593,55 @@ class MainWindowUI {
         return restartPromise;
     }
 
+    _flushAudioWorkletTail() {
+        const workletNode = this._audioWorkletNode;
+        if (!workletNode || !workletNode.port) {
+            return Promise.resolve();
+        }
+
+        return new Promise((resolve) => {
+            let settled = false;
+            const timeout = setTimeout(() => finish(), AUDIO_TAIL_ACK_TIMEOUT_MS);
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                if (this._audioWorkletFlushState && this._audioWorkletFlushState.finish === finish) {
+                    this._audioWorkletFlushState = null;
+                }
+                resolve();
+            };
+            this._audioWorkletFlushState = {
+                flushId: `tail-${this._captureGeneration}-${++this._audioTailSequence}`,
+                generation: this._captureGeneration,
+                workletDone: false,
+                waitingMainAck: false,
+                mainAck: false,
+                finish
+            };
+            try {
+                workletNode.port.postMessage({ type: 'flush' });
+            } catch (_) {
+                finish();
+            }
+        });
+    }
+
     _stopRendererAudioCapture() {
-        this._captureGeneration += 1;
+        if (this._captureStopPromise) {
+            return this._captureStopPromise;
+        }
+        const stopPromise = this._performStopRendererAudioCapture();
+        this._captureStopPromise = stopPromise;
+        stopPromise.finally(() => {
+            if (this._captureStopPromise === stopPromise) {
+                this._captureStopPromise = null;
+            }
+        });
+        return stopPromise;
+    }
+
+    async _performStopRendererAudioCapture() {
         this._stopMicMeter();
         if (this._captureWatchdog) {
             clearInterval(this._captureWatchdog);
@@ -1325,6 +1653,21 @@ class MainWindowUI {
         }
         this._captureStartPromise = null;
         try {
+            await this._flushAudioWorkletTail();
+            this._captureGeneration += 1;
+            if (this._audioPort) {
+                this._audioPort.onmessage = null;
+                try { this._audioPort.close(); } catch (_) { /* best effort */ }
+                this._audioPort = null;
+            }
+            if (this._audioWorkletNode) {
+                this._audioWorkletNode.port.onmessage = null;
+                this._audioWorkletNode.port.onmessageerror = null;
+                this._audioWorkletNode.onprocessorerror = null;
+                this._audioWorkletNode.disconnect();
+                this._audioWorkletNode = null;
+            }
+            this._audioWorkletFlushState = null;
             if (this._scriptNode) {
                 this._scriptNode.disconnect();
                 this._scriptNode.onaudioprocess = null;
@@ -1350,6 +1693,7 @@ class MainWindowUI {
 
     updateSkillIndicator() {
         const skillNames = {
+            'general': 'General',
             'dsa': 'DSA',
             'behavioral': 'Behavioral', 
             'sales': 'Sales',
@@ -1437,13 +1781,13 @@ class MainWindowUI {
         
         const newSkill = this.availableSkills[newIndex];
         
-        // Update skill locally and notify main process
-        this.currentSkill = newSkill;
-        this.updateSkillIndicator();
-        
-        // Save the skill change via IPC
+        // Ask the main process to commit the skill change. The resulting
+        // skill-changed/skill-updated events keep every window synchronized.
         if (window.electronAPI && window.electronAPI.updateActiveSkill) {
-            window.electronAPI.updateActiveSkill(newSkill).then(() => {
+            window.electronAPI.updateActiveSkill(newSkill).then((result) => {
+                if (result && result.success === false) return;
+                this.handleSkillActivated(result && result.skill || newSkill);
+                this.showSkillChangeNotification(newSkill, direction);
                 logger.info('Skill navigation completed', {
                     component: 'MainWindowUI',
                     newSkill,
@@ -1455,14 +1799,15 @@ class MainWindowUI {
                     error: error.message
                 });
             });
+        } else {
+            this.handleSkillActivated(newSkill);
+            this.showSkillChangeNotification(newSkill, direction);
         }
-        
-        // Show visual feedback
-        this.showSkillChangeNotification(newSkill, direction);
     }
 
     showSkillChangeNotification(skill, direction) {
         const skillNames = {
+            'general': 'General',
             'dsa': 'DSA',
             'behavioral': 'Behavioral', 
             'sales': 'Sales',
@@ -1887,5 +2232,4 @@ if (typeof document !== 'undefined') {
         logger.info('MainWindowUI initialized and available as window.mainWindowUI');
     });
 }
-
 // module.exports = MainWindowUI; // Not needed in browser context
