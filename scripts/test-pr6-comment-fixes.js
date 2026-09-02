@@ -267,6 +267,29 @@ async function testStaleAudioWorkletStartDoesNotCreateNode() {
   assert.equal(ui._audioWorkletNode, null);
 }
 
+async function testAudioWorkletUsesConfiguredChunkSize() {
+  const { MainWindowUI, context } = loadMainWindowUI();
+  const ui = Object.create(MainWindowUI.prototype);
+  let nodeOptions = null;
+  ui.isRecording = true;
+  ui._captureGeneration = 1;
+  ui._audioWorkletNode = null;
+  ui._connectAudioNodeSilently = () => {};
+  context.window.AudioWorkletNode = class {
+    constructor(_audioContext, _name, options) {
+      nodeOptions = options;
+      this.port = {};
+    }
+  };
+  const audioContext = { audioWorklet: { addModule: async () => {} } };
+  const source = { connect() {} };
+  const stream = { getAudioTracks: () => [] };
+
+  assert.equal(await ui._tryStartAudioWorkletCapture(audioContext, source, stream, 1, 4096), true);
+  assert.equal(nodeOptions.processorOptions.bufferSize, 4096,
+    'AudioWorklet must receive the configured capture chunk size');
+}
+
 async function testAudioTailWaitsForMainProcessAck() {
   const { MainWindowUI } = loadMainWindowUI();
   const ui = Object.create(MainWindowUI.prototype);
@@ -478,6 +501,7 @@ function testSourceContracts() {
 const tests = [
   testAudioWorkletFlushesPartialTail,
   testStaleAudioWorkletStartDoesNotCreateNode,
+  testAudioWorkletUsesConfiguredChunkSize,
   testAudioTailWaitsForMainProcessAck,
   testQueuedAudioBufferSurvivesActiveWorkletFlush,
   testPreloadTransfersAudioPortToBothContexts,

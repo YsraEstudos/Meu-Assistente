@@ -1165,26 +1165,6 @@ class MainWindowUI {
                 this._audioPort = audioPort;
                 const source = audioContext.createMediaStreamSource(stream);
                 this._startMicMeter(audioContext, source, stream, generation);
-                const workletStarted = await this._tryStartAudioWorkletCapture(audioContext, source, stream, generation);
-                if (!this.isRecording || generation !== this._captureGeneration) {
-                    logger.debug('Renderer audio capture worklet start cancelled', {
-                        component: 'MainWindowUI',
-                        generation
-                    });
-                    return;
-                }
-                if (workletStarted) {
-                    this._startRendererCaptureWatchdog(generation);
-                    if (audioContext.state === 'suspended') {
-                        await audioContext.resume();
-                    }
-                    logger.info('Renderer audio capture started with AudioWorklet', {
-                        component: 'MainWindowUI',
-                        generation,
-                        audioContextState: audioContext.state
-                    });
-                    return;
-                }
 
                 let bufferSize = 2048;
                 try {
@@ -1205,6 +1185,34 @@ class MainWindowUI {
                     });
                     return;
                 }
+
+                const workletStarted = await this._tryStartAudioWorkletCapture(
+                    audioContext,
+                    source,
+                    stream,
+                    generation,
+                    bufferSize
+                );
+                if (!this.isRecording || generation !== this._captureGeneration) {
+                    logger.debug('Renderer audio capture worklet start cancelled', {
+                        component: 'MainWindowUI',
+                        generation
+                    });
+                    return;
+                }
+                if (workletStarted) {
+                    this._startRendererCaptureWatchdog(generation);
+                    if (audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                    }
+                    logger.info('Renderer audio capture started with AudioWorklet', {
+                        component: 'MainWindowUI',
+                        generation,
+                        audioContextState: audioContext.state
+                    });
+                    return;
+                }
+
                 const scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
                 this._scriptNode = scriptNode;
 
@@ -1417,7 +1425,7 @@ class MainWindowUI {
         }
     }
 
-    async _tryStartAudioWorkletCapture(audioContext, source, stream, generation) {
+    async _tryStartAudioWorkletCapture(audioContext, source, stream, generation, bufferSize = 2048) {
         const AudioWorkletNodeClass = window.AudioWorkletNode;
         if (!audioContext.audioWorklet || typeof AudioWorkletNodeClass !== 'function') {
             return false;
@@ -1434,7 +1442,7 @@ class MainWindowUI {
                 numberOfInputs: 1,
                 numberOfOutputs: 1,
                 channelCount: 1,
-                processorOptions: { bufferSize: 2048 }
+                processorOptions: { bufferSize: normalizeCaptureBufferSize(bufferSize) }
             });
             workletNode.port.onmessage = (event) => {
                 this._handleAudioWorkletMessage(event && event.data, generation);
