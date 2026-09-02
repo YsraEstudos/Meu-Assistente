@@ -2101,7 +2101,7 @@ class ApplicationController {
       azureRegion: process.env.AZURE_SPEECH_REGION || "",
       whisperEngine: process.env.WHISPER_ENGINE || "whisper-cpp",
       whisperCommand: process.env.WHISPER_COMMAND || "",
-      whisperModel: process.env.WHISPER_MODEL || "small",
+      whisperModel: process.env.WHISPER_MODEL ?? "small",
       whisperLanguage: process.env.WHISPER_LANGUAGE || "pt",
       whisperCaptureChunkSamples: process.env.WHISPER_CAPTURE_CHUNK_SAMPLES ||
         speechService.getStatus().effectiveSettings.whisperCaptureChunkSamples || "2048",
@@ -2168,26 +2168,31 @@ class ApplicationController {
       // Writing to .env ensures they survive app restarts and are picked
       // up the next time the app boots.
       const envUpdates = {};
-      const supportedGeminiModels = ["gemini-3.6-flash", "gemini-3.5-flash-lite"];
-      const supportedThinkingLevels = ["minimal", "low", "medium", "high"];
+      const supportedGeminiModels = config.get("llm.gemini.supportedModels") || [];
+      const supportedThinkingLevels = config.get("llm.gemini.supportedThinkingLevels") || [];
       const previousGeminiModel = config.get("llm.gemini.model");
       const previousGeminiThinkingLevel = config.get("llm.gemini.generation.thinkingConfig.thinkingLevel");
-      const nextGeminiModel = supportedGeminiModels.includes(settings.geminiModel)
-        ? settings.geminiModel
+      const requestedGeminiModel = settings.geminiModel === undefined
+        ? null
+        : String(settings.geminiModel).trim();
+      const requestedThinkingLevel = settings.geminiThinkingLevel === undefined
+        ? null
+        : String(settings.geminiThinkingLevel).trim().toLowerCase();
+      const nextGeminiModel = supportedGeminiModels.includes(requestedGeminiModel)
+        ? requestedGeminiModel
         : previousGeminiModel;
-      const nextGeminiThinkingLevel = supportedThinkingLevels.includes(settings.geminiThinkingLevel)
-        ? settings.geminiThinkingLevel
+      const nextGeminiThinkingLevel = supportedThinkingLevels.includes(requestedThinkingLevel)
+        ? requestedThinkingLevel
         : previousGeminiThinkingLevel;
-      if (settings.geminiModel !== undefined && nextGeminiModel) {
-        config.set("llm.gemini.model", nextGeminiModel);
-        config.set("llm.gemini.fallbackModels", supportedGeminiModels.filter((model) => model !== nextGeminiModel));
-        envUpdates.GEMINI_MODEL = nextGeminiModel;
+      if (settings.geminiModel !== undefined && supportedGeminiModels.includes(requestedGeminiModel)) {
+        envUpdates.GEMINI_MODEL = requestedGeminiModel;
+      } else if (settings.geminiModel !== undefined) {
+        logger.warn("Ignoring unsupported Gemini model from settings", { geminiModel: requestedGeminiModel });
       }
-      if (settings.geminiThinkingLevel !== undefined && nextGeminiThinkingLevel) {
-        config.set("llm.gemini.generation.thinkingConfig", {
-          thinkingLevel: nextGeminiThinkingLevel
-        });
-        envUpdates.GEMINI_THINKING_LEVEL = nextGeminiThinkingLevel;
+      if (settings.geminiThinkingLevel !== undefined && supportedThinkingLevels.includes(requestedThinkingLevel)) {
+        envUpdates.GEMINI_THINKING_LEVEL = requestedThinkingLevel;
+      } else if (settings.geminiThinkingLevel !== undefined) {
+        logger.warn("Ignoring unsupported Gemini thinking level from settings", { thinkingLevel: requestedThinkingLevel });
       }
       if (settings.speechProvider === "azure" || settings.speechProvider === "whisper") {
         envUpdates.SPEECH_PROVIDER = settings.speechProvider;
@@ -2264,7 +2269,6 @@ class ApplicationController {
       if (settings.geminiKey !== undefined && settings.geminiKey !== "[CONFIGURED]") {
         envUpdates.GEMINI_API_KEY = settings.geminiKey;
       }
-
       // Capture the previous whisper command BEFORE persisting — persistEnvUpdates
       // mutates process.env in place, so comparing afterwards would always read
       // equal and skip the speech re-init below (the exact stale-mic-after-install
@@ -2281,14 +2285,27 @@ class ApplicationController {
 
       const persistedKeys = this.persistEnvUpdates(envUpdates);
 
+      if (persistedKeys.includes("GEMINI_MODEL")) {
+        config.set("llm.gemini.model", envUpdates.GEMINI_MODEL);
+        config.set("llm.gemini.fallbackModels", supportedGeminiModels.filter((model) => model !== envUpdates.GEMINI_MODEL));
+      }
+      if (persistedKeys.includes("GEMINI_THINKING_LEVEL")) {
+        config.set("llm.gemini.generation.thinkingConfig", {
+          thinkingLevel: envUpdates.GEMINI_THINKING_LEVEL
+        });
+      }
+
       // If the Gemini key was just saved, reinitialize the LLM service
       // so the new client picks up the key. Without this, the test-
       // connection button in the onboarding wizard fails with
       // "Service not initialized" because the client was first created
       // at app startup, before any key was set.
-      const geminiModelChanged = settings.geminiModel !== undefined && nextGeminiModel !== previousGeminiModel;
-      const geminiThinkingLevelChanged = settings.geminiThinkingLevel !== undefined && nextGeminiThinkingLevel !== previousGeminiThinkingLevel;
-      if ((settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) || geminiModelChanged || geminiThinkingLevelChanged) {
+      const geminiModelChanged = persistedKeys.includes("GEMINI_MODEL") &&
+        nextGeminiModel !== previousGeminiModel;
+      const geminiThinkingLevelChanged = persistedKeys.includes("GEMINI_THINKING_LEVEL") &&
+        nextGeminiThinkingLevel !== previousGeminiThinkingLevel;
+      if ((settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) ||
+        geminiModelChanged || geminiThinkingLevelChanged) {
         try {
           llmService.initializeClient();
           logger.info("LLM service reinitialized after Gemini settings update", {
