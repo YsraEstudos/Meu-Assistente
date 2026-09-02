@@ -127,7 +127,10 @@ class ApplicationController {
   this.codingLanguage = "cpp";
     this.speechAvailable = false;
     this._speechInitializationTimer = null;
-    this.mobileSync = new MobileSyncService({ logger });
+    this.mobileSync = new MobileSyncService({
+      logger,
+      bindHost: config.get("mobileSync.bindHost")
+    });
     this.responseStream = new ResponseStream();
     this._startupTrace = performanceTracker.begin("app-start");
 
@@ -553,15 +556,16 @@ class ApplicationController {
         });
       }
       this._audioIpcStats = null;
-    this._audioPorts = new Set();
       this._audioChunkWindow = { count: 0, bytes: 0, resetAt: Date.now() + 1000, dropped: 0 };
       // This is the only point where voice text may reach the LLM. The speech
       // service emits it only after the active segment and consolidated tail
       // batches have completed.
-      if (typeof speechService.markLatencyEvent === 'function') {
-        speechService.markLatencyEvent('dispatchAt');
-      }
-      const latency = payload.latency || speechService.getLatencyMetrics?.() || null;
+      const liveLatency = typeof speechService.markLatencyEvent === 'function'
+        ? speechService.markLatencyEvent('dispatchAt')
+        : null;
+      const latency = liveLatency || (speechService && typeof speechService.getLatencyMetrics === "function"
+        ? speechService.getLatencyMetrics()
+        : payload.latency || null);
       performanceTracker.mark('speech-consolidated-dispatch', {
         sessionId: payload.sessionId || this._speechSessionId,
         latency
@@ -570,7 +574,7 @@ class ApplicationController {
       BrowserWindow.getAllWindows().forEach((window) => {
         window.webContents.send("recording-stopped", {
           sessionId: payload.sessionId || this._speechSessionId,
-          latency: speechService.getLatencyMetrics?.() || latency
+          latency
         });
       });
     });
@@ -738,7 +742,7 @@ class ApplicationController {
     if (len > 2 * 1024 * 1024) {
       logger.warn('Oversized audio chunk rejected', { length: len });
       speechService.recordAudioChunk?.(len, true);
-      return;
+      return false;
     }
 
     const now = Date.now();
@@ -753,9 +757,10 @@ class ApplicationController {
       }
       this._audioChunkWindow.dropped += 1;
       speechService.recordAudioChunk?.(len, true);
-      return;
+      return false;
     }
     this.handleRendererAudioPayload(rawBuffer);
+    return true;
   }
 
   closeAudioPorts() {
@@ -798,7 +803,9 @@ class ApplicationController {
     ipcMain.handle("get-speech-status", async () => {
       try {
         const readStatus = speechService.getHardwareStatusAsync || speechService.getHardwareStatus;
-        return await readStatus.call(speechService, { probe: false });
+        return readStatus
+          ? await readStatus.call(speechService, { probe: false })
+          : { ok: false, available: false, execution: { kind: 'unavailable', label: 'Indisponível' } };
       } catch (error) {
         logger.warn("Failed to read speech hardware status", { error: error.message });
         return { ok: false, available: false, error: error.message, execution: { kind: 'unavailable', label: 'Indisponível' } };
@@ -808,7 +815,9 @@ class ApplicationController {
     ipcMain.handle("diagnose-speech", async (event, options = {}) => {
       try {
         const readStatus = speechService.getHardwareStatusAsync || speechService.getHardwareStatus;
-        return await readStatus.call(speechService, { probe: options.probe === true });
+        return readStatus
+          ? await readStatus.call(speechService, { probe: options.probe === true })
+          : { ok: false, available: false, execution: { kind: 'unavailable', label: 'Indisponível' } };
       } catch (error) {
         logger.warn("Speech hardware diagnosis failed", { error: error.message });
         return { ok: false, available: false, error: error.message, execution: { kind: 'unavailable', label: 'Indisponível' } };
@@ -830,22 +839,41 @@ class ApplicationController {
     // serialization copy; audio-chunk remains the compatibility fallback.
     ipcMain.on("audio-port", (event) => {
       const port = event.ports && event.ports[0];
+      if (!this._isAllowedRenderer(event, ['main'])) {
+        try { port?.close(); } catch (_) { /* best effort */ }
+        logger.warn('Rejected audio transport from unauthorized renderer');
+        return;
+      }
       if (!port || typeof port.on !== 'function') return;
       this._audioPorts.add(port);
       port.on('message', (messageEvent) => {
-        const buf = messageEvent && messageEvent.data && messageEvent.data.buffer;
-        this._handleBoundedRendererAudioPayload(buf);
+        const data = messageEvent && messageEvent.data;
+        const accepted = this._handleBoundedRendererAudioPayload(data && data.buffer);
+        if (data && data.flushId) {
+          try {
+            port.postMessage({
+              type: 'audio-tail-accepted',
+              flushId: data.flushId,
+              accepted
+            });
+          } catch (_) { /* renderer timeout remains the fallback */ }
+        }
       });
       port.on('close', () => this._audioPorts.delete(port));
       if (typeof port.start === 'function') port.start();
     });
 
-    ipcMain.on("audio-chunk", (_event, data) => {
+    ipcMain.on("audio-chunk", (event, data) => {
+      if (!this._isAllowedRenderer(event, ['main'])) {
+        logger.warn('Rejected audio chunk from unauthorized renderer');
+        return;
+      }
       const buf = data && data.buffer;
       this._handleBoundedRendererAudioPayload(buf);
     });
 
-    ipcMain.on("speech-capture-drained", () => {
+    ipcMain.on("speech-capture-drained", (event) => {
+      if (!this._isAllowedRenderer(event, ['main'])) return;
       speechService.confirmRendererCaptureStopped();
     });
 
@@ -1555,7 +1583,7 @@ class ApplicationController {
         }
       });
 
-      this.broadcastLLMError(error.message);
+      this.broadcastLLMError(error.message, messageId);
     }
   }
 
@@ -1614,6 +1642,9 @@ class ApplicationController {
     }
     this._utteranceBuffer = "";
     this._utteranceDispatchInFlight = true;
+    if (speechService && typeof speechService.markLatencyEvent === "function") {
+      speechService.markLatencyEvent('dispatchAt');
+    }
 
     try {
       const sessionHistory = sessionManager.getOptimizedHistory();
@@ -1693,7 +1724,8 @@ class ApplicationController {
           });
           this.appendResponseStream(messageId, delta);
           this.publishMobileResponseChunk({ messageId, delta });
-        }
+        },
+        false
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
       this.endResponseStream(messageId, { response: llmResult.response });
@@ -1812,11 +1844,13 @@ class ApplicationController {
     windowManager.broadcastToAllWindows("llm-response", broadcastData);
   }
 
-  broadcastLLMError(errorMessage) {
-    windowManager.broadcastToAllWindows("llm-error", {
+  broadcastLLMError(errorMessage, messageId = null) {
+    const data = {
       error: errorMessage,
-      timestamp: new Date().toISOString(),
-    });
+      timestamp: new Date().toISOString()
+    };
+    if (messageId) data.messageId = messageId;
+    windowManager.broadcastToAllWindows("llm-error", data);
   }
 
   startResponseStream(messageId, skill) {
@@ -1847,10 +1881,11 @@ class ApplicationController {
     };
     const channel = channels[type];
     if (!channel) return;
+    const isTerminalEvent = type === 'end' || type === 'error';
 
     for (const windowType of ['chat', 'llmResponse']) {
       const target = windowManager.getWindow(windowType);
-      if (!target || target.isDestroyed() || !target.isVisible()) continue;
+      if (!target || target.isDestroyed() || (!isTerminalEvent && !target.isVisible())) continue;
       target.webContents.send(channel, data);
     }
   }
@@ -2066,8 +2101,10 @@ class ApplicationController {
       azureRegion: process.env.AZURE_SPEECH_REGION || "",
       whisperEngine: process.env.WHISPER_ENGINE || "whisper-cpp",
       whisperCommand: process.env.WHISPER_COMMAND || "",
-      whisperModel: process.env.WHISPER_MODEL || "small",
-      whisperLanguage: process.env.WHISPER_LANGUAGE || "auto",
+      whisperModel: process.env.WHISPER_MODEL ?? "small",
+      whisperLanguage: process.env.WHISPER_LANGUAGE || "pt",
+      whisperCaptureChunkSamples: process.env.WHISPER_CAPTURE_CHUNK_SAMPLES ||
+        speechService.getStatus().effectiveSettings.whisperCaptureChunkSamples || "2048",
       whisperDevice: process.env.WHISPER_DEVICE || "auto",
       whisperCaptureMode: process.env.WHISPER_CAPTURE_MODE ||
         (process.env.WHISPER_MANUAL_CAPTURE === "true" ? "manual" : "vad"),
@@ -2131,26 +2168,31 @@ class ApplicationController {
       // Writing to .env ensures they survive app restarts and are picked
       // up the next time the app boots.
       const envUpdates = {};
-      const supportedGeminiModels = ["gemini-3.6-flash", "gemini-3.5-flash-lite"];
-      const supportedThinkingLevels = ["minimal", "low", "medium", "high"];
+      const supportedGeminiModels = config.get("llm.gemini.supportedModels") || [];
+      const supportedThinkingLevels = config.get("llm.gemini.supportedThinkingLevels") || [];
       const previousGeminiModel = config.get("llm.gemini.model");
       const previousGeminiThinkingLevel = config.get("llm.gemini.generation.thinkingConfig.thinkingLevel");
-      const nextGeminiModel = supportedGeminiModels.includes(settings.geminiModel)
-        ? settings.geminiModel
+      const requestedGeminiModel = settings.geminiModel === undefined
+        ? null
+        : String(settings.geminiModel).trim();
+      const requestedThinkingLevel = settings.geminiThinkingLevel === undefined
+        ? null
+        : String(settings.geminiThinkingLevel).trim().toLowerCase();
+      const nextGeminiModel = supportedGeminiModels.includes(requestedGeminiModel)
+        ? requestedGeminiModel
         : previousGeminiModel;
-      const nextGeminiThinkingLevel = supportedThinkingLevels.includes(settings.geminiThinkingLevel)
-        ? settings.geminiThinkingLevel
+      const nextGeminiThinkingLevel = supportedThinkingLevels.includes(requestedThinkingLevel)
+        ? requestedThinkingLevel
         : previousGeminiThinkingLevel;
-      if (settings.geminiModel !== undefined && nextGeminiModel) {
-        config.set("llm.gemini.model", nextGeminiModel);
-        config.set("llm.gemini.fallbackModels", supportedGeminiModels.filter((model) => model !== nextGeminiModel));
-        envUpdates.GEMINI_MODEL = nextGeminiModel;
+      if (settings.geminiModel !== undefined && supportedGeminiModels.includes(requestedGeminiModel)) {
+        envUpdates.GEMINI_MODEL = requestedGeminiModel;
+      } else if (settings.geminiModel !== undefined) {
+        logger.warn("Ignoring unsupported Gemini model from settings", { geminiModel: requestedGeminiModel });
       }
-      if (settings.geminiThinkingLevel !== undefined && nextGeminiThinkingLevel) {
-        config.set("llm.gemini.generation.thinkingConfig", {
-          thinkingLevel: nextGeminiThinkingLevel
-        });
-        envUpdates.GEMINI_THINKING_LEVEL = nextGeminiThinkingLevel;
+      if (settings.geminiThinkingLevel !== undefined && supportedThinkingLevels.includes(requestedThinkingLevel)) {
+        envUpdates.GEMINI_THINKING_LEVEL = requestedThinkingLevel;
+      } else if (settings.geminiThinkingLevel !== undefined) {
+        logger.warn("Ignoring unsupported Gemini thinking level from settings", { thinkingLevel: requestedThinkingLevel });
       }
       if (settings.speechProvider === "azure" || settings.speechProvider === "whisper") {
         envUpdates.SPEECH_PROVIDER = settings.speechProvider;
@@ -2227,7 +2269,6 @@ class ApplicationController {
       if (settings.geminiKey !== undefined && settings.geminiKey !== "[CONFIGURED]") {
         envUpdates.GEMINI_API_KEY = settings.geminiKey;
       }
-
       // Capture the previous whisper command BEFORE persisting — persistEnvUpdates
       // mutates process.env in place, so comparing afterwards would always read
       // equal and skip the speech re-init below (the exact stale-mic-after-install
@@ -2244,14 +2285,27 @@ class ApplicationController {
 
       const persistedKeys = this.persistEnvUpdates(envUpdates);
 
+      if (persistedKeys.includes("GEMINI_MODEL")) {
+        config.set("llm.gemini.model", envUpdates.GEMINI_MODEL);
+        config.set("llm.gemini.fallbackModels", supportedGeminiModels.filter((model) => model !== envUpdates.GEMINI_MODEL));
+      }
+      if (persistedKeys.includes("GEMINI_THINKING_LEVEL")) {
+        config.set("llm.gemini.generation.thinkingConfig", {
+          thinkingLevel: envUpdates.GEMINI_THINKING_LEVEL
+        });
+      }
+
       // If the Gemini key was just saved, reinitialize the LLM service
       // so the new client picks up the key. Without this, the test-
       // connection button in the onboarding wizard fails with
       // "Service not initialized" because the client was first created
       // at app startup, before any key was set.
-      const geminiModelChanged = settings.geminiModel !== undefined && nextGeminiModel !== previousGeminiModel;
-      const geminiThinkingLevelChanged = settings.geminiThinkingLevel !== undefined && nextGeminiThinkingLevel !== previousGeminiThinkingLevel;
-      if ((settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) || geminiModelChanged || geminiThinkingLevelChanged) {
+      const geminiModelChanged = persistedKeys.includes("GEMINI_MODEL") &&
+        nextGeminiModel !== previousGeminiModel;
+      const geminiThinkingLevelChanged = persistedKeys.includes("GEMINI_THINKING_LEVEL") &&
+        nextGeminiThinkingLevel !== previousGeminiThinkingLevel;
+      if ((settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) ||
+        geminiModelChanged || geminiThinkingLevelChanged) {
         try {
           llmService.initializeClient();
           logger.info("LLM service reinitialized after Gemini settings update", {

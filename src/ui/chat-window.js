@@ -164,6 +164,8 @@ class ChatWindowUI {
             });
             
             window.electronAPI.onLlmError((event, data) => {
+                if (data?.messageId && (this._canonicalStreamIds.has(data.messageId) ||
+                    this._completedCanonicalIds.has(data.messageId))) return;
                 this.addMessage(`LLM Error: ${data.error}`, 'error');
             });
             
@@ -484,7 +486,7 @@ class ChatWindowUI {
             textDiv,
             buffer: '',
             frame: null,
-            shouldAutoScroll: this.isChatAtBottom()
+            frameType: null
         });
         this.elements.chatMessages.scrollTop = this.elements.chatMessages.scrollHeight;
     }
@@ -495,18 +497,21 @@ class ChatWindowUI {
         const state = this._streamStates.get(messageId);
         if (!state) return;
         state.buffer += String(delta);
-        state.shouldAutoScroll = this.isChatAtBottom();
         if (state.frame != null) return;
 
         const render = () => {
             state.frame = null;
             if (!this._streamStates.has(messageId)) return;
+            const shouldAutoScroll = this.isChatAtBottom();
             state.textDiv.textContent = state.buffer;
-            if (state.shouldAutoScroll) {
+            if (shouldAutoScroll) {
                 this.elements.chatMessages.scrollTop = this.elements.chatMessages.scrollHeight;
             }
         };
-        state.frame = typeof requestAnimationFrame === 'function'
+        const canCancelAnimationFrame = typeof requestAnimationFrame === 'function' &&
+            typeof cancelAnimationFrame === 'function';
+        state.frameType = canCancelAnimationFrame ? 'animation-frame' : 'timeout';
+        state.frame = canCancelAnimationFrame
             ? requestAnimationFrame(render)
             : setTimeout(render, 16);
     }
@@ -521,7 +526,11 @@ class ChatWindowUI {
     finalizeStreamingResponse(messageId, response) {
         const state = messageId && this._streamStates.get(messageId);
         if (state) {
-            if (state.frame != null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(state.frame);
+            if (state.frame != null) {
+                if (state.frameType === 'animation-frame') cancelAnimationFrame(state.frame);
+                else clearTimeout(state.frame);
+                state.frame = null;
+            }
             state.messageDiv.remove();
             this._streamStates.delete(messageId);
         }
@@ -563,7 +572,7 @@ class ChatWindowUI {
         timeDiv.textContent = new Date().toLocaleTimeString();
         const textDiv = document.createElement('div');
         textDiv.className = 'message-text';
-        const escapedLang = (language || 'text').toUpperCase();
+        const escapedLang = this.escapeHtmlForSnippet((language || 'text').toUpperCase());
         const escapedCode = this.escapeHtmlForSnippet(code || '');
         textDiv.innerHTML = `
             <div style="font-size:12px;color:rgba(255,255,255,0.85);margin-bottom:6px;">Snippet: ${escapedLang}</div>

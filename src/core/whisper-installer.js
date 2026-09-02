@@ -24,6 +24,17 @@ const path = require('path');
 const PROBE_TIMEOUT_MS = 30000; // first `import whisper` (torch) is slow on a cold cache
 const INSTALL_TIMEOUT_MS = 300000; // pip downloads can be slow on cold cache
 
+function buildChildEnv(extra = {}) {
+  const env = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    const upper = String(key).toUpperCase();
+    if (upper === 'GEMINI_API_KEY' || upper === 'AZURE_SPEECH_KEY' || upper === 'AZURE_SPEECH_REGION') continue;
+    if (upper.includes('TOKEN') || upper.includes('SECRET')) continue;
+    env[key] = value;
+  }
+  return { ...env, ...extra };
+}
+
 /**
  * Run a command, streaming stdout/stderr lines to `onProgress` as they
  * arrive. Resolves with the full result once the process exits.
@@ -49,7 +60,7 @@ function runExec(cmd, args, { timeout = PROBE_TIMEOUT_MS, onProgress } = {}) {
     try {
       child = spawn(cmd, args, {
         windowsHide: true,
-        env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' },
+        env: buildChildEnv({ PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' }),
       });
     } catch (e) {
       finish({ ok: false, error: e.message, stderr: e.message, stdout: '', code: null });
@@ -321,7 +332,7 @@ class WhisperInstaller {
 
     // Step 3: pip install into the venv
     log(`→ Installing openai-whisper into venv (this can take a few minutes)…`);
-    const pipResult = await this.runExec(vp.python, ['-m', 'pip', 'install', '--upgrade', 'openai-whisper'], {
+    const pipResult = await this.runExec(vp.python, ['-m', 'pip', 'install', '--upgrade', 'openai-whisper==20240930'], {
       timeout: INSTALL_TIMEOUT_MS,
       onProgress: log,
     });
@@ -427,11 +438,12 @@ class WhisperInstaller {
     } else {
       log('No Faster Whisper GPU runtime detected. Using device=cpu, compute_type=int8.');
     }
-    const pipResult = await this.runExec(vp.python, ['-m', 'pip', 'install', '--upgrade', 'pip', 'faster-whisper'], { timeout: INSTALL_TIMEOUT_MS, onProgress: log });
+    const pipResult = await this.runExec(vp.python, ['-m', 'pip', 'install', 'pip==24.3.1', 'faster-whisper==1.0.3'], { timeout: INSTALL_TIMEOUT_MS, onProgress: log });
     if (!pipResult.ok) return { ok: false, command: null, message: 'pip install failed: ' + (pipResult.stderr || pipResult.error), logs: pipResult.stderr || '' };
     let supportLogs = '';
     if (device === 'cuda') {
-      const cudaResult = await this.runExec(vp.python, ['-m', 'pip', 'install', 'nvidia-cublas-cu12', 'nvidia-cudnn-cu12'], { timeout: INSTALL_TIMEOUT_MS, onProgress: log });
+      // Review these CUDA pins when updating support.
+      const cudaResult = await this.runExec(vp.python, ['-m', 'pip', 'install', 'nvidia-cublas-cu12==12.1.3.1', 'nvidia-cudnn-cu12==9.1.0.70'], { timeout: INSTALL_TIMEOUT_MS, onProgress: log });
       supportLogs = cudaResult.stdout || '';
       if (!cudaResult.ok) log('! CUDA runtime packages could not be installed: ' + (cudaResult.stderr || cudaResult.error));
     }
@@ -548,6 +560,7 @@ class WhisperInstaller {
       const sourceDir = path.join(this.dataDir, '.whisper.cpp');
       if (!fs.existsSync(path.join(sourceDir, 'CMakeLists.txt'))) {
         log('→ Cloning whisper.cpp v1.9.1…');
+        // Integrity is provided by the pinned v1.9.1 branch/tag selection.
         const clone = await this.runExec(git, ['clone', '--branch', 'v1.9.1', '--depth', '1', 'https://github.com/ggml-org/whisper.cpp.git', sourceDir], { timeout: 600000, onProgress: log });
         buildLogs += clone.stdout || '';
         if (!clone.ok) return { ok: false, command: null, message: 'Failed to clone whisper.cpp: ' + (clone.stderr || clone.error), logs: buildLogs };
@@ -570,23 +583,36 @@ class WhisperInstaller {
   }
 
   _normaliseWhisperCppModelName(modelName) {
-    const raw = String(modelName || 'turbo').trim().toLowerCase().replace(/^ggml-/, '').replace(/\.bin$/, '');
+    const sanitized = this._sanitizeModelName(modelName);
+    if (!sanitized) throw new Error('Invalid model name: ' + modelName);
+    const raw = sanitized.replace(/^ggml-/, '').replace(/\.(bin|pt)$/, '');
     return { turbo: 'large-v3-turbo', large: 'large-v3' }[raw] || raw;
+  }
+
+  _sanitizeModelName(raw) {
+    const value = String(raw ?? '').trim().toLowerCase().replace(/^ggml-/, '').replace(/\.(bin|pt)$/, '');
+    if (!value || value.length > 64) return null;
+    if (value.includes('/') || value.includes('\\') || value.includes('..') || /\s/.test(value)) return null;
+    if (!/^[a-z0-9._-]+$/.test(value)) return null;
+    return value;
   }
 
   async _downloadWhisperCppModel(modelName, { onProgress } = {}) {
     const log = (line) => { if (typeof onProgress === 'function' && line) onProgress(line); };
     const python = this._detectPython();
     if (!python) return { ok: false, message: 'Python 3 is required to download whisper.cpp models.', path: null };
-    const modelPath = this._getModelPath(modelName);
+    const sanitized = this._sanitizeModelName(modelName);
+    if (!sanitized) return { ok: false, message: 'Invalid model name: ' + modelName, path: null };
+    const modelPath = this._getModelPath(sanitized);
     if (fs.existsSync(modelPath)) return { ok: true, message: 'Model already exists', path: modelPath };
     try { fs.mkdirSync(this.modelDir, { recursive: true }); } catch (_) { /* best effort */ }
-    const key = this._normaliseWhisperCppModelName(modelName);
+    const key = this._normaliseWhisperCppModelName(sanitized);
     const url = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-' + key + '.bin';
     log('→ Downloading whisper.cpp ' + modelName + ' model…');
     const script = 'import urllib.request; urllib.request.urlretrieve(' + JSON.stringify(url) + ', ' + JSON.stringify(modelPath) + '); print("model_downloaded")';
     const result = await this.runExec(python, ['-c', script], { timeout: 900000, onProgress: log });
-    if (!result.ok || !fs.existsSync(modelPath)) return { ok: false, message: 'Model download failed: ' + (result.stderr || result.error), path: null };
+    const stat = result.ok && fs.existsSync(modelPath) ? fs.statSync(modelPath) : null;
+    if (!result.ok || !stat || stat.size <= 0) return { ok: false, message: 'Model download failed: ' + (result.stderr || result.error), path: null };
     return { ok: true, message: 'Model downloaded successfully', path: modelPath };
   }
 
@@ -802,6 +828,8 @@ class WhisperInstaller {
 
   async downloadModel(modelName = 'turbo', { onProgress } = {}) {
     if (this.engine === 'whisper-cpp') return this._downloadWhisperCppModel(modelName, { onProgress });
+    const sanitized = this._sanitizeModelName(modelName);
+    if (!sanitized) return { ok: false, message: 'Invalid model name: ' + modelName, path: null };
     const log = (line) => {
       if (typeof onProgress === 'function' && line) {
         try { onProgress(line); } catch (_) { /* ignore */ }
@@ -822,7 +850,7 @@ class WhisperInstaller {
     log(`→ Downloading ${modelName} weights to ${downloadRoot} (this may take a minute)…`);
     const loadResult = await this.runExec(pythonCmd, [
       '-c',
-      `import whisper; whisper.load_model(${JSON.stringify(modelName)}, download_root=${JSON.stringify(downloadRoot)}); print('model_loaded')`
+      `import whisper; whisper.load_model(${JSON.stringify(sanitized)}, download_root=${JSON.stringify(downloadRoot)}); print('model_loaded')`
     ], {
       timeout: 600000,
       onProgress: log,
@@ -832,9 +860,9 @@ class WhisperInstaller {
       return { ok: false, message: loadResult.stderr || loadResult.error };
     }
 
-    const modelPath = this._getModelPath(modelName);
-    log(`✓ Model ${modelName} ready at ${modelPath}`);
-    return { ok: true, message: `Model ${modelName} downloaded successfully`, path: modelPath };
+    const modelPath = this._getModelPath(sanitized);
+    log(`✓ Model ${sanitized} ready at ${modelPath}`);
+    return { ok: true, message: `Model ${sanitized} downloaded successfully`, path: modelPath };
   }
 
   _resolveWhisperPython() {
@@ -865,11 +893,21 @@ class WhisperInstaller {
    * Get the expected model cache path inside our unified model dir.
    */
   _getModelPath(modelName) {
-    if (this.engine === 'whisper-cpp') return path.join(this.modelDir, 'ggml-' + this._normaliseWhisperCppModelName(modelName) + '.bin');
-    return path.join(this.modelDir, modelName + '.pt');
+    const modelDirAbs = path.resolve(this.modelDir);
+    const name = this._sanitizeModelName(modelName);
+    if (!name || name.includes('..')) throw new Error('Invalid model name: ' + modelName);
+    if (this.engine === 'whisper-cpp') {
+      const resolved = path.resolve(this.modelDir, 'ggml-' + this._normaliseWhisperCppModelName(name) + '.bin');
+      if (!resolved.startsWith(modelDirAbs + path.sep)) throw new Error('Invalid model path: ' + modelName);
+      return resolved;
+    }
+    const resolved = path.resolve(this.modelDir, name + '.pt');
+    if (!resolved.startsWith(modelDirAbs + path.sep)) throw new Error('Invalid model path: ' + modelName);
+    return resolved;
   }
 }
 
 module.exports = WhisperInstaller;
 module.exports.WhisperInstaller = WhisperInstaller;
 module.exports.runExec = runExec;
+module.exports.buildChildEnv = buildChildEnv;

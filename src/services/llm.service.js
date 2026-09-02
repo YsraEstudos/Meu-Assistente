@@ -15,6 +15,8 @@ class LLMService {
     this.isInitialized = false;
     this.requestCount = 0;
     this.errorCount = 0;
+    this._unsupportedGenerationWarnings = new Set();
+    this._generationConfigSources = new WeakMap();
     
     this.initializeClient();
   }
@@ -47,7 +49,18 @@ class LLMService {
     }
   }
 
-  getGenerationConfig(overrides = {}) {
+  _thinkingBudgetForLevel(level) {
+    const budgets = {
+      none: 0,
+      minimal: 1024,
+      low: 1024,
+      medium: 8192,
+      high: 24576
+    };
+    return budgets[String(level || '').trim().toLowerCase()] ?? 0;
+  }
+
+  getGenerationConfig(overrides = {}, model = null) {
     const defaults = config.get('llm.gemini.generation') || {};
     const fallback = {
       temperature: 0.7,
@@ -64,11 +77,32 @@ class LLMService {
 
     // Gemini 3.6 Flash and Gemini 3.5 Flash-Lite use thinkingLevel and no
     // longer accept the legacy sampling controls in generationConfig.
-    const model = this.model || config.get('llm.gemini.model');
-    if (model === 'gemini-3.6-flash' || model === 'gemini-3.5-flash-lite') {
-      delete generationConfig.temperature;
-      delete generationConfig.topK;
-      delete generationConfig.topP;
+    const targetModel = model || this.model || config.get('llm.gemini.model');
+    if (targetModel === 'gemini-2.5-flash-lite') {
+      const overrideThinking = overrides.thinkingConfig || {};
+      const thinkingConfig = generationConfig.thinkingConfig || {};
+      const thinkingBudget = overrideThinking.thinkingLevel !== undefined
+        ? this._thinkingBudgetForLevel(overrideThinking.thinkingLevel)
+        : thinkingConfig.thinkingBudget !== undefined
+          ? thinkingConfig.thinkingBudget
+          : this._thinkingBudgetForLevel(thinkingConfig.thinkingLevel);
+      generationConfig.thinkingConfig = { thinkingBudget };
+    }
+
+    if (targetModel === 'gemini-3.6-flash' || targetModel === 'gemini-3.5-flash-lite') {
+      const unsupportedFields = ['temperature', 'topK', 'topP']
+        .filter((field) => generationConfig[field] !== undefined);
+      if (unsupportedFields.length) {
+        const warningKey = `${targetModel}:${unsupportedFields.join(',')}`;
+        if (!this._unsupportedGenerationWarnings.has(warningKey)) {
+          logger.warn('Ignoring unsupported Gemini sampling controls', {
+            model: targetModel,
+            fields: unsupportedFields
+          });
+          this._unsupportedGenerationWarnings.add(warningKey);
+        }
+        unsupportedFields.forEach((field) => delete generationConfig[field]);
+      }
       generationConfig.thinkingConfig = {
         thinkingLevel: generationConfig.thinkingConfig?.thinkingLevel || 'medium'
       };
@@ -77,9 +111,19 @@ class LLMService {
     return generationConfig;
   }
 
-  applyGenerationDefaults(request, overrides = {}) {
-    request.generationConfig = this.getGenerationConfig({ ...(request.generationConfig || {}), ...overrides });
+  applyGenerationDefaults(request, overrides = {}, model = null) {
+    const generationOverrides = {
+      ...(this._generationConfigSources.get(request) || request.generationConfig || {}),
+      ...overrides
+    };
+    this._generationConfigSources.set(request, generationOverrides);
+    request.generationConfig = this.getGenerationConfig(generationOverrides, model);
     return request;
+  }
+
+  _getGenerationConfigForModel(request, model) {
+    const source = this._generationConfigSources.get(request) || request.generationConfig || {};
+    return this.getGenerationConfig(source, model);
   }
 
   extractTextFromCandidates(response) {
@@ -319,7 +363,7 @@ class LLMService {
     return `Analyze this image for a ${activeSkill.toUpperCase()} question. Extract the problem concisely and provide the best possible solution with explanation and final code.${langNote}`;
   }
 
-  async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
+  async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null, historyIncludesCurrentMessage = true) {
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
@@ -336,7 +380,7 @@ class LLMService {
         requestId: this.requestCount
       });
 
-      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
+      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage, historyIncludesCurrentMessage);
 
       const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
       let response;
@@ -406,7 +450,7 @@ class LLMService {
     }
   }
 
-  async processTextWithSkillStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
+  async processTextWithSkillStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null, historyIncludesCurrentMessage = true) {
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
@@ -415,7 +459,7 @@ class LLMService {
     this.requestCount++;
 
     try {
-      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
+      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage, historyIncludesCurrentMessage);
 
       const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
         if (typeof onDelta === 'function' && delta) {
@@ -450,11 +494,11 @@ class LLMService {
         error: error.message,
         requestId: this.requestCount
       });
-      return this.processTextWithSkill(text, activeSkill, sessionMemory, programmingLanguage);
+      return this.processTextWithSkill(text, activeSkill, sessionMemory, programmingLanguage, historyIncludesCurrentMessage);
     }
   }
 
-  async processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
+  async processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory = [], programmingLanguage = null, historyIncludesCurrentMessage = false) {
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
@@ -471,7 +515,7 @@ class LLMService {
         requestId: this.requestCount
       });
 
-      const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
+      const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage, historyIncludesCurrentMessage);
 
       const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
       let response;
@@ -570,12 +614,13 @@ class LLMService {
     }
   }
 
-  buildGeminiRequest(text, activeSkill, historySnapshot = {}, programmingLanguage) {
+  buildGeminiRequest(text, activeSkill, historySnapshot = {}, programmingLanguage, historyIncludesCurrentMessage = true) {
     const context = contextBuilder.build({
       text,
       activeSkill,
       codingLanguage: programmingLanguage,
-      historySnapshot
+      historySnapshot,
+      historyIncludesCurrentMessage
     });
     const request = { contents: context.contents };
     this.applyGenerationDefaults(request);
@@ -590,7 +635,7 @@ class LLMService {
     return request;
   }
 
-  buildIntelligentTranscriptionRequest(text, activeSkill, historySnapshot = {}, programmingLanguage) {
+  buildIntelligentTranscriptionRequest(text, activeSkill, historySnapshot = {}, programmingLanguage, historyIncludesCurrentMessage = false) {
     const cleanText = text && typeof text === 'string' ? text.trim() : '';
     if (!cleanText) throw new Error('Empty or invalid transcription text provided to buildIntelligentTranscriptionRequest');
 
@@ -603,7 +648,8 @@ class LLMService {
       codingLanguage: programmingLanguage,
       historySnapshot,
       systemPrompt: intelligentPrompt,
-      currentMessage: buildTranscriptionUserMessage(cleanText, activeSkill)
+      currentMessage: buildTranscriptionUserMessage(cleanText, activeSkill),
+      historyIncludesCurrentMessage
     });
     const request = { contents: context.contents };
     this.applyGenerationDefaults(request);
@@ -736,7 +782,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
           const requestPromise = this.client.models.generateContent({
             model: modelName,
             contents: geminiRequest.contents,
-            config: geminiRequest.generationConfig,
+            config: this._getGenerationConfigForModel(geminiRequest, modelName),
             systemInstruction: geminiRequest.systemInstruction
           });
           const result = await Promise.race([requestPromise, timeoutPromise]);
@@ -840,7 +886,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
    * {response, metadata} shape. Falls back to the non-streaming path on any
    * streaming failure so reliability is never worse than before.
    */
-  async processTranscriptionWithIntelligentResponseStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
+  async processTranscriptionWithIntelligentResponseStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null, historyIncludesCurrentMessage = false) {
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
@@ -849,7 +895,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     this.requestCount++;
 
     try {
-      const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
+      const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage, historyIncludesCurrentMessage);
 
       const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
         if (typeof onDelta === 'function' && delta) {
@@ -887,7 +933,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
       });
       // Non-streaming path returns the same shape; the caller renders it as a
       // single final response.
-      return this.processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory, programmingLanguage);
+      return this.processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory, programmingLanguage, historyIncludesCurrentMessage);
     }
   }
 
@@ -978,7 +1024,11 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     const https = require('https');
     const timeout = config.get('llm.gemini.timeout');
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:streamGenerateContent?alt=sse`;
-    const postData = JSON.stringify(geminiRequest);
+    const requestForModel = {
+      ...geminiRequest,
+      generationConfig: this._getGenerationConfigForModel(geminiRequest, modelName)
+    };
+    const postData = JSON.stringify(requestForModel);
     const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
 
     const options = {
@@ -1269,7 +1319,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
         logger.warn('Network connectivity issues detected', networkCheck);
       }
 
-      const generationConfig = this.getGenerationConfig({ temperature: 0, maxOutputTokens: 64 });
+      const generationOverrides = { temperature: 0, maxOutputTokens: 64 };
       const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
       const modelsToTry = [this.model, ...fallbackModels];
 
@@ -1283,7 +1333,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
           result = await this.client.models.generateContent({
             model: modelName,
             contents: 'Test connection. Please respond with "OK".',
-            config: generationConfig
+            config: this.getGenerationConfig(generationOverrides, modelName)
           });
           usedModel = modelName;
           const latency = Date.now() - startTime;
@@ -1437,7 +1487,11 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
 
-    const postData = JSON.stringify(geminiRequest);
+    const requestForModel = {
+      ...geminiRequest,
+      generationConfig: this._getGenerationConfigForModel(geminiRequest, modelName)
+    };
+    const postData = JSON.stringify(requestForModel);
 
     const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
 

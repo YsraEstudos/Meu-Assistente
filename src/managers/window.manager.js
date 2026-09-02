@@ -18,7 +18,6 @@ class WindowManager {
     this._responsePrewarmTimer = null;
     this._windowCreationPromises = new Map();
     this._windowEventBindings = new WeakSet();
-    this._permissionHandlerInstalled = false;
     this.isScreenBeingShared = false;
     this.wasVisibleBeforeSharing = false;
     this.screenCaptureStatus = {
@@ -294,13 +293,12 @@ class WindowManager {
   }
 
   async createSettingsWindow() {
-    if (this.windows.has('settings')) {
-      return this.windows.get('settings');
-    }
-    const window = await this.createWindow('settings');
-    this.windows.set('settings', window);
-    window.hide();
-    return window;
+    return this._ensureWindow('settings', async () => {
+      const window = await this.createWindow('settings');
+      this.windows.set('settings', window);
+      window.hide();
+      return window;
+    });
   }
 
   async createWindow(type, showOnCreate = false) {
@@ -515,42 +513,6 @@ class WindowManager {
         logger.warn('Blocked navigation due to URL parse failure', { url, error: error.message });
       }
     });
-
-    if (!this._permissionHandlerInstalled) {
-      this._permissionHandlerInstalled = true;
-      // Harden the default session for all windows: only app-origin windows can
-      // request sensitive permissions, which supersedes the broader global handler.
-      window.webContents.session.setPermissionRequestHandler((webContents, permission, callback) => {
-        try {
-          const origin = new URL(webContents.getURL()).origin;
-          const appOrigin = new URL(window.webContents.getURL()).origin;
-
-          if (origin !== appOrigin) {
-            logger.warn('Denied permission for non-app origin', { origin, permission });
-            return callback(false);
-          }
-
-          const allowed = ['media', 'microphone', 'camera', 'display-capture'].includes(permission);
-          return callback(allowed);
-        } catch (error) {
-          return callback(false);
-        }
-      });
-      window.webContents.session.setPermissionCheckHandler((webContents, permission, origin, details) => {
-        try {
-          const currentOrigin = new URL(webContents.getURL()).origin;
-          const appOrigin = new URL(window.webContents.getURL()).origin;
-          const requestedOrigin = String(origin || '');
-          const originMatches = requestedOrigin === appOrigin ||
-            (appOrigin === 'null' && /^file:\/\//i.test(requestedOrigin));
-          if (currentOrigin !== appOrigin || !originMatches) return false;
-          if (permission === 'media') return !details?.mediaType || details.mediaType === 'audio';
-          return ['microphone', 'camera', 'display-capture'].includes(permission);
-        } catch (_) {
-          return false;
-        }
-      });
-    }
 
   // Load the HTML file
     await window.loadFile(windowConfig.file);
@@ -1522,6 +1484,11 @@ class WindowManager {
       clearInterval(this._stealthWatchdog);
       this._stealthWatchdog = null;
     }
+
+    if (this._responsePrewarmTimer) {
+      clearTimeout(this._responsePrewarmTimer);
+      this._responsePrewarmTimer = null;
+    }
     
     logger.info('All windows destroyed');
   }
@@ -1781,12 +1748,18 @@ class WindowManager {
     }
   }
 
-  showChatWindow() {
+  async showChatWindow() {
     this._ensureMainWindowVisible();
-    const chatWindow = this.windows.get('chat');
-    if (chatWindow && !chatWindow.isDestroyed()) {
-      this.showOnCurrentDesktop(chatWindow);
-      logger.debug('Chat window shown');
+    try {
+      const chatWindow = this.windows.get('chat') || await this.ensureChatWindow();
+      if (chatWindow && !chatWindow.isDestroyed()) {
+        this.showOnCurrentDesktop(chatWindow);
+        logger.debug('Chat window shown');
+      }
+      return chatWindow || null;
+    } catch (error) {
+      logger.warn('Failed to create or show chat window', { error: error.message });
+      return null;
     }
   }
 
@@ -1798,9 +1771,13 @@ class WindowManager {
     }
   }
 
-  handleRecordingStarted() {
+  async handleRecordingStarted() {
     this.isRecording = true;
-    this.showChatWindow();
+    try {
+      await this.showChatWindow();
+    } catch (error) {
+      logger.warn('Failed to show chat window before recording broadcast', { error: error.message });
+    }
     // Notify all windows about recording state
     this.broadcastToAllWindows('recording-started');
     logger.debug('Recording started, chat window shown');

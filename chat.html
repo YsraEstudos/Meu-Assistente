@@ -789,6 +789,7 @@
       let chatHistory = [];
       const recentResponseHashes = new Set();
       const RECENT_HASH_LIMIT = 50;
+      const responseStreams = new Map();
 
       function hashString(str) {
         try {
@@ -929,6 +930,7 @@
           chatHistory.push({ kind: 'message', type, text });
           saveHistory();
         }
+        return messageDiv;
       }
 
       // Markdown formatter using markdown.js library
@@ -939,16 +941,12 @@
           if (typeof markdown !== 'undefined' && markdown.toHTML) {
             return markdown.toHTML(text);
           } else {
-            console.warn('Markdown library not loaded, falling back to basic formatting');
-            return text
-              .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-              .replace(/\*(.+?)\*/g, '<em>$1</em>')
-              .replace(/`(.+?)`/g, '<code>$1</code>')
-              .replace(/\n/g, '<br>');
+            console.warn('Markdown library not loaded, falling back to escaped text');
+            return escapeHtml(text).replace(/\n/g, '<br>');
           }
         } catch (error) {
           console.error('Markdown parsing failed:', error);
-          return text.replace(/\n/g, '<br>');
+          return escapeHtml(text).replace(/\n/g, '<br>');
         }
       }
 
@@ -1253,10 +1251,63 @@
         blocks.forEach(b => addCodeSnippet(b.language, b.code));
       }
 
+      function beginResponseStream(messageId) {
+        if (!messageId || responseStreams.has(messageId)) return;
+        try { hideThinkingIndicator(); } catch (_) {}
+        const messageDiv = addMessage('', 'assistant', true);
+        if (!messageDiv) return;
+        messageDiv.classList.add('streaming');
+        messageDiv.dataset.streamId = messageId;
+        responseStreams.set(messageId, {
+          messageDiv,
+          textDiv: messageDiv.querySelector('.message-text'),
+          buffer: ''
+        });
+      }
+
+      function appendResponseDelta(messageId, delta) {
+        if (!messageId || !delta) return;
+        if (!responseStreams.has(messageId)) beginResponseStream(messageId);
+        const state = responseStreams.get(messageId);
+        if (!state || !state.textDiv) return;
+        state.buffer += String(delta);
+        state.textDiv.textContent = state.buffer;
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+      }
+
+      function finishResponseStream(messageId, response) {
+        const state = messageId && responseStreams.get(messageId);
+        if (state) {
+          state.messageDiv.remove();
+          responseStreams.delete(messageId);
+        }
+        if (response) renderAssistantResponse(response);
+      }
+
       // Basic IPC Event Listeners - simplified
       
       // Listen for transcription events
       if (whysperAPI) {
+        whysperAPI.onResponseStart?.((_event, data) => {
+          if (data && data.messageId) beginResponseStream(data.messageId);
+        });
+
+        whysperAPI.onResponseDelta?.((_event, data) => {
+          if (data && data.messageId) appendResponseDelta(data.messageId, data.delta || '');
+        });
+
+        whysperAPI.onResponseEnd?.((_event, data) => {
+          if (!data || !data.messageId) return;
+          try { hideThinkingIndicator(); } catch (_) {}
+          finishResponseStream(data.messageId, data.response || '');
+        });
+
+        whysperAPI.onResponseError?.((_event, data) => {
+          if (!data || !data.messageId) return;
+          finishResponseStream(data.messageId, '');
+          addMessage(`LLM Error: ${data.error || 'stream failed'}`, 'error');
+        });
+
         whysperAPI.onTranscriptionReceived((event, data) => {
           if (data && data.text) {
             handleTranscription(data.text);
