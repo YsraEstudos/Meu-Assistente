@@ -269,7 +269,6 @@ document.addEventListener('DOMContentLoaded', () => {
         azureKeyInput,
         azureRegionInput,
         whisperCommandInput,
-        whisperEngineSelect,
         whisperFasterDeviceSelect,
         whisperFasterComputeTypeSelect,
         whisperCppCommandInput,
@@ -314,6 +313,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (whisperEngineSelect) {
         whisperEngineSelect.addEventListener('change', () => {
+            if (whisperModelInput && whisperModelInput.value.trim() &&
+                !validateWhisperModelName(whisperModelInput.value, whisperEngineSelect.value)) {
+                console.warn('[SettingsWindowUI] Resetting model incompatible with selected whisper engine');
+                whisperModelInput.value = '';
+                whisperModelInput.style.borderColor = '';
+            }
             updateSpeechFieldStates();
             saveSettings();
         });

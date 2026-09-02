@@ -118,7 +118,28 @@ function testFasterWhisperAcceptsRepositoryAndLocalReferences() {
     'Faster Whisper must persist local model paths');
 }
 
+function testEngineChangeResetsIncompatibleModel() {
+  for (const engine of ['openai', 'whisper-cpp']) {
+    const harness = createSettingsHarness({
+      engine: 'faster',
+      model: 'distil-whisper/distil-large-v3'
+    });
+    harness.whisperEngineSelect.value = engine;
+    harness.whisperEngineSelect.dispatch('change');
+
+    const saves = harness.sent.filter(({ channel }) => channel === 'save-settings');
+    const save = saves.at(-1);
+    assert.equal(save?.payload.whisperEngine, engine,
+      `changing the engine to ${engine} must persist the selected engine`);
+    assert.equal(save?.payload.whisperModel, '',
+      `changing to ${engine} must clear the incompatible Faster Whisper model`);
+    assert.equal(harness.whisperModelInput.value, '',
+      `the UI must not keep displaying a model incompatible with ${engine}`);
+  }
+}
+
 testClearingWhisperModelSendsAnExplicitReset();
 testFasterWhisperAcceptsRepositoryAndLocalReferences();
+testEngineChangeResetsIncompatibleModel();
 
 console.log('UI configuration contract tests passed');
