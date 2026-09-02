@@ -1404,7 +1404,10 @@ class MainWindowUI {
             }
             return;
         }
-        this._sendRendererAudioBuffer(payload, generation);
+        const state = this._audioWorkletFlushState;
+        this._sendRendererAudioBuffer(payload, generation, {
+            allowStopped: Boolean(state && state.generation === generation)
+        });
     }
 
     _completeAudioWorkletFlushIfReady() {

@@ -291,6 +291,27 @@ async function testAudioTailWaitsForMainProcessAck() {
   assert.equal(settled, true);
 }
 
+function testQueuedAudioBufferSurvivesActiveWorkletFlush() {
+  const { MainWindowUI, context } = loadMainWindowUI();
+  const ui = Object.create(MainWindowUI.prototype);
+  const sent = [];
+  ui.isRecording = false;
+  ui._captureGeneration = 7;
+  ui._audioWorkletFlushState = { generation: 7 };
+  ui._audioPort = null;
+  ui._captureStats = null;
+  context.window.electronAPI = {
+    sendAudioChunk(buffer) { sent.push(buffer); }
+  };
+
+  ui._handleAudioWorkletMessage(new ArrayBuffer(4), 7);
+  assert.equal(sent.length, 1, 'a queued worklet buffer must be accepted while its generation is flushing');
+
+  ui._audioWorkletFlushState = null;
+  ui._handleAudioWorkletMessage(new ArrayBuffer(4), 7);
+  assert.equal(sent.length, 1, 'stopped audio must still be rejected after the flush window closes');
+}
+
 function testPreloadTransfersAudioPortToBothContexts() {
   const { api, ipcMessages, posted } = loadPreloadApi();
   const result = api.openAudioTransport();
@@ -458,6 +479,7 @@ const tests = [
   testAudioWorkletFlushesPartialTail,
   testStaleAudioWorkletStartDoesNotCreateNode,
   testAudioTailWaitsForMainProcessAck,
+  testQueuedAudioBufferSurvivesActiveWorkletFlush,
   testPreloadTransfersAudioPortToBothContexts,
   testMainWindowConsumesAudioPortHandoff,
   testConcurrentLlmStreamsKeepIndependentBuffers,
