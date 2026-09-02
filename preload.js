@@ -13,10 +13,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   sendAudioChunk: (buffer) => ipcRenderer.send('audio-chunk', { buffer }),
   openAudioTransport: () => {
     try {
-      if (typeof MessageChannel === 'undefined' || typeof ipcRenderer.postMessage !== 'function') return null;
+      if (typeof MessageChannel === 'undefined' ||
+          typeof ipcRenderer.postMessage !== 'function' ||
+          typeof window.postMessage !== 'function') return null;
       const channel = new MessageChannel();
       ipcRenderer.postMessage('audio-port', null, [channel.port2]);
-      return channel.port1;
+      // MessagePort is not a supported contextBridge return type. Relay the
+      // renderer-side port through the browser's transferable message path so
+      // the main-world audio code can use the low-copy transport.
+      window.postMessage('opencluely-audio-port', '*', [channel.port1]);
+      return true;
     } catch (error) {
       console.warn('Audio MessagePort unavailable; using legacy IPC', error.message);
       return null;

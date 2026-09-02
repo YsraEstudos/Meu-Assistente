@@ -1,9 +1,11 @@
 # Relatório Final do Scan — Privacidade Visual e Compartilhamento de Tela
 
-**Projeto:** `C:\Users\israe\Documents\Codex\OpenCluely`
+**Projeto:** `OpenCluely` (raiz do repositório)
 **Revisão de discovery:** `699189a8f77f0a78e36f66e0e477d910a7bc939d`
 **Discovery consolidado:** 17/07/2026
 **Revisão e reteste:** 18/07/2026
+
+As disposições abaixo descrevem o código retestado, incluindo correções de segurança já integradas à branch principal; este PR publica a documentação e não reivindica ter introduzido esses fixes de runtime.
 
 ## Escopo e ressalva de contagem
 
@@ -21,8 +23,8 @@ O resumo inicial mencionava 28 candidatos, mas o worklist canônico atual (`SECU
 
 | Disposição | Quantidade |
 |---|---:|
-| Confirmados na revisão original | 33 IDs |
-| Corrigidos diretamente nesta revisão | 27 |
+| IDs avaliados | 33 |
+| Corrigidos no código retestado | 27 |
 | Residuais/mitigação parcial | 6 IDs |
 | Falsos positivos absolutos | 0 |
 

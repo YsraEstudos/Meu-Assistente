@@ -475,6 +475,8 @@
         let isInteractive = false;
         let scrollableElements = [];
         let initialized = false;
+        const streamingResponses = new Map();
+        let activeStreamingMessageId = null;
         
         // Immediate logging to verify script execution
         console.log('[LLM-RESPONSE] Script tag executed');
@@ -531,6 +533,54 @@
                 window.electronAPI.onShowLoading(() => {
                     console.log('[LLM-RESPONSE] show-loading received');
                     showLoadingState();
+                });
+
+                window.electronAPI.onResponseStart?.((_event, data) => {
+                    if (!data || !data.messageId) return;
+                    streamingResponses.set(data.messageId, { buffer: '' });
+                    activeStreamingMessageId = data.messageId;
+                    showLoadingState();
+                });
+
+                window.electronAPI.onResponseDelta?.((_event, data) => {
+                    if (!data || !data.messageId) return;
+                    let state = streamingResponses.get(data.messageId);
+                    if (!state) {
+                        state = { buffer: '' };
+                        streamingResponses.set(data.messageId, state);
+                    }
+                    if (!activeStreamingMessageId) activeStreamingMessageId = data.messageId;
+                    state.buffer += data.delta || '';
+                    if (activeStreamingMessageId === data.messageId) {
+                        displayStreamingResponse(state.buffer);
+                    }
+                });
+
+                window.electronAPI.onResponseEnd?.((_event, data) => {
+                    if (!data || !data.messageId) return;
+                    if (activeStreamingMessageId && activeStreamingMessageId !== data.messageId) {
+                        streamingResponses.delete(data.messageId);
+                        return;
+                    }
+                    streamingResponses.delete(data.messageId);
+                    activeStreamingMessageId = null;
+                    hideLoadingState();
+                    if (data.response) {
+                        displayResponse({ response: data.response });
+                        setupScrolling();
+                    }
+                });
+
+                window.electronAPI.onResponseError?.((_event, data) => {
+                    if (!data || !data.messageId) return;
+                    if (activeStreamingMessageId && activeStreamingMessageId !== data.messageId) {
+                        streamingResponses.delete(data.messageId);
+                        return;
+                    }
+                    streamingResponses.delete(data.messageId);
+                    activeStreamingMessageId = null;
+                    hideLoadingState();
+                    displayStreamingResponse(`LLM Error: ${data.error || 'stream failed'}`);
                 });
                 
                 // Listen for LLM response
@@ -600,6 +650,20 @@
             } else {
                 console.error('Loading element not found!');
             }
+        }
+
+        function displayStreamingResponse(response) {
+            hideLoadingState();
+            const responseElement = document.getElementById('response-content');
+            const splitLayout = document.getElementById('split-layout');
+            const fullContent = document.getElementById('full-content');
+            const fullMarkdown = document.getElementById('full-markdown');
+            if (!responseElement || !splitLayout || !fullContent || !fullMarkdown) return;
+
+            responseElement.classList.remove('hidden');
+            splitLayout.classList.add('hidden');
+            fullContent.classList.remove('hidden');
+            fullMarkdown.textContent = response || '';
         }
 
         function renderMarkdown(text) {
@@ -848,9 +912,9 @@
                     const codeBlock = document.createElement('div');
                     codeBlock.className = 'code-block';
                     codeBlock.innerHTML = `
-                        <div class="code-header">${block.language.toUpperCase()}</div>
+                        <div class="code-header">${escapeHtml(block.language.toUpperCase())}</div>
                         <div class="code-content">
-                            <pre><code class="language-${block.language}">${escapeHtml(block.code)}</code></pre>
+                            <pre><code class="language-${escapeHtml(block.language)}">${escapeHtml(block.code)}</code></pre>
                         </div>
                     `;
                     const pre = codeBlock.querySelector('pre');

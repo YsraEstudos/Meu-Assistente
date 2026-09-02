@@ -34,6 +34,7 @@ class CaptureService {
     this.isProcessing = true;
     const startTime = Date.now();
     const trace = performanceTracker.begin('screenshot-capture', { hasArea: Boolean(options.area) });
+    let traceMetadata = { success: false };
     try {
       const { image, metadata } = await this.captureScreenshot(options);
 
@@ -58,11 +59,17 @@ class CaptureService {
       }
 
       const buffer = finalImage.toPNG();
+      const finalSize = finalImage.getSize();
       logger.logPerformance('Screenshot capture', startTime, {
         bytes: buffer.length,
-        dimensions: finalImage.getSize()
+        dimensions: finalSize
       });
-      performanceTracker.end(trace, { bytes: buffer.length, width: finalImage.getSize().width, height: finalImage.getSize().height });
+      traceMetadata = {
+        success: true,
+        bytes: buffer.length,
+        width: finalSize.width,
+        height: finalSize.height
+      };
 
       return {
         imageBuffer: buffer,
@@ -74,13 +81,16 @@ class CaptureService {
         }
       };
     } finally {
-      performanceTracker.end(trace, { success: false });
+      performanceTracker.end(trace, traceMetadata);
       this.isProcessing = false;
     }
   }
 
   async captureScreenshot(options = {}) {
     const targetDisplay = this._getTargetDisplay(options.displayId);
+    if (!targetDisplay) {
+      throw new Error(`Requested display ${options.displayId} is unavailable`);
+    }
     const { width, height } = targetDisplay.size || { width: 1920, height: 1080 };
     const maxDimension = Number(config.get('performance.screenshotMaxDimension')) || 2560;
     const displayMaxDimension = Math.max(width, height);
@@ -142,10 +152,9 @@ class CaptureService {
 
   _getTargetDisplay(displayId) {
     const all = screen.getAllDisplays();
-    if (!all || all.length === 0) return screen.getPrimaryDisplay();
+    if (!all || all.length === 0) return displayId == null ? screen.getPrimaryDisplay() : null;
     if (displayId == null) return screen.getPrimaryDisplay();
-    const found = all.find(d => d.id === displayId);
-    return found || screen.getPrimaryDisplay();
+    return all.find(d => String(d.id) === String(displayId)) || null;
   }
 
   _isValidArea(area) {

@@ -1,7 +1,7 @@
 # Auditoria de segurança: exposição ao mostrar ou compartilhar a tela
 
 Data da consolidação: 17/07/2026
-Repositório: `C:\Users\israe\Documents\Codex\OpenCluely`
+Repositório: `OpenCluely` (raiz do repositório)
 Revisão analisada: `699189a8f77f0a78e36f66e0e477d910a7bc939d`
 
 ## Conclusão provisória
@@ -192,9 +192,9 @@ Os registros abaixo são mantidos individualmente, mesmo quando repetem um candi
 
 ## Artefatos completos
 
-Os artefatos brutos das rodadas permanecem no diretório do scan:
+Os artefatos brutos das rodadas não fazem parte deste repositório. No ambiente que executou o scan, eles permanecem sob:
 
-`C:\Users\israe\AppData\Local\Temp\codex-security-scans-smcpNB\OpenCluely\699189a8f77f0a78e36f66e0e477d910a7bc939d_20260716T182359Z_vy0n55n3\artifacts\deep_discovery`
+`<SCAN_WORKDIR>/artifacts/deep_discovery`
 
 Principais fontes:
 
