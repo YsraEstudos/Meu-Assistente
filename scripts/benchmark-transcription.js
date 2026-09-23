@@ -197,7 +197,29 @@ function resolveLocalPaths({ platform = process.platform, env = process.env, hom
     .find((candidate) => fs.existsSync(candidate));
   const bin = findBinary('whisper-cli');
   const server = findBinary('whisper-server');
-  const model = path.join(root, '.whisper-cpp-models', 'ggml-large-v3-turbo.bin');
+  const configuredModelDir = env.WHISPER_CPP_MODEL_DIR;
+  const modelDir = configuredModelDir && path.isAbsolute(configuredModelDir)
+    ? configuredModelDir
+    : path.join(root, '.whisper-cpp-models');
+  const configuredModel = String(env.WHISPER_CPP_MODEL || env.WHISPER_MODEL || '').trim();
+  let model;
+  if (configuredModel && path.isAbsolute(configuredModel)) {
+    model = path.resolve(configuredModel);
+  } else {
+    const resolvedConfiguredPath = configuredModel ? path.resolve(configuredModel) : '';
+    const relativeToModelDir = resolvedConfiguredPath ? path.relative(modelDir, resolvedConfiguredPath) : '';
+    const isModelInConfiguredDir = relativeToModelDir && !relativeToModelDir.startsWith('..') && !path.isAbsolute(relativeToModelDir);
+    if (isModelInConfiguredDir && fs.existsSync(resolvedConfiguredPath)) {
+      model = resolvedConfiguredPath;
+    } else {
+      const safeModelName = configuredModel.toLowerCase().replace(/^ggml-/, '').replace(/\.bin$/, '');
+      const modelName = safeModelName && safeModelName.length <= 64 && !safeModelName.includes('..') && /^[a-z0-9._-]+$/.test(safeModelName)
+        ? safeModelName
+        : 'turbo';
+      const normalizedModelName = { turbo: 'large-v3-turbo', large: 'large-v3' }[modelName] || modelName;
+      model = path.join(modelDir, `ggml-${normalizedModelName}.bin`);
+    }
+  }
   const configuredPython = env.WHISPER_CPP_PYTHON || env.PYTHON || 'python';
   return {
     bin,

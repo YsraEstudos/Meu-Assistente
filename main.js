@@ -560,12 +560,12 @@ class ApplicationController {
       // This is the only point where voice text may reach the LLM. The speech
       // service emits it only after the active segment and consolidated tail
       // batches have completed.
-      if (typeof speechService.markLatencyEvent === 'function') {
-        speechService.markLatencyEvent('dispatchAt');
-      }
-      const latency = payload.latency || (speechService && typeof speechService.getLatencyMetrics === "function"
+      const liveLatency = typeof speechService.markLatencyEvent === 'function'
+        ? speechService.markLatencyEvent('dispatchAt')
+        : null;
+      const latency = liveLatency || (speechService && typeof speechService.getLatencyMetrics === "function"
         ? speechService.getLatencyMetrics()
-        : null);
+        : payload.latency || null);
       performanceTracker.mark('speech-consolidated-dispatch', {
         sessionId: payload.sessionId || this._speechSessionId,
         latency

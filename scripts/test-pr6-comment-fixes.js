@@ -267,6 +267,29 @@ async function testStaleAudioWorkletStartDoesNotCreateNode() {
   assert.equal(ui._audioWorkletNode, null);
 }
 
+async function testAudioWorkletUsesConfiguredChunkSize() {
+  const { MainWindowUI, context } = loadMainWindowUI();
+  const ui = Object.create(MainWindowUI.prototype);
+  let nodeOptions = null;
+  ui.isRecording = true;
+  ui._captureGeneration = 1;
+  ui._audioWorkletNode = null;
+  ui._connectAudioNodeSilently = () => {};
+  context.window.AudioWorkletNode = class {
+    constructor(_audioContext, _name, options) {
+      nodeOptions = options;
+      this.port = {};
+    }
+  };
+  const audioContext = { audioWorklet: { addModule: async () => {} } };
+  const source = { connect() {} };
+  const stream = { getAudioTracks: () => [] };
+
+  assert.equal(await ui._tryStartAudioWorkletCapture(audioContext, source, stream, 1, 4096), true);
+  assert.equal(nodeOptions.processorOptions.bufferSize, 4096,
+    'AudioWorklet must receive the configured capture chunk size');
+}
+
 async function testAudioTailWaitsForMainProcessAck() {
   const { MainWindowUI } = loadMainWindowUI();
   const ui = Object.create(MainWindowUI.prototype);
@@ -289,6 +312,27 @@ async function testAudioTailWaitsForMainProcessAck() {
   ui._handleAudioTransportMessage({ type: 'audio-tail-accepted', flushId });
   await flush;
   assert.equal(settled, true);
+}
+
+function testQueuedAudioBufferSurvivesActiveWorkletFlush() {
+  const { MainWindowUI, context } = loadMainWindowUI();
+  const ui = Object.create(MainWindowUI.prototype);
+  const sent = [];
+  ui.isRecording = false;
+  ui._captureGeneration = 7;
+  ui._audioWorkletFlushState = { generation: 7 };
+  ui._audioPort = null;
+  ui._captureStats = null;
+  context.window.electronAPI = {
+    sendAudioChunk(buffer) { sent.push(buffer); }
+  };
+
+  ui._handleAudioWorkletMessage(new ArrayBuffer(4), 7);
+  assert.equal(sent.length, 1, 'a queued worklet buffer must be accepted while its generation is flushing');
+
+  ui._audioWorkletFlushState = null;
+  ui._handleAudioWorkletMessage(new ArrayBuffer(4), 7);
+  assert.equal(sent.length, 1, 'stopped audio must still be rejected after the flush window closes');
 }
 
 function testPreloadTransfersAudioPortToBothContexts() {
@@ -374,6 +418,24 @@ async function testRecordingStartBroadcastWaitsForChatCreation() {
   assert.deepEqual(broadcasts, ['recording-started']);
 }
 
+async function testRecordingStopDuringChatCreationDoesNotBroadcastStaleStart() {
+  const WindowManager = loadWindowManagerClass();
+  const manager = Object.create(WindowManager.prototype);
+  manager.isRecording = false;
+  const broadcasts = [];
+  let releaseChat;
+  manager.showChatWindow = () => new Promise((resolve) => { releaseChat = resolve; });
+  manager.broadcastToAllWindows = (channel) => broadcasts.push(channel);
+
+  const started = manager.handleRecordingStarted();
+  manager.handleRecordingStopped();
+  releaseChat();
+  await started;
+
+  assert.deepEqual(broadcasts, ['recording-stopped'],
+    'a completed stale start must not override a stop received while the chat window was opening');
+}
+
 function testSourceContracts() {
   const preload = read('preload.js');
   const main = read('main.js');
@@ -457,11 +519,14 @@ function testSourceContracts() {
 const tests = [
   testAudioWorkletFlushesPartialTail,
   testStaleAudioWorkletStartDoesNotCreateNode,
+  testAudioWorkletUsesConfiguredChunkSize,
   testAudioTailWaitsForMainProcessAck,
+  testQueuedAudioBufferSurvivesActiveWorkletFlush,
   testPreloadTransfersAudioPortToBothContexts,
   testMainWindowConsumesAudioPortHandoff,
   testConcurrentLlmStreamsKeepIndependentBuffers,
   testRecordingStartBroadcastWaitsForChatCreation,
+  testRecordingStopDuringChatCreationDoesNotBroadcastStaleStart,
   testSourceContracts
 ];
 

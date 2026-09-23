@@ -95,12 +95,17 @@ function testRendererCaptureRechecksGenerationAfterSettings() {
   const captureStart = rendererSource.indexOf('_startRendererAudioCapture() {');
   const settingsAwait = rendererSource.indexOf('await window.electronAPI.getSettings()', captureStart);
   const scriptProcessor = rendererSource.indexOf('audioContext.createScriptProcessor', settingsAwait);
+  const workletStart = rendererSource.indexOf('this._tryStartAudioWorkletCapture(', settingsAwait);
   const generationGuard = rendererSource.indexOf(
     'if (!this.isRecording || generation !== this._captureGeneration)',
     settingsAwait
   );
   assert(settingsAwait >= 0, 'renderer capture must load settings asynchronously');
   assert(captureStart >= 0, 'renderer capture start method must exist');
+  assert(workletStart > settingsAwait && workletStart < scriptProcessor,
+    'AudioWorklet capture must start after loading the configured chunk size');
+  assert.match(rendererSource.slice(workletStart, scriptProcessor), /generation,\s*bufferSize\s*\n\s*\);/,
+    'renderer must pass the configured chunk size into AudioWorklet startup');
   assert(generationGuard > settingsAwait && generationGuard < scriptProcessor,
     'renderer capture must discard stale settings continuations before creating a script node');
 }
@@ -200,6 +205,38 @@ function testWorkerDoesNotReportRequestedVulkanAsObservedWithoutDiagnostics() {
   ], { encoding: 'utf8', windowsHide: true });
   assert.equal(probe.status, 0, probe.stderr || 'server backend confirmation probe failed');
   assert.deepEqual(JSON.parse(probe.stdout.trim()), { backend: 'cpu', backendConfirmed: false });
+}
+
+function testWorkerServerStartupHasSingleOverallDeadline() {
+  const workerPath = path.join(__dirname, 'whisper-cpp-worker.py');
+  const python = findPython();
+  if (!python) {
+    console.warn('Server startup deadline probe skipped: no Python interpreter found');
+    return;
+  }
+  const probe = spawnSync(python.command, [...python.baseArgs,
+    '-c',
+    [
+      'import json, runpy, sys, types',
+      'worker_path = sys.argv[1]',
+      'module = runpy.run_path(worker_path, run_name="worker_module")',
+      'clock = [0]',
+      'module["time"].monotonic = lambda: (clock.__setitem__(0, clock[0] + 100) or clock[0])',
+      'module["time"].sleep = lambda _seconds: None',
+      'module["_executable_available"] = lambda _binary: True',
+      'module["socket"].socket = lambda *args, **kwargs: types.SimpleNamespace(bind=lambda _address: None, getsockname=lambda: ("127.0.0.1", 54321), close=lambda: None)',
+      'module["socket"].create_connection = lambda *args, **kwargs: (_ for _ in ()).throw(OSError("not ready"))',
+      'proc = lambda: types.SimpleNamespace(stdout=[], stderr=[], poll=lambda: None, terminate=lambda: None, wait=lambda **kwargs: None, kill=lambda: None)',
+      'popen_count = [0]',
+      'module["subprocess"].Popen = lambda *args, **kwargs: (popen_count.__setitem__(0, popen_count[0] + 1) or proc())',
+      'args = types.SimpleNamespace(server_binary=worker_path, model=worker_path, backend="cpu", device="auto", language="en", threads=1, beam_size=1, best_of=1, no_fallback=True, flash_attn=True, timeout_seconds=180)',
+      'runtime = module["_start_server"](args)',
+      'print(json.dumps({"mode": runtime.get("mode"), "popenCount": popen_count[0]}))'
+    ].join('; '),
+    workerPath
+  ], { encoding: 'utf8', windowsHide: true });
+  assert.equal(probe.status, 0, probe.stderr || 'server startup deadline probe failed');
+  assert.deepEqual(JSON.parse(probe.stdout.trim()), { mode: 'cli', popenCount: 1 });
 }
 
 async function testWorkerResultPreservesBackendConfirmation() {
@@ -517,6 +554,22 @@ function testLowLatencyContractsAreWired() {
   assert(rendererSource.includes('Math.log2'), 'renderer must quantize capture chunks to a supported Web Audio size');
 }
 
+function testMainUsesLiveLatencyAfterDispatchMark() {
+  const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const handlerStart = mainSource.indexOf('speechService.on("recording-stopped"');
+  const liveLatencyDeclaration = mainSource.indexOf('const liveLatency', handlerStart);
+  const markMatch = mainSource.slice(handlerStart).match(/speechService\.markLatencyEvent\((['"])dispatchAt\1\)/);
+  const mark = markMatch ? handlerStart + markMatch.index : -1;
+  const latency = mainSource.indexOf('const latency', mark);
+  assert(handlerStart >= 0 && liveLatencyDeclaration > handlerStart && mark > liveLatencyDeclaration && latency > mark,
+    'recording-stopped handler must mark dispatch before reading latency');
+  const dispatchSection = mainSource.slice(liveLatencyDeclaration, latency + 260);
+  assert.match(dispatchSection, /const liveLatency\s*=\s*typeof speechService\.markLatencyEvent[\s\S]*?speechService\.markLatencyEvent\((['"])dispatchAt\1\)/,
+    'recording-stopped handler must retain the live latency returned after dispatch marking');
+  assert.doesNotMatch(dispatchSection, /const latency\s*=\s*payload\.latency\s*\|\|/,
+    'recording-stopped handler must not prefer the pre-dispatch latency snapshot');
+}
+
 async function run() {
   testFastProfileDefaults();
   testAbsoluteWhisperOverridesRemainUsable();
@@ -527,10 +580,12 @@ async function run() {
   testRendererCaptureRechecksGenerationAfterSettings();
   testLatencyMetricsAreDeterministic();
   testLowLatencyContractsAreWired();
+  testMainUsesLiveLatencyAfterDispatchMark();
   await testAsyncHardwareValidationDoesNotUseSyncValidation();
   await testVersionedExternalPythonTargetsAreAllowed();
   await testWindowsPyLauncherIsAllowed();
   testWorkerDoesNotReportRequestedVulkanAsObservedWithoutDiagnostics();
+  testWorkerServerStartupHasSingleOverallDeadline();
   await testWorkerResultPreservesBackendConfirmation();
   await testFinalLatencyWaitsForFinalization();
   await testAsyncRuntimeProbePreservesConfiguredDevice();

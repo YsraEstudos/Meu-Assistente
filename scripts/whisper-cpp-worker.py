@@ -222,7 +222,10 @@ def _start_server(args: argparse.Namespace) -> dict[str, object]:
         # `-ng` even when Vulkan was explicitly requested.
         selected_device = _select_vulkan_device(args.device, server_binary) or "0"
 
+    startup_deadline = time.monotonic() + min(180.0, max(10.0, args.timeout_seconds))
     for attempt in range(3):
+        if time.monotonic() >= startup_deadline:
+            break
         port_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             port_socket.bind(("127.0.0.1", 0))
@@ -267,9 +270,8 @@ def _start_server(args: argparse.Namespace) -> dict[str, object]:
             _stop_server()
             return {"mode": "cli", "reason": str(exc)}
 
-        deadline = time.monotonic() + min(180.0, max(10.0, args.timeout_seconds))
         ready = False
-        while time.monotonic() < deadline:
+        while time.monotonic() < startup_deadline:
             if _server_process.poll() is not None:
                 break
             try:
@@ -304,10 +306,12 @@ def _start_server(args: argparse.Namespace) -> dict[str, object]:
             reason += f": {diagnostics[-1000:]}"
         _stop_server()
         if attempt < 2:
-            continue
+            if time.monotonic() < startup_deadline:
+                continue
+            return {"mode": "cli", "reason": reason}
         return {"mode": "cli", "reason": reason}
 
-    return {"mode": "cli", "reason": "whisper-server startup retries exhausted"}
+    return {"mode": "cli", "reason": "whisper-server startup deadline exceeded"}
 
 
 def _multipart_body(audio_path: str) -> tuple[bytes, str]:
