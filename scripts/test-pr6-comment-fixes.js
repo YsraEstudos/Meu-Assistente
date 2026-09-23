@@ -418,6 +418,24 @@ async function testRecordingStartBroadcastWaitsForChatCreation() {
   assert.deepEqual(broadcasts, ['recording-started']);
 }
 
+async function testRecordingStopDuringChatCreationDoesNotBroadcastStaleStart() {
+  const WindowManager = loadWindowManagerClass();
+  const manager = Object.create(WindowManager.prototype);
+  manager.isRecording = false;
+  const broadcasts = [];
+  let releaseChat;
+  manager.showChatWindow = () => new Promise((resolve) => { releaseChat = resolve; });
+  manager.broadcastToAllWindows = (channel) => broadcasts.push(channel);
+
+  const started = manager.handleRecordingStarted();
+  manager.handleRecordingStopped();
+  releaseChat();
+  await started;
+
+  assert.deepEqual(broadcasts, ['recording-stopped'],
+    'a completed stale start must not override a stop received while the chat window was opening');
+}
+
 function testSourceContracts() {
   const preload = read('preload.js');
   const main = read('main.js');
@@ -508,6 +526,7 @@ const tests = [
   testMainWindowConsumesAudioPortHandoff,
   testConcurrentLlmStreamsKeepIndependentBuffers,
   testRecordingStartBroadcastWaitsForChatCreation,
+  testRecordingStopDuringChatCreationDoesNotBroadcastStaleStart,
   testSourceContracts
 ];
 

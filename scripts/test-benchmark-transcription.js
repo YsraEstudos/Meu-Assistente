@@ -164,6 +164,43 @@ function testBenchmarkFindsSingleConfigWhisperBinary() {
   }
 }
 
+function testBenchmarkResolvesConfiguredWhisperCppModel() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-benchmark-model-'));
+  const home = path.join(tempRoot, 'home');
+  const modelDir = path.join(tempRoot, 'models');
+  try {
+    const configured = benchmark.resolveLocalPaths({
+      platform: 'linux',
+      env: { HOME: home, WHISPER_MODEL: 'small', WHISPER_CPP_MODEL_DIR: modelDir },
+      homeDir: home
+    });
+    assert.equal(configured.model, path.join(modelDir, 'ggml-small.bin'));
+
+    const configuredCppModel = benchmark.resolveLocalPaths({
+      platform: 'linux',
+      env: {
+        HOME: home,
+        WHISPER_MODEL: 'large',
+        WHISPER_CPP_MODEL: 'ggml-small.bin',
+        WHISPER_CPP_MODEL_DIR: modelDir
+      },
+      homeDir: home
+    });
+    assert.equal(configuredCppModel.model, path.join(modelDir, 'ggml-small.bin'),
+      'the whisper.cpp-specific model must take precedence over the general Whisper model');
+
+    const explicitPath = path.join(tempRoot, 'custom-model.bin');
+    const explicit = benchmark.resolveLocalPaths({
+      platform: 'linux',
+      env: { HOME: home, WHISPER_CPP_MODEL: explicitPath },
+      homeDir: home
+    });
+    assert.equal(explicit.model, explicitPath);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
 async function testBenchmarkRejectsIncompleteRuns() {
   let calls = 0;
   const report = await benchmark.measureVariant({
@@ -207,6 +244,7 @@ async function run() {
   testAcceptanceRejectsUnconfirmedMeasuredBackend();
   testBenchmarkUsesPlatformDataDirectory();
   testBenchmarkFindsSingleConfigWhisperBinary();
+  testBenchmarkResolvesConfiguredWhisperCppModel();
   await testBenchmarkRejectsIncompleteRuns();
   console.log('Speech benchmark tests: passed');
 }

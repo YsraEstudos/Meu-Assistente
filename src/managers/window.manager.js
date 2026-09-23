@@ -1772,18 +1772,22 @@ class WindowManager {
   }
 
   async handleRecordingStarted() {
+    const generation = (this._recordingStateGeneration || 0) + 1;
+    this._recordingStateGeneration = generation;
     this.isRecording = true;
     try {
       await this.showChatWindow();
     } catch (error) {
       logger.warn('Failed to show chat window before recording broadcast', { error: error.message });
     }
+    if (generation !== this._recordingStateGeneration || !this.isRecording) return;
     // Notify all windows about recording state
     this.broadcastToAllWindows('recording-started');
     logger.debug('Recording started, chat window shown');
   }
 
   handleRecordingStopped() {
+    this._recordingStateGeneration = (this._recordingStateGeneration || 0) + 1;
     this.isRecording = false;
     // Notify all windows about recording state
     this.broadcastToAllWindows('recording-stopped');
